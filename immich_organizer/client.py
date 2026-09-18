@@ -291,6 +291,34 @@ class ImmichClient:
             return []
         return self._request("DELETE", f"/albums/{album_id}/assets", body={"ids": asset_ids}) or []
 
+    # ------------------------------------------------- workflows and plugins
+
+    def list_plugins(self) -> list[dict]:
+        """``GET /plugins`` -- installed workflow plugins.
+
+        Added in the Immich release that introduced Workflows; older servers
+        answer 404, which the caller should treat as "not supported".
+        """
+        return self._request("GET", "/plugins") or []
+
+    def list_plugin_methods(self) -> list[dict]:
+        """``GET /plugins/methods`` -- the filters and actions workflows can use."""
+        return self._request("GET", "/plugins/methods") or []
+
+    def list_workflows(self) -> list[dict]:
+        return self._request("GET", "/workflows") or []
+
+    def workflow_triggers(self) -> list:
+        return self._request("GET", "/workflows/triggers") or []
+
+    def supports_workflows(self) -> bool:
+        """Whether this server exposes the Workflows/plugins API at all."""
+        try:
+            self.list_plugins()
+            return True
+        except NotFoundError:
+            return False
+
     # ------------------------------------------------------------------- misc
 
     def update_assets(self, asset_ids: list[str], **changes: Any) -> None:

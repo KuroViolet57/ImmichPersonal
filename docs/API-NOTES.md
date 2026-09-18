@@ -131,6 +131,56 @@ POST /api/search/metadata
 | Archive / favorite in bulk | `PUT /api/assets` — `{ "ids": [...], "visibility": "archive" }` |
 | Exact (non-AI) search | `POST /api/search/metadata` |
 
+## Workflows and plugins
+
+Immich has a native automation feature built on the same API surface.
+
+| Purpose | Call |
+|---|---|
+| Installed plugins | `GET /api/plugins` |
+| Filters and actions they expose | `GET /api/plugins/methods` |
+| Workflow templates | `GET /api/plugins/templates` |
+| Workflows | `GET`/`POST /api/workflows` |
+| Available triggers | `GET /api/workflows/triggers` |
+
+Servers released before the feature answer 404 to all of these, which is how
+`doctor` detects support.
+
+A **workflow** is a trigger plus an ordered list of steps. Each step names a
+plugin method as `pluginName#methodName` and carries a config object validated
+against the JSON Schema in the plugin's manifest. A step tagged with the
+`Filter` UI hint returns `{ workflow: { continue: boolean } }`; returning
+`false` stops the pipeline for that asset.
+
+Triggers are `AssetCreate`, `AssetMetadataExtraction` and `AssetTagged` — all
+asset events. There is no manual or scheduled run, so workflows act on new and
+changed assets, never retroactively over a library.
+
+**Plugins are WASM modules** run through Extism. A plugin directory holds a
+`manifest.json` and the `.wasm` it names. The host exposes six functions to
+plugin code: `searchAlbums`, `createAlbum`, `addAssetsToAlbum`,
+`addAssetsToAlbums`, `bulkTagAssets`, and `httpRequest` — the last gated by an
+`allowedHosts` allowlist in the manifest. Third-party plugins load only when
+the server sets `IMMICH_ALLOW_EXTERNAL_PLUGINS=true` and
+`IMMICH_PLUGINS_INSTALL_FOLDER=/some/absolute/path`.
+
+The core plugin's filters are all metadata-based (filename, date, location,
+EXIF, tags, type, missing time zone); its actions include add-to-album, tag,
+archive, favorite, visibility and webhook. Nothing matches on image content,
+which is what `plugins/immich-smart-album/` in this repository adds.
+
+### Ordering: embeddings arrive after the triggers
+
+Worth knowing before building on this. Immich queues the `SmartSearch` job —
+the one that produces the CLIP embedding — from the completion of
+`AssetGenerateThumbnails`. Meanwhile `AssetCreate` fires on upload and
+`AssetMetadataExtracted` fires at the end of metadata extraction, both earlier.
+
+So at the moment an upload-triggered workflow runs, the asset is not yet in the
+smart-search index and cannot match any semantic query. A trigger that fired
+after machine learning completed would fix this; there is no such trigger
+today.
+
 ## Things Immich can do that this tool does not (yet)
 
 Worth knowing, since they are all reachable the same way:

@@ -69,6 +69,34 @@ class TestDoctorAndAlbums(CliCase):
         self.assertEqual(code, 1)
         self.assertIn("Smart Search", out)
 
+    def test_doctor_reports_no_content_filter_on_a_stock_server(self):
+        self.fake.smart_results["a photograph"] = self.ids[:1]
+        self.fake.similar_results[self.ids[0]] = self.ids[1:2]
+        self.fake.install_core_plugin()
+        code, out = self.run_cli("doctor")
+        self.assertEqual(code, 0)
+        self.assertIn("Workflows supported - 1 plugin(s)", out)
+        self.assertIn("1 filter(s), 1 action(s)", out)
+        self.assertIn("no content-matching filter installed", out)
+
+    def test_doctor_detects_the_smart_album_plugin(self):
+        self.fake.smart_results["a photograph"] = self.ids[:1]
+        self.fake.similar_results[self.ids[0]] = self.ids[1:2]
+        self.fake.install_core_plugin()
+        self.fake.install_smart_album_plugin()
+        code, out = self.run_cli("doctor")
+        self.assertEqual(code, 0)
+        self.assertIn("a content-matching filter is installed", out)
+        self.assertIn("immich-smart-album#smartMatchFilter", out)
+
+    def test_doctor_handles_a_server_without_workflows(self):
+        self.fake.smart_results["a photograph"] = self.ids[:1]
+        self.fake.similar_results[self.ids[0]] = self.ids[1:2]
+        self.fake.supports_workflows = False
+        code, out = self.run_cli("doctor")
+        self.assertEqual(code, 0)
+        self.assertIn("predates Immich Workflows", out)
+
     def test_albums_are_listed(self):
         self.fake.add_album("Trip", members=self.ids[:2])
         code, out = self.run_cli("albums")

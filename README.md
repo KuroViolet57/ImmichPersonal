@@ -164,6 +164,38 @@ network, every data route requires the token embedded in that URL, so treat
 the link like a password. Details in
 [`docs/SETUP-ANDROID.md`](docs/SETUP-ANDROID.md).
 
+## Immich's own Workflows, and the plugin in this repository
+
+Recent Immich versions ship a native **Workflows** feature: a UI at
+`/workflows`, event triggers, and WASM plugins providing filters and actions.
+It is worth knowing how it relates to this tool, because the two cover
+different halves of the problem.
+
+Immich's built-in plugin filters on **metadata only** — filename, date,
+geolocation, EXIF, tags, asset type. There is no filter for *what a photo looks
+like*. And every trigger is an asset event, so workflows act on new uploads and
+cannot sweep a library that already exists.
+
+|  | Immich Workflows | This tool |
+|---|---|---|
+| Runs on the **existing** library | no — new assets only | yes |
+| Automatic on new uploads | yes | via a scheduled re-run |
+| Matches on image content | not out of the box | yes |
+| Interface | built into Immich | CLI + the mobile web UI |
+
+`plugins/immich-smart-album/` closes the content gap: it is an Immich plugin
+adding a **"Filter by smart search"** step, so a native workflow can say
+*"photos that look like a mountain → Mountains"*. It is written against
+Immich's plugin SDK interface, compiled to WASM, and ships prebuilt.
+
+One caveat it cannot engineer away: a freshly uploaded photo has no CLIP
+embedding when the upload triggers fire, so the plugin is reliable on the
+`AssetTagged` trigger and not on `AssetCreate`. Full explanation in
+[`plugins/immich-smart-album/README.md`](plugins/immich-smart-album/README.md).
+
+`immich-organizer doctor` reports whether your server has Workflows, which
+plugin methods it exposes, and whether a content-matching filter is installed.
+
 ## Commands
 
 | Command | What it does |
@@ -198,12 +230,17 @@ Configuration lives in `%APPDATA%\immich-organizer\config.json` on Windows and
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t .
+python3 -m unittest discover -s tests -t .      # the CLI and web UI
+cd plugins/immich-smart-album && npm test        # the compiled plugin
 ```
 
-114 tests run against an in-process fake Immich server that mirrors the real
-API's request and response shapes, so the client, engine, CLI, and web UI are
-all covered without a live server.
+The Python suite runs against an in-process fake Immich server that mirrors the
+real API's request and response shapes, so the client, engine, CLI, and web UI
+are all covered without a live server.
+
+The plugin suite loads the compiled `plugin.wasm` into the real Extism runtime
+using the same host-function contract the Immich server uses, against a fake
+Immich whose search results the test controls.
 
 ## Licence
 

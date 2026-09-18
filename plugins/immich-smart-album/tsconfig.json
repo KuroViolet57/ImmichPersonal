@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "lib": ["es2020"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2020",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "rootDir": "./src",
+    "types": ["./dist/index.d.ts", "./node_modules/@extism/js-pdk"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules"]
+}

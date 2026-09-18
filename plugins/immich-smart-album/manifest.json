@@ -1,0 +1,94 @@
+{
+  "name": "immich-smart-album",
+  "version": "1.0.0",
+  "title": "Smart Album",
+  "description": "Filter workflow assets by what they look like, using Immich's own smart search. Immich's built-in filters all match on metadata; this one matches on image content.",
+  "author": "immich-organizer",
+  "wasmPath": "plugin.wasm",
+  "methods": [
+    {
+      "name": "smartMatchFilter",
+      "title": "Filter by smart search",
+      "description": "Continue only when the asset is among the closest smart-search matches for a description, or for a reference photo.",
+      "types": ["AssetV1"],
+      "hostFunctions": true,
+      "allowedHosts": ["localhost", "127.0.0.1", "immich-server", "immich_server"],
+      "uiHints": ["Filter"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Description",
+            "description": "What the photo should look like, e.g. 'person in a mountain'. Leave blank if using a reference photo instead.",
+            "uiHint": { "order": 1 }
+          },
+          "likeAssetId": {
+            "type": "string",
+            "title": "Reference photo ID",
+            "description": "Match against this photo instead of a description. Open the photo in Immich and copy the ID from the URL.",
+            "uiHint": { "order": 2 }
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Match depth",
+            "description": "How many of the closest results count as a match. Smart search has no confidence score, so this top-N depth is the precision control. Set it comfortably larger than the album you expect.",
+            "default": 200,
+            "minimum": 1,
+            "maximum": 1000,
+            "uiHint": { "order": 3 }
+          },
+          "inverse": {
+            "type": "boolean",
+            "title": "Invert",
+            "description": "Continue only when the asset does NOT match.",
+            "default": false,
+            "uiHint": { "order": 4 }
+          },
+          "serverUrl": {
+            "type": "string",
+            "title": "Immich URL (internal)",
+            "description": "How this plugin reaches Immich from inside the server container. Usually the default is correct.",
+            "default": "http://localhost:2283",
+            "uiHint": { "order": 5 }
+          },
+          "apiKey": {
+            "type": "string",
+            "title": "API key",
+            "description": "An Immich API key used for the search call. Create one under Account Settings -> API Keys.",
+            "uiHint": { "order": 6 }
+          },
+          "explainMisses": {
+            "type": "boolean",
+            "title": "Diagnose non-matches",
+            "description": "When an asset does not match, check whether it has been indexed by Smart Search yet and log the reason. Costs one extra request per non-matching asset.",
+            "default": true,
+            "uiHint": { "order": 7 }
+          }
+        },
+        "required": ["apiKey"]
+      }
+    }
+  ],
+  "templates": [
+    {
+      "name": "smartAlbum",
+      "title": "Smart album",
+      "description": "File photos into an album by what they look like. Triggered on tagging, because a freshly uploaded photo has not been indexed by Smart Search yet.",
+      "trigger": "AssetTagged",
+      "uiHints": ["smart-album"],
+      "steps": [
+        {
+          "method": "immich-smart-album#smartMatchFilter",
+          "config": { "query": "person in a mountain", "limit": 200, "apiKey": "" },
+          "enabled": true
+        },
+        {
+          "method": "immich-plugin-core#assetAddToAlbums",
+          "config": { "albumIds": [], "albumName": "Mountains" },
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

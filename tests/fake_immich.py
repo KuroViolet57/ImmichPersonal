@@ -47,6 +47,12 @@ class FakeImmich:
         self.albums: dict[str, dict] = {}
         self.album_members: dict[str, list[str]] = {}
         self.updates: list[dict] = []
+        # Workflows/plugins API. `supports_workflows = False` emulates a server
+        # released before the feature existed, which answers 404.
+        self.supports_workflows = True
+        self.plugins: list[dict] = []
+        self.plugin_methods: list[dict] = []
+        self.workflows: list[dict] = []
         self.requests: list[tuple[str, str]] = []
         self.fail_next: dict[str, int] = {}
         self._server: ThreadingHTTPServer | None = None
@@ -71,6 +77,36 @@ class FakeImmich:
         }
         self.album_members[album_id] = list(members or [])
         return album_id
+
+    def install_core_plugin(self) -> None:
+        """Mirror Immich's built-in plugin: metadata filters, no content filter."""
+        self.plugins.append({
+            "id": "core", "name": "immich-plugin-core", "version": "2.0.1",
+            "title": "Immich Core Plugin", "author": "immich", "description": "",
+            "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z",
+            "methods": [],
+        })
+        self.plugin_methods.extend([
+            {"key": "immich-plugin-core#assetDateFilter", "name": "assetDateFilter",
+             "title": "Filter by date", "description": "", "uiHints": ["Filter"],
+             "types": ["AssetV1"], "hostFunctions": False},
+            {"key": "immich-plugin-core#assetAddToAlbums", "name": "assetAddToAlbums",
+             "title": "Add to Album(s)", "description": "", "uiHints": [],
+             "types": ["AssetV1"], "hostFunctions": True},
+        ])
+
+    def install_smart_album_plugin(self) -> None:
+        self.plugins.append({
+            "id": "smart", "name": "immich-smart-album", "version": "1.0.0",
+            "title": "Smart Album", "author": "immich-organizer", "description": "",
+            "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z",
+            "methods": [],
+        })
+        self.plugin_methods.append({
+            "key": "immich-smart-album#smartMatchFilter", "name": "smartMatchFilter",
+            "title": "Filter by smart search", "description": "", "uiHints": ["Filter"],
+            "types": ["AssetV1"], "hostFunctions": True,
+        })
 
     def album_by_name(self, name: str) -> dict | None:
         for album in self.albums.values():
@@ -137,6 +173,15 @@ class FakeImmich:
                     return self._send(200, outer._smart(self._body()))
                 if path == "/api/search/metadata" and method == "POST":
                     return self._send(200, outer._metadata(self._body()))
+
+                if path in ("/api/plugins", "/api/plugins/methods", "/api/workflows"):
+                    if not outer.supports_workflows:
+                        return self._send(404, {"message": "Not found"})
+                    return self._send(200, {
+                        "/api/plugins": outer.plugins,
+                        "/api/plugins/methods": outer.plugin_methods,
+                        "/api/workflows": outer.workflows,
+                    }[path])
 
                 if path == "/api/albums" and method == "GET":
                     return self._send(200, list(outer.albums.values()))

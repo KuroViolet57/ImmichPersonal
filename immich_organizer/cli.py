@@ -9,7 +9,7 @@ import webbrowser
 from pathlib import Path
 
 from . import __version__
-from .client import AuthError, ImmichClient, ImmichError
+from .client import AuthError, ImmichClient, ImmichError, NotFoundError
 from .config import ENV_KEY, ENV_URL, Settings, config_path, load_settings, save_settings
 from .engine import (
     Plan,
@@ -166,8 +166,74 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         problems += 1
         _echo(f"  [FAIL] albums: {exc}")
 
+    _report_workflow_support(client)
+
     _echo("\nAll good." if not problems else f"\n{problems} thing(s) need attention.")
     return EXIT_OK if not problems else EXIT_ERROR
+
+
+# Methods whose name or description suggests they can match on image content
+# rather than on metadata. Immich's own core plugin ships none of these.
+_SEMANTIC_HINTS = ("smart", "clip", "similar", "semantic", "embedding", "description")
+
+
+def _report_workflow_support(client: ImmichClient) -> None:
+    """Report whether the server has native Workflows, and what they can do.
+
+    Immich gained a Workflows feature (triggers, plugin filters and actions,
+    with a UI at /workflows). It complements this tool rather than replacing
+    it: workflows fire on asset events, so they organize new uploads, while
+    this tool sweeps a library that already exists.
+    """
+    _echo("\nWorkflows and plugins:")
+    try:
+        plugins = client.list_plugins()
+    except NotFoundError:
+        _echo("  [--]   this server predates Immich Workflows; nothing to integrate with")
+        return
+    except ImmichError as exc:
+        _echo(f"  [warn] could not read plugins: {exc}")
+        return
+
+    _echo(f"  [ok]   Workflows supported - {len(plugins)} plugin(s) installed")
+    for plugin in plugins:
+        _echo(
+            f"           {plugin.get('name', '?')} {plugin.get('version', '')}"
+            f" - {plugin.get('title', '')}"
+        )
+
+    try:
+        methods = client.list_plugin_methods()
+    except ImmichError as exc:
+        _echo(f"  [warn] could not read plugin methods: {exc}")
+        return
+
+    filters = [m for m in methods if "Filter" in (m.get("uiHints") or [])]
+    actions = [m for m in methods if "Filter" not in (m.get("uiHints") or [])]
+    _echo(f"  [ok]   {len(filters)} filter(s), {len(actions)} action(s) available")
+
+    semantic = [
+        m for m in methods
+        if any(h in f"{m.get('name', '')} {m.get('title', '')}".lower() for h in _SEMANTIC_HINTS)
+    ]
+    if semantic:
+        _echo("  [ok]   a content-matching filter is installed:")
+        for method in semantic:
+            _echo(f"           {method.get('key') or method.get('name')} - {method.get('title', '')}")
+    else:
+        _echo(
+            "  [--]   no content-matching filter installed. Every built-in filter\n"
+            "         matches on metadata (filename, date, location, EXIF, tags),\n"
+            "         so workflows cannot yet file photos by what they look like.\n"
+            "         See plugins/immich-smart-album/ in this repository."
+        )
+
+    try:
+        workflows = client.list_workflows()
+        enabled = sum(1 for w in workflows if w.get("enabled"))
+        _echo(f"  [ok]   {len(workflows)} workflow(s) defined, {enabled} enabled")
+    except ImmichError as exc:
+        _echo(f"  [warn] could not read workflows: {exc}")
 
 
 def cmd_albums(args: argparse.Namespace) -> int:
