@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Immich Organizer">
+  <rect width="512" height="512" rx="108" fill="#2f6df6"/>
+  <rect x="104" y="150" width="200" height="150" rx="16" fill="#ffffff" opacity=".55"/>
+  <rect x="150" y="196" width="200" height="150" rx="16" fill="#ffffff" opacity=".78"/>
+  <rect x="196" y="242" width="200" height="150" rx="16" fill="#ffffff"/>
+  <circle cx="246" cy="290" r="22" fill="#2f6df6"/>
+  <path d="M196 372l58-54 40 34 44-40 58 52v12a16 16 0 0 1-16 16H212a16 16 0 0 1-16-16z" fill="#2f6df6" opacity=".35"/>
+</svg>

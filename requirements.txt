@@ -1,0 +1,3 @@
+# The tool itself needs nothing beyond the Python standard library.
+# PyYAML is required only if you write your rules file in YAML rather than JSON.
+PyYAML>=5.1

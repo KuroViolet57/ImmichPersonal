@@ -1,0 +1,117 @@
+# Immich Organizer rules
+# ----------------------
+# Copy this to rules.yaml and edit. Then:
+#
+#   immich-organizer plan  -r rules.yaml --html plan.html --open   # preview
+#   immich-organizer apply -r rules.yaml                           # do it
+#
+# Rules are re-runnable: photos already in the target album are skipped, so
+# running the same file weekly just picks up whatever you have uploaded since.
+
+version: 1
+
+# Applied to every rule unless the rule overrides them.
+defaults:
+  limit: 150          # hard cap on matches per rule (see the note at the bottom)
+  create_album: true  # create the target album if it does not exist yet
+  filters:
+    type: IMAGE       # skip videos everywhere; a rule can set type: VIDEO
+
+rules:
+
+  # ---------------------------------------------------------------------
+  # 1. The plain case: describe what you want, name the album.
+  #    `query` is the same natural-language search the Immich web UI uses.
+  # ---------------------------------------------------------------------
+  - name: Mountains
+    album: Mountains
+    query: person in a mountain
+    limit: 200
+
+  # ---------------------------------------------------------------------
+  # 2. "Everything that looks like this photo" -- the three-dots
+  #    "search similar" feature, as a rule.
+  #    Get the asset ID from the Immich URL when a photo is open, or run:
+  #        immich-organizer search --query "my dog" --limit 10
+  #    and copy the ID of the best match from the last column.
+  # ---------------------------------------------------------------------
+  - name: Photos of Bailey
+    album: Bailey
+    like_asset: 00000000-0000-0000-0000-000000000000   # <- replace this
+    limit: 300
+
+  # ---------------------------------------------------------------------
+  # 3. Refinement. Smart search returns no similarity score, so a single
+  #    query with a big limit drags in junk. `all_of` keeps only results
+  #    that ALSO come back for those searches; `none_of` drops anything
+  #    matching them. This is the main precision lever you have.
+  # ---------------------------------------------------------------------
+  - name: Beach days
+    album: Beach
+    query: beach
+    limit: 250
+    refine:
+      all_of:
+        - sand and ocean
+      none_of:
+        - swimming pool
+        - bathroom
+      pool: 800       # how deep each refinement search looks
+
+  # ---------------------------------------------------------------------
+  # 4. Filters. Every documented smart-search filter is available.
+  #    `only_unfiled: true` is the useful one for inbox-style triage:
+  #    it looks only at photos that are not in any album yet.
+  # ---------------------------------------------------------------------
+  - name: Recent food photos
+    album: Food
+    query: a plate of food in a restaurant
+    limit: 120
+    filters:
+      taken_after: -18m      # relative: -30d, -6m, -2y. Or 2023-01-01.
+      only_unfiled: true
+
+  - name: Lisbon trip
+    album: Lisbon 2024
+    query: street scene with old buildings
+    filters:
+      city: Lisbon
+      taken_after: 2024-03-01
+      taken_before: 2024-03-15
+
+  # ---------------------------------------------------------------------
+  # 5. Videos, and extra actions. `archive` hides the filed assets from the
+  #    main timeline without deleting them; `favorite` stars them.
+  # ---------------------------------------------------------------------
+  - name: Concert clips
+    album: Concerts
+    query: a concert stage with lights
+    limit: 80
+    filters:
+      type: VIDEO
+    actions:
+      favorite: true
+      archive: false
+
+  # ---------------------------------------------------------------------
+  # 6. Screenshots and receipts -- worth archiving out of the timeline.
+  #    Set `enabled: false` to keep a rule in the file without running it.
+  # ---------------------------------------------------------------------
+  - name: Screenshots
+    album: Screenshots
+    query: a screenshot of a phone screen
+    limit: 400
+    enabled: false
+    actions:
+      archive: true
+
+# ---------------------------------------------------------------------------
+# About `limit`
+#
+# Immich's smart search ranks the whole library by how close each photo is to
+# your query and hands back the top N. It never says "nothing matched" -- ask
+# for 500 photos of a dog in a library with 12 dogs and you get 488 non-dogs.
+#
+# So `limit` is the real control, not a threshold. Start low (50-100), look at
+# the HTML preview, and raise it until the tail stops being relevant.
+# ---------------------------------------------------------------------------

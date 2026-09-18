@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#14161a">
+<title>Immich Organizer</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <h1>Immich Organizer</h1>
+  <div class="status" id="status">connecting…</div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab is-active" data-panel="search" role="tab">Search</button>
+  <button class="tab" data-panel="rules" role="tab">Rules</button>
+</nav>
+
+<main>
+  <!-- ------------------------------------------------------- search panel -->
+  <section class="panel is-active" id="panel-search">
+    <div class="card">
+      <div class="seg" id="mode">
+        <button class="seg-btn is-active" data-mode="query">Describe it</button>
+        <button class="seg-btn" data-mode="like">Like this photo</button>
+      </div>
+
+      <label class="field" id="field-query">
+        <span>What are you looking for?</span>
+        <input id="query" type="text" placeholder="person in a mountain" autocomplete="off">
+      </label>
+
+      <label class="field is-hidden" id="field-like">
+        <span>Reference asset ID</span>
+        <input id="like" type="text" placeholder="paste an asset UUID" autocomplete="off" spellcheck="false">
+        <small>Open a photo in Immich — the ID is the last part of the URL.</small>
+      </label>
+
+      <details class="more">
+        <summary>Filters &amp; refinement</summary>
+        <div class="grid-2">
+          <label class="field">
+            <span>Max results</span>
+            <input id="limit" type="number" value="60" min="1" max="1000" inputmode="numeric">
+          </label>
+          <label class="field">
+            <span>Type</span>
+            <select id="type">
+              <option value="">Photos &amp; videos</option>
+              <option value="IMAGE">Photos only</option>
+              <option value="VIDEO">Videos only</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Taken after</span>
+            <input id="takenAfter" type="date">
+          </label>
+          <label class="field">
+            <span>Taken before</span>
+            <input id="takenBefore" type="date">
+          </label>
+        </div>
+        <label class="check">
+          <input id="unfiled" type="checkbox">
+          <span>Only photos not already in an album</span>
+        </label>
+        <label class="field">
+          <span>Must also match (comma separated)</span>
+          <input id="allOf" type="text" placeholder="snow, hiking boots" autocomplete="off">
+          <small>Narrows results to photos that show up for these searches too.</small>
+        </label>
+        <label class="field">
+          <span>Must not match</span>
+          <input id="noneOf" type="text" placeholder="ski resort" autocomplete="off">
+        </label>
+      </details>
+
+      <button class="btn btn-primary" id="run">Search</button>
+    </div>
+
+    <div class="card is-hidden" id="results-card">
+      <div class="results-head">
+        <strong id="results-count">0 results</strong>
+        <div class="results-actions">
+          <button class="btn btn-quiet" id="select-all">All</button>
+          <button class="btn btn-quiet" id="select-none">None</button>
+        </div>
+      </div>
+      <p class="hint">Tap a photo to include or exclude it. Smart search has no
+        confidence score, so the tail of a long list is usually noise.</p>
+      <div class="grid" id="results"></div>
+    </div>
+
+    <div class="card is-hidden" id="file-card">
+      <label class="field">
+        <span>Add selected to album</span>
+        <input id="album" type="text" list="album-list" placeholder="Mountains" autocomplete="off">
+        <datalist id="album-list"></datalist>
+      </label>
+      <label class="check"><input id="archive" type="checkbox"><span>Archive them (hide from main timeline)</span></label>
+      <label class="check"><input id="favorite" type="checkbox"><span>Mark as favorite</span></label>
+      <button class="btn btn-primary" id="file">Add <span id="file-count">0</span> to album</button>
+    </div>
+  </section>
+
+  <!-- -------------------------------------------------------- rules panel -->
+  <section class="panel" id="panel-rules">
+    <div class="card">
+      <h2>Saved rules</h2>
+      <p class="hint" id="rules-path">No rules file loaded.</p>
+      <div id="rules-list"></div>
+      <div class="row">
+        <button class="btn" id="preview-rules">Preview all</button>
+        <button class="btn btn-danger" id="apply-rules">Apply all</button>
+      </div>
+    </div>
+    <div class="card is-hidden" id="plan-card">
+      <h2>Plan</h2>
+      <div id="plan-body"></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast is-hidden" id="toast"></div>
+<div class="veil is-hidden" id="veil"><div class="spinner"></div><span id="veil-text">Working…</span></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
