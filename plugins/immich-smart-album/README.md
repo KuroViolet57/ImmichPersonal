@@ -108,7 +108,7 @@ Tagging a photo now files it if it looks like the description.
 | **Match depth** | How many of the closest results count as a match. See below. |
 | **Invert** | Continue only when the asset does *not* match. |
 | **Immich URL (internal)** | How the plugin reaches Immich from inside the container. `http://localhost:2283` is usually right. |
-| **API key** | Used for the search call. |
+| **API key** | Used for the search call only. Grant it just `asset.read` — that is the sole permission `POST /api/search/smart` requires. See [Why an API key](#why-an-api-key). |
 | **Diagnose non-matches** | On a non-match, check whether the asset is indexed yet and log why. One extra request per non-matching asset. |
 
 ### Why "match depth" and not a confidence threshold
@@ -125,6 +125,36 @@ Two consequences:
 - Too large and the tail — the least-similar results — starts matching. Preview
   a query with `immich-organizer search --query "..." --limit N --html out.html`
   to see where it goes wrong before committing to a number.
+
+### Why an API key
+
+The plugin reaches smart search over HTTP, and Immich treats that as an
+ordinary API call, so it needs its own credential.
+
+It cannot borrow the workflow's identity. The `authToken` a plugin receives is
+a JWT signed with a secret the server generates fresh on every boot, and only
+the workflow host validates it — it authorises the six host functions
+(`searchAlbums`, `createAlbum`, `addAssetsToAlbum`, `addAssetsToAlbums`,
+`bulkTagAssets`, `httpRequest`), not the REST API. And `httpRequest` performs a
+plain `fetch` with exactly the headers the plugin supplies; the host adds no
+credentials of its own.
+
+None of those six host functions can search, which is why this step goes over
+HTTP at all. If Immich ever adds a search host function, the key becomes
+unnecessary and this plugin should drop it.
+
+Two consequences worth acting on:
+
+- **Scope the key to `asset.read`.** That is the only permission the endpoint
+  requires. Adding to the album is the *next* step's job, done through host
+  functions, so the key needs no album permissions.
+- **Use the key of the user who owns the photos.** The filter asks "is this
+  asset among the closest matches", and the search only sees libraries the key
+  can read. A key belonging to another account searches a different library,
+  so nothing ever matches.
+
+Step config is stored in Immich's database and shown to anyone who can open
+the workflow, so treat the key as visible to your Immich admins.
 
 ### Network access
 

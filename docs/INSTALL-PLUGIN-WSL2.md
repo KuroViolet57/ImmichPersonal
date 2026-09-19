@@ -128,14 +128,14 @@ docker compose logs immich-server | grep -i plugin
 You want this line:
 
 ```
-Imported plugin immich-smart-album@1.0.0 (1 methods) from /plugins/immich-smart-album
+Imported plugin immich-smart-album@1.0.1 (1 methods) from /plugins/immich-smart-album
 ```
 
 Other things you might see, and what they mean:
 
 | Log line | Cause |
 |---|---|
-| `Plugin up to date (name=immich-smart-album@1.0.0, hash=...)` | Already installed, nothing to do. |
+| `Plugin up to date (name=immich-smart-album@1.0.1, hash=...)` | Already installed, nothing to do. |
 | `Invalid plugin manifest at ...` | `manifest.json` is truncated or corrupt — re-download it. The message lists which fields failed. |
 | `Failed to import plugin from /plugins/...` | Something else went wrong. Immich logs no detail here, so check the obvious causes: `plugin.wasm` missing or truncated, or the folder not readable inside the container. Verify with `docker compose exec immich-server ls -la /plugins/immich-smart-album`. |
 | nothing at all about plugins | `IMMICH_ALLOW_EXTERNAL_PLUGINS` was not picked up. Check with `docker compose config \| grep IMMICH_ALLOW`, then recreate: `docker compose up -d --force-recreate`. |
@@ -156,10 +156,28 @@ In Immich: **Workflows → New**, or pick the **Smart album** template.
 2. **Step 1 — Filter by smart search:**
    - *Description*: `person in a mountain`
    - *Match depth*: `200`
-   - *API key*: create one under Account Settings → API Keys and paste it.
+   - *API key*: see below.
 3. **Step 2 — Add to Album(s):** choose or name the album.
 
 Save and enable it. Now tagging a photo files it if it matches.
+
+### Make the API key a read-only one
+
+The plugin needs a key because it reaches smart search over HTTP, and Immich
+treats that as an ordinary API call. It does **not** need a powerful key.
+
+`POST /api/search/smart` is guarded by exactly one permission: `asset.read`.
+Filing into the album is done by the next workflow step, which uses Immich's
+internal plugin functions rather than your key — so the key needs nothing else.
+
+In **Account Settings → API Keys → New API Key**, the permission list starts
+empty. Tick only **`asset.read`** and leave everything else off. The resulting
+key can read photos and nothing more: it cannot delete, modify, share or
+upload.
+
+Store it knowing where it ends up: workflow step settings are saved in Immich's
+database and are visible to anyone who can open that workflow in the UI. A
+read-only key limits what that exposure is worth.
 
 ---
 
