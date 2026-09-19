@@ -44,6 +44,10 @@ than failing silently. Leave **Diagnose non-matches** on until you trust it.
 
 ## Install
 
+> Running Immich in Docker on WSL2? There is a step-by-step walkthrough at
+> [`docs/INSTALL-PLUGIN-WSL2.md`](../../docs/INSTALL-PLUGIN-WSL2.md), and
+> `scripts/install-plugin.sh` automates most of it.
+
 ### 1. Enable external plugins
 
 Immich only loads third-party plugins when you opt in. Add to the

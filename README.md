@@ -188,6 +188,9 @@ adding a **"Filter by smart search"** step, so a native workflow can say
 *"photos that look like a mountain → Mountains"*. It is written against
 Immich's plugin SDK interface, compiled to WASM, and ships prebuilt.
 
+Install guide for Docker on WSL2: [`docs/INSTALL-PLUGIN-WSL2.md`](docs/INSTALL-PLUGIN-WSL2.md), or run
+`./scripts/install-plugin.sh ~/immich-app` from a checkout inside WSL2.
+
 One caveat it cannot engineer away: a freshly uploaded photo has no CLIP
 embedding when the upload triggers fire, so the plugin is reliable on the
 `AssetTagged` trigger and not on `AssetCreate`. Full explanation in
