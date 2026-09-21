@@ -190,6 +190,9 @@ Immich's plugin SDK interface, compiled to WASM, and ships prebuilt.
 
 Install guide for Docker on WSL2: [`docs/INSTALL-PLUGIN-WSL2.md`](docs/INSTALL-PLUGIN-WSL2.md), or run
 `./scripts/install-plugin.sh ~/immich-app` from a checkout inside WSL2.
+Handing the job to an agent instead? [`docs/COWORK-RUNBOOK-install-plugin.md`](docs/COWORK-RUNBOOK-install-plugin.md)
+is the same procedure written for a Claude Cowork session to execute, with
+verification gates and a rollback.
 
 One caveat it cannot engineer away: a freshly uploaded photo has no CLIP
 embedding when the upload triggers fire, so the plugin is reliable on the

@@ -3,6 +3,10 @@
 For the common Windows setup: Immich running under Docker inside WSL2, reached
 from your Windows browser at `http://localhost:2283`.
 
+> Want an agent to do this instead? [`COWORK-RUNBOOK-install-plugin.md`](COWORK-RUNBOOK-install-plugin.md)
+> is the same procedure written for a Claude Cowork session, with gates,
+> failure handling and a rollback.
+
 Everything here happens **inside WSL2**, not in PowerShell. Open your WSL
 terminal (`wsl` from PowerShell, or the Ubuntu app).
 
