@@ -38,8 +38,17 @@ the HTTP server answers at once, the models load in a background thread, and eve
 only its own slot.
 
 Environment: `AITAGGER_VRAM_GB` (memory cap for this process, default 5), `AITAGGER_BATCH` (GPU micro-batch,
-default 16), `IDLE_EXIT_MINUTES` (default 20; **must not exit while a request is in flight**), `WD_MODEL`, `RAM_MODEL`.
-Model files live under `/cache`.
+default 16), `IDLE_EXIT_MINUTES` (default 20; **must not exit while a request is in flight**), `WD_MODEL`, `RAM_MODEL`,
+`WD_PRECISION` (default `fp16`: the ONNX model is converted once and cached; `fp32` keeps the original). Model files live
+under `/cache` (`/cache/hub` is a Hugging Face cache). Built and measured: WD fp16 + RAM++ fp16 loads in about 6 s and
+holds about 4 GB of VRAM under the 5 GB cap; about 40 pictures/s with both models (WD alone 70/s, RAM++ alone 85/s).
+WD is run in micro-batches of at most 8 (bigger gains nothing); a CUDA out-of-memory answer halves the micro-batch of
+that model for the rest of the process (`effectiveBatch` in `/health`).
+
+RAM++ is **not** the official `ram` package (its pins, `timm==0.4.12`/`fairscale`/an old `transformers`, no longer
+install). The image build fetches one pinned commit of `xinyu1205/recognize-anything` and keeps only the Swin-L backbone
+source, the tag list with per-class thresholds and the licence files (`/opt/ram`); `tagger_service.py` implements the small
+tagging head itself. Checked against the official code on real pictures: identical logits in fp32, one tag in 167 flips in fp16.
 
 ### `GET /health`
 ```json
@@ -50,7 +59,10 @@ Model files live under `/cache`.
 ```
 
 ### `POST /tag`
-Request: `{"images": ["<base64 jpeg/png>", ...], "floor": 0.05}` (maximum 64 images).
+Request: `{"images": ["<base64 jpeg/png>", ...], "floor": 0.05}` (maximum 64 images). Optional: `"models": ["wd"]` or
+`["ram"]` runs only that model (default both; the other key is then absent), so the panel can skip a disabled tagger.
+`/health` also reports `effectiveBatch: {wd, ram}`. Any failure of one picture on one model makes that slot an error
+(`results[i]` null, `errors[i]` says which model).
 
 Response:
 ```json
@@ -74,8 +86,24 @@ untagged and are tried again); a 4xx is a bug in the request.
 
 `vllm/vllm-openai` serving `Qwen/Qwen3.5-9B` as model name `tagger-vlm`, on `127.0.0.1:11441` (container port 8000).
 Flags: `--quantization fp8`, `--gpu-memory-utilization ${AITAGGER_VLM_UTIL}`, `--max-model-len 8192`,
-`--max-num-seqs ${AITAGGER_VLM_SEQS}`, `--limit-mm-per-prompt {"image":8}`. The HF cache is a volume under
-`~/vlm/models/aitagger/hf`. Ready means `GET /health` answers 200.
+`--max-num-seqs ${AITAGGER_VLM_SEQS}`, `--limit-mm-per-prompt {"image":8}`, plus (added when building it, see below)
+`--max-num-batched-tokens 8192`, `--mm-processor-kwargs {"max_pixels":589824}` and
+`--default-chat-template-kwargs {"enable_thinking":false}`. Image `vllm/vllm-openai:v0.30.0`. The HF cache is a volume under
+`~/vlm/models/aitagger/hf` (the torch.compile cache is another, `.../vllm`). Ready means `GET /health` answers 200
+(about 2 minutes after `up`, once the weights are cached).
+
+**Memory (measured, RTX 4090, vLLM 0.30.0).** The FP8 weights take 10.8 GiB (embeddings, lm_head and the vision tower stay
+bf16), plus about 1 GiB of activations, plus the KV cache. `--gpu-memory-utilization 0.45` (11 GiB) therefore **cannot
+start**: "No available memory for the cache blocks". 0.51 is the bare minimum, 0.58 (13.9 GiB, 38k tokens of KV cache)
+runs 8 concurrent requests with 6 pictures each; the real footprint is about 0.8 GiB more than the fraction (CUDA
+context): 14.6 GiB at 0.58. With the formula in section 3 this needs `vram_gb >= 19` (0.58); the settings default of 16
+(0.46) is too low, 20 (0.62) is a good default. Measured with everything running: Immich ML 2.2 GB + tagger 4.0 GB +
+VLM 14.6 GB = 21 GB of 24. Speed: one request with 6 pictures (about 2k prompt tokens, 200 answer tokens) takes
+about 3 s; 8 in flight give about 1.7-2 requests/s (100-125 per minute); the worst case of 8 pictures of 768x768 px each
+(5k prompt tokens) about 1 request/s. Thinking text never appears. A prompt that does not limit the tag lists made 4 of
+16 answers run into `max_tokens` (cut-off, invalid JSON); with `"maxItems": 12` on `add_tags` and `remove_tags` in the
+schema, 0 of 16 (vLLM enforces it), so the panel should add `maxItems` to its schema and ask for "at most 8" tags.
+Restarting the stopped container takes about 70 s; first start downloads 18 GB.
 
 The panel calls `POST /v1/chat/completions` with:
 - `model: "tagger-vlm"`, `temperature: 0.2`, `max_tokens: 400`

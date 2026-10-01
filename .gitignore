@@ -27,5 +27,9 @@ secrets.*
 # Search+ model cache location on this machine
 deploy/searchplus/.env
 
+# AI Tagger model cache location on this machine (the .env.* rule above would also hide the example)
+deploy/aitagger/.env
+!deploy/aitagger/.env.example
+
 # Agent worktrees (Claude Code)
 .claude/worktrees/
