@@ -651,10 +651,10 @@
       <div class="results-head">
         <h2>AI Tagger <span class="badge">experimental</span></h2>
       </div>
-      <p class="hint" id="tg-about">Two AI taggers find the objects, people and scenes in every photo and video, then a
-        vision model refines the tags and writes a short description that follows your instructions. The result goes
-        into the photo's description in Immich, inside a block marked <code>[AI Tagger]</code>. Your own text is never
-        changed.</p>
+      <p class="hint" id="tg-about">Two AI taggers find the objects, people, characters and scenes in every photo and
+        video, then a small text model turns the tags into a short description that follows your instructions (it never
+        sees the picture, only the tags). The result goes into the photo's description in Immich, inside a block marked
+        <code>[AI Tagger]</code>. Your own text is never changed.</p>
       <p class="d-state" id="tg-state">…</p>
       <div class="meter" aria-hidden="true"><div class="meter-fill" id="tg-meter"></div></div>
       <p class="hint" id="tg-progress"></p>
@@ -665,7 +665,7 @@
         <button class="btn btn-quiet" id="tg-toggle" type="button">Start tagging</button>
         <button class="btn btn-quiet" id="tg-unload" type="button">Stop &amp; free GPU</button>
       </div>
-      <p class="hint" style="margin-top:10px">Search+ is paused while the AI Tagger uses the graphics card. Pause the
+      <p class="hint" id="tg-exclusive-note" style="margin-top:10px">Search+ is paused while the AI Tagger uses the graphics card. Pause the
         tagger and press “Stop &amp; free GPU” to give it back. The models also unload by themselves after a quiet
         spell.</p>
       <details class="more is-hidden" id="tg-fail-box">
@@ -704,10 +704,10 @@
         <span>Language of the descriptions</span>
         <input id="tg-language" type="text" maxlength="40" placeholder="English" autocomplete="off">
       </label>
-      <label class="check"><input id="tg-describe" type="checkbox"><span>Write a description (needs the description model)</span></label>
+      <label class="check"><input id="tg-describe" type="checkbox"><span>Short description from the tags (small text model)</span></label>
       <label class="check"><input id="tg-use-wd" type="checkbox"><span>Use the illustration / people tagger (WD)</span></label>
-      <label class="check"><input id="tg-use-ram" type="checkbox"><span>Use the everyday objects and scenes tagger (RAM++)</span></label>
-      <label class="check"><input id="tg-character" type="checkbox"><span>Add character names (for example cartoon characters)</span></label>
+      <label class="check"><input id="tg-use-pixai" type="checkbox"><span>PixAI (anime/illustration, characters, series)</span></label>
+      <label class="check"><input id="tg-character" type="checkbox"><span>Add character and series names (for example cartoon characters)</span></label>
       <label class="check"><input id="tg-rating" type="checkbox"><span>Add a rating tag (rating: general, sensitive, …)</span></label>
       <label class="check"><input id="tg-write-tags" type="checkbox"><span>Also add the tags to Immich as real tags, under “AI/”</span></label>
       <label class="field">
@@ -715,8 +715,8 @@
         <input class="slider" id="tg-wd" type="range" step="0.01">
       </label>
       <label class="field">
-        <span>RAM++ strictness: <b id="tg-ram-v"></b></span>
-        <input class="slider" id="tg-ram" type="range" step="0.01">
+        <span>PixAI strictness: <b id="tg-pixai-v"></b></span>
+        <input class="slider" id="tg-pixai" type="range" step="0.01">
         <small>Higher means fewer, surer tags. At 0.50 each model uses the cut-off its authors recommend.</small>
       </label>
       <label class="field">
@@ -762,8 +762,8 @@
       <label class="field">
         <span>GPU memory: <b id="tg-vram-v"></b></span>
         <input class="slider" id="tg-vram" type="range" step="1">
-        <small>Shared by the taggers (5 GB) and the description model. Parallel descriptions and GPU memory take
-          effect the next time the models start.</small>
+        <small>Memory for the two taggers; the description model uses about 3 GB on its own. Parallel descriptions
+          and GPU memory take effect the next time the models start.</small>
       </label>
       <button class="btn btn-primary" id="tg-save-speed" type="button">Save</button>
       <label class="check" style="margin-top:14px"><input id="tg-keep" type="checkbox"><span>Keep it up to date: tag new uploads

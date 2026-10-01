@@ -1763,7 +1763,7 @@
   });
 
   // -------------------------------------------------------------- AI Tagger
-  // Two image taggers plus a vision model write tags and a description into the Immich description
+  // Two image taggers plus a small text model write tags and a description into the Immich description
   // (see aitagger.py and docs/AI-TAGGER.md). Same shape as Search+: status polled every 5 s while the tab shows.
 
   const tagState = {
@@ -1793,12 +1793,12 @@
     language:       { id: "tg-language", kind: "line" },
     describe:       { id: "tg-describe", kind: "bool" },
     use_wd:         { id: "tg-use-wd", kind: "bool" },
-    use_ram:        { id: "tg-use-ram", kind: "bool" },
+    use_pixai:      { id: "tg-use-pixai", kind: "bool" },
     character_tags: { id: "tg-character", kind: "bool" },
     rating_tag:     { id: "tg-rating", kind: "bool" },
     write_tags:     { id: "tg-write-tags", kind: "bool" },
     wd_strictness:  { id: "tg-wd", kind: "float" },
-    ram_strictness: { id: "tg-ram", kind: "float" },
+    pixai_strictness: { id: "tg-pixai", kind: "float" },
     max_tags:       { id: "tg-max", kind: "int" },
     video_frames:   { kind: "frames" },
     batch_size:     { id: "tg-batch", kind: "int" },
@@ -1807,17 +1807,17 @@
   };
   const TG_LABELS = {
     instructions: "Instructions", vocabulary: "Vocabulary", blocked: "Blocked tags", language: "Language",
-    describe: "Write a description", use_wd: "WD tagger", use_ram: "RAM++ tagger", character_tags: "Character names",
-    rating_tag: "Rating tag", write_tags: "Immich tags", wd_strictness: "WD strictness", ram_strictness: "RAM++ strictness",
+    describe: "Short description from the tags", use_wd: "WD tagger", use_pixai: "PixAI tagger", character_tags: "Character names",
+    rating_tag: "Rating tag", write_tags: "Immich tags", wd_strictness: "WD strictness", pixai_strictness: "PixAI strictness",
     max_tags: "Most tags per photo", rules: "Rules", video_frames: "Captures per video", batch_size: "Assets per round",
     vlm_parallel: "Parallel descriptions", vram_gb: "GPU memory",
   };
   // Which settings change what is written, and the lightest reprocess mode that applies them.
   const TG_MODE_OF = {
-    wd_strictness: "retag", ram_strictness: "retag", rules: "retag", blocked: "retag", max_tags: "retag",
+    wd_strictness: "retag", pixai_strictness: "retag", rules: "retag", blocked: "retag", max_tags: "retag",
     write_tags: "retag", character_tags: "retag", rating_tag: "retag",
     instructions: "describe", vocabulary: "describe", language: "describe", describe: "describe",
-    video_frames: "full", use_wd: "full", use_ram: "full",
+    video_frames: "full", use_wd: "full", use_pixai: "full",
   };
   const TG_MODES = [
     ["retag", "Re-tag", "quick, re-applies the stored results, no GPU needed"],
@@ -1825,12 +1825,12 @@
     ["full", "Full re-process", "runs the taggers and the description model again, slowest"],
   ];
   const TG_GROUPS = {
-    how: ["instructions", "vocabulary", "blocked", "language", "describe", "use_wd", "use_ram", "character_tags",
-      "rating_tag", "write_tags", "wd_strictness", "ram_strictness", "max_tags"],
+    how: ["instructions", "vocabulary", "blocked", "language", "describe", "use_wd", "use_pixai", "character_tags",
+      "rating_tag", "write_tags", "wd_strictness", "pixai_strictness", "max_tags"],
     rules: ["rules"],
     speed: ["video_frames", "batch_size", "vlm_parallel", "vram_gb"],
   };
-  const TG_LIMIT_IDS = { wd_strictness: "tg-wd", ram_strictness: "tg-ram", max_tags: "tg-max", batch_size: "tg-batch",
+  const TG_LIMIT_IDS = { wd_strictness: "tg-wd", pixai_strictness: "tg-pixai", max_tags: "tg-max", batch_size: "tg-batch",
     vlm_parallel: "tg-parallel", vram_gb: "tg-vram" };
   const TG_RULE_KEYS = ["if_all", "if_any", "unless", "add", "remove"];
 
@@ -1875,10 +1875,10 @@
 
   function tgShowSliders() {
     $("tg-wd-v").textContent = tgScore($("tg-wd").value);
-    $("tg-ram-v").textContent = tgScore($("tg-ram").value);
+    $("tg-pixai-v").textContent = tgScore($("tg-pixai").value);
     $("tg-vram-v").textContent = `${$("tg-vram").value} GB`;
   }
-  ["tg-wd", "tg-ram", "tg-vram"].forEach((id) => $(id).addEventListener("input", tgShowSliders));
+  ["tg-wd", "tg-pixai", "tg-vram"].forEach((id) => $(id).addEventListener("input", tgShowSliders));
 
   // The ranges come from the server (`limits`), never from here. Set them before filling in values.
   function tgApplyLimits(limits) {
@@ -1991,8 +1991,10 @@
 
     const lines = [`Taggers: ${tgServiceWord(tg)} · Description model: ${tgServiceWord(vl)}`
       + (gpu.totalGb ? ` · GPU ${gpu.usedGb != null ? gpu.usedGb : "?"} of ${gpu.totalGb} GB in use` : "")];
-    if (sv.searchplusRunning) lines.push("Search+ is using the GPU right now; it is stopped when the tagger starts.");
-    const names = [models.wd, models.ram, models.vlm].filter(Boolean);
+    const exclusive = sv.exclusive !== false;      // the panel says whether Search+ and the tagger take turns on the GPU
+    $("tg-exclusive-note").classList.toggle("is-hidden", !exclusive);
+    if (exclusive && sv.searchplusRunning) lines.push("Search+ is using the GPU right now; it is stopped when the tagger starts.");
+    const names = [models.wd, models.pixai, models.vlm].filter(Boolean);
     if (names.length) lines.push(`Models: ${names.join(" · ")}`);
     $("tg-service").textContent = lines.join("\n");
 
@@ -2249,7 +2251,8 @@
     const on = tagState.data && tagState.data.settings.indexing;
     tagCall("index", { action: on ? "pause" : "start" },
       on ? "Paused. The models unload by themselves after a quiet spell (or press Stop & free GPU)."
-        : "Tagging started — it picks up by itself after a restart. Search+ is paused meanwhile.");
+        : "Tagging started — it picks up by itself after a restart."
+          + (tagState.data && tagState.data.service && tagState.data.service.exclusive === false ? "" : " Search+ is paused meanwhile."));
   });
   $("tg-unload").addEventListener("click", async () => {
     busy(true, "Stopping and freeing the GPU…");
@@ -2337,7 +2340,7 @@
 
     const m = p.models || {};
     if (m.wd) { heading(`Illustration / people tagger (WD) · ${m.wd.length}`); tgChips(out, m.wd); }
-    if (m.ram) { heading(`Everyday objects tagger (RAM++) · ${m.ram.length}`); tgChips(out, m.ram); }
+    if (m.pixai) { heading(`Anime / illustration, characters and series tagger (PixAI) · ${m.pixai.length}`); tgChips(out, m.pixai); }
     if (m.rating) {
       const ratings = Object.entries(m.rating).sort((a, b) => b[1] - a[1]);
       if (ratings.length) {
