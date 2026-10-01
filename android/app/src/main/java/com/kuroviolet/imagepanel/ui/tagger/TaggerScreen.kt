@@ -392,7 +392,7 @@ private fun StatusCard(vm: TaggerVm) {
         val gpu = sv.o("gpu")
         Hint(serviceText(sv.o("tagger"), "Taggers") + " · " + serviceText(sv.o("vlm"), "Describer") +
             (gpu.d("usedGb")?.let { " · GPU %.1f of %.0f GB in use".format(it, gpu.d("totalGb") ?: 24.0) } ?: ""))
-        Hint("Search+ is paused while the AI Tagger uses the GPU.")
+        if (sv.b("exclusive") != false) Hint("Search+ is paused while the AI Tagger uses the GPU.")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Button(onClick = {
                 vm.action("index", buildJsonObject { put("action", if (indexing) "pause" else "start") },
