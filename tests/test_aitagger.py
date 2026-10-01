@@ -465,15 +465,30 @@ class TestFinalTags(unittest.TestCase):
         vlm = {"description": "A girl.", "add_tags": ["Smile", "Sea Shore"], "remove_tags": ["solo", "nothing"]}
         got = self.build(vlm)
         by = {t["tag"]: t for t in got["tags"]}
-        self.assertEqual(by["smile"], {"tag": "smile", "score": 1.0, "source": "vlm"})
-        self.assertEqual(by["sea shore"]["score"], 1.0)
+        self.assertEqual(by["smile"], {"tag": "smile", "score": 0.7, "source": "vlm"})
+        self.assertEqual(by["sea shore"]["score"], 0.7)
         self.assertNotIn("solo", by)
         self.assertEqual(by["girl"]["source"], "wd")
         self.assertEqual(got["description"], "A girl.")
 
-    def test_a_tag_the_vlm_adds_that_was_found_already_keeps_its_source_and_gets_score_1(self):
-        got = self.build({"description": "", "add_tags": ["sea"], "remove_tags": []})
-        self.assertEqual([t for t in got["tags"] if t["tag"] == "sea"], [{"tag": "sea", "score": 1.0, "source": "ram"}])
+    def test_a_tag_the_vlm_adds_that_was_found_already_keeps_its_source_and_score(self):
+        got = self.build({"description": "", "add_tags": ["sea", "girl"], "remove_tags": []})
+        by = {t["tag"]: t for t in got["tags"]}
+        self.assertEqual(by["sea"], {"tag": "sea", "score": 0.7, "source": "ram"})
+        self.assertEqual(by["girl"], {"tag": "girl", "score": 0.9, "source": "wd"})       # never lowered
+
+    def test_a_tag_the_vlm_both_adds_and_removes_is_ignored(self):
+        got = self.build({"description": "", "add_tags": ["smile", "solo"], "remove_tags": ["smile", "solo"]})
+        names = tags_of(got)
+        self.assertNotIn("smile", names)                    # not added
+        self.assertIn("solo", names)                        # not removed either
+
+    def test_the_vlm_cannot_remove_a_sure_tag_or_the_rating(self):
+        vlm = {"description": "", "add_tags": [], "remove_tags": ["girl", "beach", "rating: general"]}
+        names = tags_of(self.build(vlm))
+        self.assertIn("girl", names)                        # 0.9: a tagger is sure
+        self.assertNotIn("beach", names)                    # 0.8: the VLM may overrule it
+        self.assertIn("rating: general", names)
 
     def test_vlm_tags_are_renamed_and_blocked_too(self):
         vlm = {"description": "", "add_tags": ["1girl", "cat", "Hair_Bow"], "remove_tags": ["sea"]}
@@ -485,7 +500,7 @@ class TestFinalTags(unittest.TestCase):
         self.assertNotIn("sea", names)
         # the VLM may name a tag the way the panel showed it (already renamed)
         got = self.build({"description": "", "add_tags": [], "remove_tags": ["woman"]}, vocabulary="girl -> woman",
-                         pictures=("wd:girl=0.9",))
+                         pictures=("wd:girl=0.6",))
         self.assertEqual(tags_of(got), [r for r in tags_of(got) if r.startswith("rating")])
 
     def test_without_describe_the_vlm_is_ignored(self):
@@ -512,7 +527,7 @@ class TestFinalTags(unittest.TestCase):
         self.assertEqual(names, ["t00", "t01", "t02", "t03", "rating: general"])         # 4 + the pinned rating
         self.assertEqual(len(self.build(pictures=(pic,), max_tags=5, rating_tag=False)["tags"]), 5)
         got = self.build({"description": "", "add_tags": ["zzz"], "remove_tags": []}, pictures=(pic,), max_tags=5)
-        self.assertEqual(tags_of(got)[0], "zzz")                                            # VLM tags score 1.0: first in line
+        self.assertNotIn("zzz", tags_of(got))           # a tag only the VLM saw (0.7) ranks below the taggers' sure ones
         self.assertEqual(len(got["tags"]), 5)
 
     def test_order_is_by_score_then_name_with_the_rating_last(self):
@@ -2048,7 +2063,7 @@ class TestWithRealClients(Base):
         self.assertEqual(self.indexer.state, "done", self.indexer.detail)
         self.assertEqual(self.store.counts()["processed"], 3)
         self.assertEqual(self.description(1),
-                         "[AI Tagger]\nTags: extra, dog, grass, rating: general\nDescription: Seen: dog.\n[/AI Tagger]")
+                         "[AI Tagger]\nTags: dog, extra, grass, rating: general\nDescription: Seen: dog.\n[/AI Tagger]")
         self.assertEqual(len([r for r in tagger.requests if r[1] == "/tag"]), 1)                   # one batch
         self.assertEqual(len([r for r in vlm.requests if r[1] == "/v1/chat/completions"]), 3)
         self.assertEqual(runner.commands("compose"), [])                                            # they were running already

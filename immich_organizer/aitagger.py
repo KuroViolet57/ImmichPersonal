@@ -60,6 +60,8 @@ PREVIEW_SIDE = 256            # pictures in the Test card
 SEGMENTS = 8                  # a video is cut into this many equal parts; the first and last are skipped
 MAX_IMAGES_PER_REQUEST = 64   # what the tagger accepts in one /tag call
 MAX_RULE_PASSES = 5
+VLM_ADD_SCORE = 0.7           # a tag only the VLM saw ranks below the taggers' sure ones (rules still score 1.0)
+VLM_PROTECT = 0.9             # the VLM can't remove a tag a tagger is at least this sure of
 MAX_ATTEMPTS = searchplus.MAX_ATTEMPTS
 CLEARED = searchplus.CLEARED
 RETRY_AFTER = searchplus.RETRY_AFTER
@@ -419,15 +421,20 @@ def finalize(tags: dict, vlm: dict | None, settings: dict) -> tuple[list[dict], 
     blocked = set(settings["blocked"])
     tags = dict(tags)
     if settings["describe"] and vlm:
-        for tag in vlm.get("add_tags") or []:
-            name = vocab.rename(norm_tag(tag))
-            if name and name not in blocked:
+        # Measured on the library: the VLM sometimes drops tags the taggers are certain of, and sometimes lists
+        # the same tag under both add and remove. So a tag named both ways is ignored, a sure tagger tag (and the
+        # rating) can't be removed by it, and a tag only it saw ranks below the taggers' confident ones.
+        added = {vocab.rename(norm_tag(t)) for t in vlm.get("add_tags") or []} - {""}
+        removed = {norm_tag(t) for t in vlm.get("remove_tags") or []} - {""}
+        removed |= {vocab.rename(t) for t in removed}
+        contested = added & removed
+        for name in added - contested:
+            if name not in blocked:
                 old = tags.get(name)
-                tags[name] = (1.0, old[1] if old else "vlm")
-        for tag in vlm.get("remove_tags") or []:
-            name = norm_tag(tag)
-            tags.pop(name, None)
-            tags.pop(vocab.rename(name), None)
+                tags[name] = (max(old[0], VLM_ADD_SCORE), old[1]) if old else (VLM_ADD_SCORE, "vlm")
+        for name in removed - contested:
+            if name in tags and tags[name][0] < VLM_PROTECT and not name.startswith(RATING_PREFIX):
+                del tags[name]
     tags = {t: v for t, v in tags.items() if t not in blocked}
     tags, trace = apply_rules(tags, settings["rules"])
     tags = {t: v for t, v in tags.items() if t not in blocked}

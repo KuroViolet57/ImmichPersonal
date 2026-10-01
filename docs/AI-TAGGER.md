@@ -182,8 +182,11 @@ in order and repeat until nothing changes (at most 5 passes). Tags are compared 
    `rating: <name>` if `rating_tag` is on. WD character tags are kept only if `character_tags` is on.
 4. **Normalise.** Lowercase, `_` becomes a space, `name_(qualifier)` becomes `name (qualifier)`. Apply the vocabulary
    renames, merge duplicates across models keeping the highest score, and drop `blocked` tags.
-5. **VLM** (if `describe`). Apply its `add_tags` (score 1.0) and `remove_tags`, then normalise, rename and block again.
-6. **Rules**, then `blocked` again. Cap at `max_tags` by score; rule- and VLM-added tags score 1.0.
+5. **VLM** (if `describe`). Apply its `add_tags` and `remove_tags`, then normalise, rename and block again. Guards
+   (measured on the library, the VLM drops sure tags and sometimes names a tag both ways): a tag in both lists is
+   ignored; it cannot remove a tag a tagger scored >= 0.9, nor the rating; a tag only it saw scores 0.7, so it ranks
+   below the taggers' confident tags; a tag it confirms keeps its higher tagger score.
+6. **Rules**, then `blocked` again. Cap at `max_tags` by score; rule-added tags score 1.0.
 7. **Write.** Compose the block and write the description with `PUT /api/assets/{id}`. Read it back and compare. Keep
    the previous description in `history`. If `write_tags` is on, upsert `AI/<tag>` tags (`PUT /api/tags`), attach them
    (`PUT /api/tags/assets`), and detach `AI/` tags that are no longer present.
