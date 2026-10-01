@@ -43,6 +43,10 @@ class WebCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"IMMICH_ORGANIZER_HOME": self.tmp.name})
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.logged = []                      # the panel's journal lines, kept out of the test output
+        patcher = mock.patch("immich_organizer.web.server._log", self.logged.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         self.rules_path = Path(self.tmp.name) / "rules.json"
         self.rules_path.write_text(json.dumps({
@@ -900,6 +904,29 @@ class TestMediaAndAlbumExtras(WebCase):
         self.assertEqual(err.exception.code, 400)
         with self.assertRaises(urllib.error.HTTPError) as err:      # token required
             urllib.request.urlopen(self.base + f"/media/{self.ids[0]}", timeout=10)
+        self.assertEqual(err.exception.code, 401)
+
+    def test_media_requests_are_logged(self):
+        self.raw(f"/media/{self.ids[0]}?kind=video", {"Range": "bytes=0-", "X-Playback-Id": "ab12cd34-1"})
+        line = self.logged[-1]
+        self.assertIn(f"media video {self.ids[0][:8]} [ab12cd34-1] bytes=0- -> 206", line)
+        self.assertIn("sent 0.0 of 0.0 MB", line)
+        self.assertIn("waited on phone", line)
+        self.assertTrue(line.endswith("complete"), line)
+        with self.assertRaises(urllib.error.HTTPError):
+            self.raw("/media/ffffffff-ffff-ffff-ffff-ffffffffffff?kind=video")
+        self.assertIn("Immich answered 404", self.logged[-1])
+
+    def test_speed_test_sends_what_was_asked(self):
+        status, headers, body = self.raw("/api/diag/speed?mb=2")
+        self.assertEqual((status, len(body), headers["Cache-Control"]), (200, 2_000_000, "no-store"))
+        self.assertIn("speed test 2 MB: sent 2.0 MB", self.logged[-1])
+        self.assertEqual(len(self.raw("/api/diag/speed?mb=999")[2]), 64_000_000)    # capped
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            self.raw("/api/diag/speed?mb=lots")
+        self.assertEqual(err.exception.code, 400)
+        with self.assertRaises(urllib.error.HTTPError) as err:      # token required
+            urllib.request.urlopen(self.base + "/api/diag/speed", timeout=10)
         self.assertEqual(err.exception.code, 401)
 
     def test_asset_info(self):

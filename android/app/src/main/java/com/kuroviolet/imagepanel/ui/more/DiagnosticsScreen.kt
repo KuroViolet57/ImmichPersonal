@@ -39,6 +39,7 @@ import androidx.navigation.NavController
 import com.kuroviolet.imagepanel.BuildConfig
 import com.kuroviolet.imagepanel.Graph
 import com.kuroviolet.imagepanel.diag.Diag
+import com.kuroviolet.imagepanel.diag.PlaybackProbe
 import com.kuroviolet.imagepanel.model.UiBus
 import com.kuroviolet.imagepanel.net.b
 import com.kuroviolet.imagepanel.net.str
@@ -59,18 +60,21 @@ fun DiagnosticsScreen(nav: NavController) {
     val revision = Diag.revision.intValue
     var filter by remember { mutableStateOf("all") }
     var test by remember { mutableStateOf<String?>(null) }
+    var speed by remember { mutableStateOf<String?>(null) }
     val crash = remember(revision) { Diag.lastCrash() }
     val entries = remember(revision, filter) {
         Diag.snapshot().filter {
             when (filter) {
                 "problems" -> it.level == 'W' || it.level == 'E'
                 "network" -> it.tag == "net"
+                "video" -> it.tag == "video" || it.tag == "speed"
                 else -> true
             }
         }.takeLast(600).reversed()
     }
     val settings = Graph.settings
-    fun report() = Diag.report("Server: ${settings.baseUrl} · key ${settings.maskedToken}" + (test?.let { "\nLast connection test: $it" } ?: ""))
+    fun report() = Diag.report("Server: ${settings.baseUrl} · key ${settings.maskedToken}" + (test?.let { "\nLast connection test: $it" } ?: "") +
+        (speed?.let { "\nLast speed test: $it" } ?: ""))
 
     Scaffold(topBar = { ScreenTop("Diagnostics", nav) }) { padding ->
         LazyColumn(
@@ -83,6 +87,7 @@ fun DiagnosticsScreen(nav: NavController) {
                     Hint("Built ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(BuildConfig.BUILD_TIME))} · ${Diag.deviceLine()}")
                     Hint("Server ${settings.baseUrl} · key ${settings.maskedToken} · requests ${Diag.requests}, failed ${Diag.failures}")
                     test?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+                    speed?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilledTonalButton(onClick = {
                             test = "Testing…"
@@ -99,6 +104,21 @@ fun DiagnosticsScreen(nav: NavController) {
                                 Diag.i("diag", "connection test: $test")
                             }
                         }) { Text("Test connection") }
+                        FilledTonalButton(enabled = speed?.startsWith("Measuring") != true, onClick = {
+                            speed = "Measuring…"
+                            scope.launch {
+                                // A small download first; a bigger one only if the link is quick enough to finish it soon.
+                                speed = try {
+                                    val net = PlaybackProbe.networkLine(context)
+                                    val small = Graph.api.speedTest(4)
+                                    val mbps = Regex("= ([0-9.]+) Mbit").find(small)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+                                    "Panel → phone: " + (if (mbps > 12) Graph.api.speedTest(25) else small) + " · $net"
+                                } catch (e: Exception) {
+                                    "Speed test failed: ${e.message}"
+                                }
+                                Diag.i("speed", speed!!)
+                            }
+                        }) { Text("Speed test") }
                         FilledTonalButton(onClick = {
                             val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
                             runCatching { Transfers.shareText(context, "imagepanel-log-$stamp.txt", report()) }
@@ -126,7 +146,7 @@ fun DiagnosticsScreen(nav: NavController) {
             }
             item {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("all" to "Everything", "problems" to "Problems", "network" to "Network").forEach { (k, label) ->
+                    listOf("all" to "Everything", "problems" to "Problems", "network" to "Network", "video" to "Video").forEach { (k, label) ->
                         FilterChip(selected = filter == k, onClick = { filter = k }, label = { Text(label) })
                     }
                 }

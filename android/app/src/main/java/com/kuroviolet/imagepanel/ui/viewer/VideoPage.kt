@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.QueryStats
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOn
 import androidx.compose.material.icons.filled.Replay10
@@ -61,6 +62,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -76,7 +78,8 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
 import com.kuroviolet.imagepanel.Graph
-import com.kuroviolet.imagepanel.diag.Diag
+import com.kuroviolet.imagepanel.diag.PlaybackProbe
+import com.kuroviolet.imagepanel.diag.VideoStats
 import com.kuroviolet.imagepanel.model.Asset
 import kotlinx.coroutines.delay
 
@@ -115,11 +118,16 @@ fun VideoPage(
     }
     val context = LocalContext.current
     var error by remember(asset.id) { mutableStateOf<String?>(null) }
+    // Logs this playback (requests, speed, stalls, decoder) and feeds the on-screen stats; its id is sent
+    // to the panel so the panel's log lines for this playback can be matched.
+    val probe = remember(asset.id) { PlaybackProbe(context.applicationContext, asset) }
     val player = remember(asset.id) {
+        val http = OkHttpDataSource.Factory(Graph.http).setDefaultRequestProperties(mapOf("X-Playback-Id" to probe.id))
         ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(OkHttpDataSource.Factory(Graph.http)))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(probe.dataSourceFactory(http)))
             .build()
             .apply {
+                probe.attach(this)
                 setMediaItem(MediaItem.fromUri(Graph.api.videoUrl(asset.id)))
                 prepare()
                 playWhenReady = true
@@ -144,8 +152,7 @@ fun VideoPage(
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
-            override fun onPlayerError(e: PlaybackException) {
-                Diag.w("player", "${asset.name} (${asset.id}): ${e.errorCodeName}: ${e.message}")
+            override fun onPlayerError(e: PlaybackException) {     // the probe logs the details
                 error = "Can't play this video (${e.errorCodeName})."
             }
             override fun onIsPlayingChanged(isPlaying: Boolean) { playing = isPlaying }
@@ -154,7 +161,21 @@ fun VideoPage(
         player.addListener(listener)
         onDispose {
             player.removeListener(listener)
+            probe.finish()
             player.release()
+        }
+    }
+    LaunchedEffect(probe) {
+        while (true) {
+            delay(1000)
+            probe.tick()
+        }
+    }
+    var statsLines by remember { mutableStateOf(emptyList<String>()) }
+    LaunchedEffect(probe, VideoStats.visible) {
+        while (VideoStats.visible) {
+            statsLines = probe.liveLines()
+            delay(500)
         }
     }
     LaunchedEffect(player) {
@@ -275,6 +296,15 @@ fun VideoPage(
             Text("2× ▸▸", color = Color.White, modifier = Modifier.align(Alignment.TopCenter).padding(top = 90.dp)
                 .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 5.dp))
         }
+        if (VideoStats.visible && statsLines.isNotEmpty()) {
+            Text(
+                statsLines.joinToString("\n"), color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 10.sp, lineHeight = 13.sp,
+                modifier = Modifier.align(Alignment.TopStart)
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
+                    .padding(start = 8.dp, top = 56.dp, end = 8.dp)
+                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 5.dp),
+            )
+        }
         error?.let {
             Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(it, color = Color.White)
@@ -315,6 +345,9 @@ fun VideoPage(
                     }) { Text("${if (speed % 1f == 0f) speed.toInt().toString() else speed.toString()}×", color = Color.White) }
                     IconButton(onClick = { loop = !loop; player.repeatMode = if (loop) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF; poke++ }) {
                         Icon(if (loop) Icons.Filled.RepeatOn else Icons.Filled.Repeat, "Repeat", tint = Color.White)
+                    }
+                    IconButton(onClick = { VideoStats.visible = !VideoStats.visible; poke++ }) {
+                        Icon(Icons.Filled.QueryStats, "Playback stats", tint = if (VideoStats.visible) Color(0xFF8AB4F8) else Color.White)
                     }
                     IconButton(onClick = { muted = !muted; player.volume = if (muted) 0f else 1f; poke++ }) {
                         Icon(if (muted) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp, "Mute", tint = Color.White)

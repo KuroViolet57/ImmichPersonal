@@ -21,6 +21,7 @@ import secrets
 import socket
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -73,6 +74,19 @@ def _plain(value):
     if isinstance(value, (_dt.date, _dt.datetime)):
         return value.isoformat()
     return value
+
+
+def _log(message: str) -> None:
+    """One line on stdout -- the journal under systemd (``journalctl -u immich-organizer``).
+
+    Milliseconds are included so lines can be matched against the app's own log.
+    """
+    now = time.time()
+    print(f"{time.strftime('%H:%M:%S', time.localtime(now))}.{int(now % 1 * 1000):03d} {message}", flush=True)
+
+
+def _rate(nbytes: int, seconds: float) -> str:
+    return f"{nbytes * 8 / seconds / 1e6:.1f} Mbit/s" if nbytes > 0 and seconds > 0 else "-"
 
 
 class OrganizerHandler(BaseHTTPRequestHandler):
@@ -146,6 +160,8 @@ class OrganizerHandler(BaseHTTPRequestHandler):
         try:
             if route == "/api/status":
                 return self._json(200, self._status())
+            if route == "/api/diag/speed":
+                return self._serve_speed_test(query)
             if route == "/api/albums":
                 return self._json(200, [
                     {
@@ -586,20 +602,33 @@ class OrganizerHandler(BaseHTTPRequestHandler):
         }
 
     def _serve_media(self, asset_id: str, query: dict[str, list[str]]) -> None:
-        """Stream a video (playable version) or an original file, passing Range through so seeking works."""
+        """Stream a video (playable version) or an original file, passing Range through so seeking works.
+
+        Every request leaves one line in the log: the range asked for, how much was sent and how fast, and
+        where the time went -- waiting for the phone to take the data (the network) or waiting for Immich.
+        The app sends X-Playback-Id so a line can be matched to the player's own log on the phone.
+        """
         asset_id = self._uuid(asset_id)
         kind = (query.get("kind") or ["original"])[0]
         path = f"/assets/{asset_id}/video/playback" if kind == "video" else f"/assets/{asset_id}/original"
         headers = {"x-api-key": self.client.api_key, "Accept": "*/*", "User-Agent": "immich-organizer/1.0"}
         if self.headers.get("Range"):
             headers["Range"] = self.headers["Range"]
+        tag = f"media {kind} {asset_id[:8]}"
+        if self.headers.get("X-Playback-Id"):
+            tag += f" [{self.headers['X-Playback-Id'][:24]}]"
+        asked = self.headers.get("Range") or "whole file"
+        started = time.monotonic()
         req = urllib.request.Request(self.client._url(path), headers=headers)  # noqa: SLF001
         try:
             resp = urllib.request.urlopen(req, timeout=60, context=self.client._ssl_context)  # noqa: SLF001
         except urllib.error.HTTPError as exc:
+            _log(f"{tag} {asked} -> Immich answered {exc.code}")
             return self._error(exc.code if exc.code in (404, 416) else 502, f"Immich answered {exc.code}")
         except (urllib.error.URLError, OSError) as exc:
+            _log(f"{tag} {asked} -> could not reach Immich: {exc}")
             return self._error(502, f"Could not reach Immich: {exc}")
+        first_byte_ms = (time.monotonic() - started) * 1000
         with resp:
             self.send_response(resp.status)
             for name in ("Content-Type", "Content-Length", "Content-Range", "Last-Modified", "ETag"):
@@ -613,14 +642,58 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command == "HEAD":
                 return
+            sent, reading, writing, ended = 0, 0.0, 0.0, "complete"
             try:
                 while True:
+                    t0 = time.monotonic()
                     chunk = resp.read(256 * 1024)
+                    t1 = time.monotonic()
+                    reading += t1 - t0
                     if not chunk:
                         break
                     self.wfile.write(chunk)
+                    writing += time.monotonic() - t1
+                    sent += len(chunk)
             except (BrokenPipeError, ConnectionResetError):
-                pass   # the browser stopped (seeked or closed); normal for video
+                ended = "phone closed it"   # the player seeked or left the video; normal
+                self.close_connection = True
+            except OSError as exc:          # e.g. Immich stopped sending (timeout)
+                ended = f"failed: {type(exc).__name__}: {exc}"
+                self.close_connection = True  # the body is cut short, so this connection can't be reused
+            finally:
+                total = time.monotonic() - started
+                length = resp.headers.get("Content-Length") or ""
+                of = f" of {int(length) / 1e6:.1f}" if length.isdigit() else ""
+                _log(f"{tag} {asked} -> {resp.status}, sent {sent / 1e6:.1f}{of} MB in {total:.1f} s "
+                     f"({_rate(sent, total)}); waited on phone {writing:.1f} s, on Immich {reading:.1f} s "
+                     f"(first byte {first_byte_ms:.0f} ms); {ended}")
+
+    def _serve_speed_test(self, query: dict[str, list[str]]) -> None:
+        """Send ``mb`` MB of random bytes, so the app can time the phone <-> panel link without Immich involved."""
+        try:
+            mb = max(1, min(int((query.get("mb") or ["8"])[0]), 64))
+        except ValueError:
+            raise ValueError("mb must be a whole number.") from None
+        size = mb * 1_000_000
+        block = memoryview(os.urandom(250_000))   # random, so nothing on the way can compress it
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        started, sent, ended = time.monotonic(), 0, "complete"
+        try:
+            while sent < size:
+                n = min(len(block), size - sent)
+                self.wfile.write(block[:n])
+                sent += n
+        except (BrokenPipeError, ConnectionResetError):
+            ended = "phone closed it"
+            self.close_connection = True
+        total = time.monotonic() - started
+        _log(f"speed test {mb} MB: sent {sent / 1e6:.1f} MB in {total:.1f} s ({_rate(sent, total)}); {ended}")
 
     def _serve_person_thumb(self, person_id: str) -> None:
         try:

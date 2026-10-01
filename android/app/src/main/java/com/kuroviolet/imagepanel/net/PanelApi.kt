@@ -68,6 +68,35 @@ class PanelApi(private val http: OkHttpClient, private val settings: () -> Setti
         }
     }
 
+    /**
+     * Times a download of [mb] MB of random bytes from the panel (no Immich involved), so the phone ↔ panel link
+     * can be measured on its own. Returns e.g. "4 MB in 3.2 s = 10.0 Mbit/s, first byte after 180 ms".
+     */
+    suspend fun speedTest(mb: Int): String = withContext(Dispatchers.IO) {
+        val started = android.os.SystemClock.elapsedRealtime()
+        val response = try {
+            http.newCall(request("/api/diag/speed?mb=$mb").get().build()).execute()
+        } catch (e: IOException) {
+            throw ApiException(0, friendly(e, settings().baseUrl))
+        }
+        response.use { r ->
+            if (r.code == 404) throw ApiException(404, "The panel is older than the app and has no speed test yet.")
+            if (!r.isSuccessful) throw ApiException(r.code, "The panel answered ${r.code}.")
+            val firstByte = android.os.SystemClock.elapsedRealtime() - started
+            val source = r.body.source()
+            val buffer = ByteArray(64 * 1024)
+            var got = 0L
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            while (true) {
+                val n = source.read(buffer)
+                if (n < 0) break
+                got += n
+            }
+            val ms = (android.os.SystemClock.elapsedRealtime() - t0).coerceAtLeast(1)
+            "%d MB in %.1f s = %.1f Mbit/s, first byte after %d ms".format(mb, ms / 1000.0, got * 8.0 / ms / 1000.0, firstByte)
+        }
+    }
+
     /** Same, against an address and key that are not saved yet (the setup screen's test). */
     suspend fun probe(baseUrl: String, token: String): JsonObject {
         val request = try {
