@@ -208,7 +208,7 @@ class TestSettings(Base):
     def test_defaults_match_the_contract(self):
         s = at.load_settings()
         self.assertEqual(s, at.DEFAULTS)
-        self.assertEqual((s["video_frames"], s["batch_size"], s["vlm_parallel"], s["vram_gb"]), (6, 8, 8, 16))
+        self.assertEqual((s["video_frames"], s["batch_size"], s["vlm_parallel"], s["vram_gb"]), (6, 8, 8, 20))
         self.assertEqual((s["indexing"], s["keep_updated"], s["write_tags"], s["language"]), (False, True, False, "English"))
         s["blocked"].append("x")                       # callers can't change the defaults by accident
         self.assertEqual(at.load_settings()["blocked"], [])
@@ -229,7 +229,7 @@ class TestSettings(Base):
         self.assertEqual(at.save_settings({"wd_strictness": 1 - 0.5}, self.store)["wd_strictness"], 0.5)
 
     def test_limits(self):
-        for key, lo, hi in [("video_frames", 1, 8), ("batch_size", 1, 64), ("vlm_parallel", 1, 32), ("vram_gb", 6, 22),
+        for key, lo, hi in [("video_frames", 1, 8), ("batch_size", 1, 64), ("vlm_parallel", 1, 32), ("vram_gb", 18, 21),
                             ("max_tags", 5, 100), ("wd_strictness", 0.05, 0.95), ("ram_strictness", 0.05, 0.95)]:
             self.assertEqual(at.LIMITS[key], (lo, hi))
             for ok in (lo, hi):
@@ -251,7 +251,7 @@ class TestSettings(Base):
     def test_the_version_goes_up_only_for_content_settings(self):
         self.assertEqual(self.store.settings_version, 1)
         for changes in ({"indexing": True}, {"keep_updated": False}, {"batch_size": 4}, {"vlm_parallel": 4},
-                        {"vram_gb": 12}):
+                        {"vram_gb": 19}):
             self.assertEqual(self.set(**changes), [])
         self.assertEqual(self.store.settings_version, 1)
         self.assertEqual(self.set(max_tags=12), ["max_tags"])
@@ -1718,7 +1718,7 @@ class Clock:
 class FakeRunner:
     """Stands in for the docker / nvidia-smi runner: containers have a state, compose up starts them."""
 
-    SERVICES = {"aitagger": "immich_aitagger", "vlm": "immich_aitagger_vlm"}
+    SERVICES = {"tagger": "immich_aitagger", "vlm": "immich_aitagger_vlm"}
 
     def __init__(self, gpu="24576, 1024"):
         self.calls: list[tuple] = []
@@ -1787,7 +1787,7 @@ class TestServices(Base):
                                sleep=self.clock.sleep, search_stop=lambda: self.stopped_search.append(len(self.runner.calls)), **kw)
 
     def test_the_environment_comes_from_the_settings_and_the_card(self):
-        self.assertEqual(self.svc.env(), {"AITAGGER_VRAM_GB": "5", "AITAGGER_VLM_UTIL": "0.46", "AITAGGER_VLM_SEQS": "8"})
+        self.assertEqual(self.svc.env(), {"AITAGGER_VRAM_GB": "5", "AITAGGER_VLM_UTIL": "0.62", "AITAGGER_VLM_SEQS": "8"})
         self.assertEqual(self.svc.env(S(vram_gb=22, vlm_parallel=4)),
                          {"AITAGGER_VRAM_GB": "5", "AITAGGER_VLM_UTIL": "0.71", "AITAGGER_VLM_SEQS": "4"})
         self.assertEqual(self.svc.env(S(vram_gb=6))["AITAGGER_VLM_UTIL"], "0.04")
@@ -1806,10 +1806,10 @@ class TestServices(Base):
         cmds = self.runner.ups()
         compose = str(at.COMPOSE)
         self.assertTrue(compose.replace("\\", "/").endswith("deploy/aitagger/docker-compose.yml"))
-        self.assertEqual(cmds[0], ["docker", "compose", "-p", "immich-aitagger", "-f", compose, "up", "-d", "aitagger"])
+        self.assertEqual(cmds[0], ["docker", "compose", "-p", "immich-aitagger", "-f", compose, "up", "-d", "tagger"])
         self.assertEqual(cmds[1], ["docker", "compose", "-p", "immich-aitagger", "-f", compose, "up", "-d", "vlm"])
         for _, env in [c for c in self.runner.calls if c[0][:2] == ["docker", "compose"]]:
-            self.assertEqual(env, {"AITAGGER_VRAM_GB": "5", "AITAGGER_VLM_UTIL": "0.46", "AITAGGER_VLM_SEQS": "8"})
+            self.assertEqual(env, {"AITAGGER_VRAM_GB": "5", "AITAGGER_VLM_UTIL": "0.62", "AITAGGER_VLM_SEQS": "8"})
         self.assertEqual(self.svc.load(), [])                               # already running: nothing to do
         self.assertEqual(len(self.runner.ups()), 2)
 
@@ -1822,7 +1822,7 @@ class TestServices(Base):
         self.svc.load()
         self.assertFalse(any("--force-recreate" in c for c in self.runner.ups()))
         self.assertEqual(json.loads(self.store.meta("services_env"))["immich_aitagger_vlm"],
-                         {"AITAGGER_VLM_UTIL": "0.46", "AITAGGER_VLM_SEQS": "8"})
+                         {"AITAGGER_VLM_UTIL": "0.62", "AITAGGER_VLM_SEQS": "8"})
         self.svc.unload()
         self.runner.calls.clear()
         self.svc.load()                                                     # same settings: a plain start
@@ -1834,7 +1834,7 @@ class TestServices(Base):
         recreated = [c[-1] for c in self.runner.ups() if "--force-recreate" in c]
         self.assertEqual(recreated, ["vlm"])                               # the tagger's env did not change
         self.svc.unload()
-        self.set(vram_gb=12)
+        self.set(vram_gb=18)
         self.runner.calls.clear()
         self.svc.load()
         self.assertEqual([c[-1] for c in self.runner.ups() if "--force-recreate" in c], ["vlm"])

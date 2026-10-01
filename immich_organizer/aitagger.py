@@ -44,7 +44,7 @@ TAGGER_CONTAINER = os.environ.get("AITAGGER_CONTAINER", "immich_aitagger")
 VLM_CONTAINER = searchplus.AITAGGER_VLM_CONTAINER
 COMPOSE = Path(__file__).resolve().parent.parent / "deploy" / "aitagger" / "docker-compose.yml"
 PROJECT = "immich-aitagger"
-TAGGER_SERVICE, VLM_SERVICE = "aitagger", "vlm"      # service names inside the compose file
+TAGGER_SERVICE, VLM_SERVICE = "tagger", "vlm"      # service names inside the compose file
 VLM_MODEL = "tagger-vlm"
 MODEL_LABELS = {"wd": "wd-eva02-large-tagger-v3", "ram": "RAM++ (swin-large)", "vlm": "Qwen3.5-9B (FP8)"}
 
@@ -149,12 +149,12 @@ class Vocabulary:
 # ---------------------------------------------------------------- settings
 
 DEFAULTS = {
-    "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vlm_parallel": 8, "vram_gb": 16,
+    "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vlm_parallel": 8, "vram_gb": 20,
     "describe": True, "use_wd": True, "use_ram": True, "wd_strictness": 0.5, "ram_strictness": 0.5,
     "character_tags": True, "rating_tag": True, "max_tags": 30, "instructions": "", "vocabulary": "",
     "blocked": [], "rules": [], "write_tags": False, "language": "English",
 }
-LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vlm_parallel": (1, 32), "vram_gb": (6, 22),
+LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vlm_parallel": (1, 32), "vram_gb": (18, 21),
           "wd_strictness": (0.05, 0.95), "ram_strictness": (0.05, 0.95), "max_tags": (5, 100)}
 TEXT_LIMITS = {"instructions": 4000, "vocabulary": 4000, "language": 40}
 MAX_BLOCKED, MAX_RULES, MAX_RULE_TAGS = 500, 100, 50
@@ -612,8 +612,8 @@ class Tagger:
 
 VLM_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["description", "add_tags", "remove_tags"],
               "properties": {"description": {"type": "string"},
-                             "add_tags": {"type": "array", "items": {"type": "string"}},
-                             "remove_tags": {"type": "array", "items": {"type": "string"}}}}
+                             "add_tags": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+                             "remove_tags": {"type": "array", "items": {"type": "string"}, "maxItems": 12}}}
 VLM_SYSTEM = (
     "You are the cataloguer of a private, personal photo archive that only its owner can see. Describe every "
     "picture neutrally and factually, including nudity, sexual or violent content, in plain language, without "
@@ -640,8 +640,8 @@ def vlm_prompt(tags: list[dict], rating: dict, settings: dict, terms: list[str],
         lines.append("Preferred terms (use these words when they fit): " + "; ".join(terms[:80]))
     lines.append(
         f"Write the description in {settings['language']}: 1-2 sentences about what the picture shows. Also check the "
-        "tags: list in add_tags the clearly visible things that are missing (short lowercase English tags) and in "
-        "remove_tags the detected tags that are clearly wrong (spelled exactly as above). Answer with a JSON object "
+        "tags: list in add_tags at most 8 clearly visible things that are missing (short lowercase English tags) and in "
+        "remove_tags at most 8 detected tags that are clearly wrong (spelled exactly as above). Answer with a JSON object "
         '{"description": "...", "add_tags": [...], "remove_tags": [...]}.')
     return "\n".join(lines)
 

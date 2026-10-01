@@ -1301,7 +1301,7 @@ class TestAiTagger(WebCase):
         data = self.get("/api/aitagger")
         self.assertEqual(data["settings"], self.at.DEFAULTS)
         self.assertEqual(data["limits"], {"video_frames": [1, 8], "batch_size": [1, 64], "vlm_parallel": [1, 32],
-                                          "vram_gb": [6, 22], "wd_strictness": [0.05, 0.95], "ram_strictness": [0.05, 0.95],
+                                          "vram_gb": [18, 21], "wd_strictness": [0.05, 0.95], "ram_strictness": [0.05, 0.95],
                                           "max_tags": [5, 100]})
         self.assertEqual(data["settingsVersion"], 1)
         self.assertEqual(data["counts"], {"assets": 0, "images": 0, "videos": 0, "processed": 0, "pending": 0, "queued": 0,

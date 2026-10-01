@@ -96,8 +96,8 @@ Flags: `--quantization fp8`, `--gpu-memory-utilization ${AITAGGER_VLM_UTIL}`, `-
 bf16), plus about 1 GiB of activations, plus the KV cache. `--gpu-memory-utilization 0.45` (11 GiB) therefore **cannot
 start**: "No available memory for the cache blocks". 0.51 is the bare minimum, 0.58 (13.9 GiB, 38k tokens of KV cache)
 runs 8 concurrent requests with 6 pictures each; the real footprint is about 0.8 GiB more than the fraction (CUDA
-context): 14.6 GiB at 0.58. With the formula in section 3 this needs `vram_gb >= 19` (0.58); the settings default of 16
-(0.46) is too low, 20 (0.62) is a good default. Measured with everything running: Immich ML 2.2 GB + tagger 4.0 GB +
+context): 14.6 GiB at 0.58. With the formula in section 3 this needs `vram_gb >= 19` (0.58); the settings default is
+therefore 20 (0.62) with limits 18–21. Measured with everything running: Immich ML 2.2 GB + tagger 4.0 GB +
 VLM 14.6 GB = 21 GB of 24. Speed: one request with 6 pictures (about 2k prompt tokens, 200 answer tokens) takes
 about 3 s; 8 in flight give about 1.7-2 requests/s (100-125 per minute); the worst case of 8 pictures of 768x768 px each
 (5k prompt tokens) about 1 request/s. Thinking text never appears. A prompt that does not limit the tag lists made 4 of
@@ -137,7 +137,7 @@ Storage lives in `state_dir()/aitagger/`: `settings.json` and `tagger.sqlite` (W
 | video_frames | 6 | int 1–8 (UI offers 2 / 6) | yes |
 | batch_size | 8 | int 1–64 (assets per round) | |
 | vlm_parallel | 8 | int 1–32 (concurrent VLM requests, also `--max-num-seqs`) | |
-| vram_gb | 16 | int 6–22 (taggers + VLM together) | |
+| vram_gb | 20 | int 18–21 (taggers + VLM together; below 18 the VLM cannot start, above 21 the card runs out next to Immich ML) | |
 | describe | true | bool | yes |
 | use_wd, use_ram | true | bool | yes |
 | wd_strictness, ram_strictness | 0.5 | float 0.05–0.95 (calibrated threshold) | yes |
