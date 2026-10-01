@@ -316,6 +316,40 @@ class ImmichClient:
             "GET", f"/assets/{asset_id}/thumbnail", params={"size": size}, raw=True
         )
 
+    def update_asset(self, asset_id: str, **fields: Any) -> dict:
+        """``PUT /assets/{id}`` -- change one asset, e.g. ``description`` (the text under the photo).
+
+        Returns the updated ``AssetResponseDto``.
+        """
+        return self._request("PUT", f"/assets/{asset_id}", body=fields) or {}
+
+    # -------------------------------------------------------------------- tags
+
+    def list_tags(self) -> list[dict]:
+        """``GET /tags`` -- every tag (``id``, ``name``, ``value`` = the full ``Parent/Child`` path)."""
+        return self._request("GET", "/tags") or []
+
+    def upsert_tags(self, names: list[str]) -> list[dict]:
+        """``PUT /tags`` -- create the tags that do not exist yet; returns all of them.
+
+        A name may be a path (``AI/beach``): Immich creates the parent tags too.
+        """
+        if not names:
+            return []
+        return self._request("PUT", "/tags", body={"tags": list(names)}) or []
+
+    def tag_assets(self, tag_ids: list[str], asset_ids: list[str]) -> dict:
+        """``PUT /tags/assets`` -- put every tag on every asset; answers ``{"count": n}``."""
+        if not tag_ids or not asset_ids:
+            return {"count": 0}
+        return self._request("PUT", "/tags/assets", body={"tagIds": list(tag_ids), "assetIds": list(asset_ids)}) or {}
+
+    def untag_assets(self, tag_id: str, asset_ids: list[str]) -> list[dict]:
+        """``DELETE /tags/{id}/assets`` -- take one tag off the assets (the tag itself stays)."""
+        if not asset_ids:
+            return []
+        return self._request("DELETE", f"/tags/{tag_id}/assets", body={"ids": list(asset_ids)}) or []
+
     # ------------------------------------------------------------------ albums
 
     def list_albums(self) -> list[dict]:

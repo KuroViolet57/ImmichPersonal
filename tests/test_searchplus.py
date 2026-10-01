@@ -336,5 +336,120 @@ class TestSettingsAndFrames(Base):
         self.assertEqual((kind, len(got)), ("animation", 3))
 
 
+class TestGpuBusy(Base):
+    """While the AI Tagger's language model holds the graphics card, Search+ must not start its model server."""
+
+    def docker(self, running: dict):
+        """A stand-in for subprocess.run: `docker inspect` answers from ``running``; other calls are recorded."""
+        self.docker_calls = []
+
+        def run(cmd, **kwargs):
+            self.docker_calls.append(list(cmd))
+            if cmd[:2] == ["docker", "inspect"]:
+                if cmd[-1] not in running:
+                    return mock.Mock(returncode=1, stdout="", stderr="Error: No such object")
+                return mock.Mock(returncode=0, stdout="true\n" if running[cmd[-1]] else "false\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        return mock.patch.object(sp.subprocess, "run", side_effect=run)
+
+    def test_gpu_busy_is_a_service_down_with_the_contract_message(self):
+        self.assertTrue(issubclass(sp.GpuBusy, sp.ServiceDown))
+        self.assertEqual(sp.AITAGGER_VLM_CONTAINER, "immich_aitagger_vlm")
+        with self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):
+            with self.assertRaises(sp.GpuBusy) as ctx:
+                sp.Service().start()
+        self.assertEqual(str(ctx.exception), "The GPU is in use by the AI Tagger — pause it to use Search+")
+        self.assertFalse([c for c in self.docker_calls if c[:2] != ["docker", "inspect"]])      # nothing was started
+
+    def test_ready_raises_it_too_so_searches_get_a_clear_answer(self):
+        service = sp.Service()
+        with self.docker({"immich_aitagger_vlm": True}), mock.patch.object(service, "health", return_value=None):
+            with self.assertRaises(sp.GpuBusy):
+                service.ready(wait=1)
+
+    def test_search_plus_starts_as_before_when_the_language_model_is_not_running(self):
+        for tagger in ({}, {"immich_aitagger_vlm": False}):
+            with self.docker({"immich_searchplus": False, **tagger}):
+                sp.Service().start()
+            self.assertEqual(self.docker_calls[-1], ["docker", "start", "immich_searchplus"])
+        with self.docker({}):                                                   # no containers at all: compose up
+            sp.Service().start()
+        self.assertEqual(self.docker_calls[-1][:3], ["docker", "compose", "-f"])
+
+    def test_a_running_search_plus_is_left_alone(self):
+        with self.docker({"immich_searchplus": True, "immich_aitagger_vlm": True}):
+            sp.Service().start()
+        self.assertEqual([c for c in self.docker_calls if c[:2] != ["docker", "inspect"]], [])
+
+    def test_docker_missing_means_not_busy(self):
+        with mock.patch.object(sp.subprocess, "run", side_effect=FileNotFoundError("docker")):
+            self.assertFalse(sp.container_running("immich_aitagger_vlm"))
+
+    def test_the_indexer_waits_for_the_card_and_does_not_count_it_as_a_drop(self):
+        class Busy(FakeService):
+            def __init__(self, busy):
+                super().__init__()
+                self.busy, self.looks = busy, 0
+
+            def ready(self, wait=0, progress=None, stop=None):
+                self.looks += 1
+                if self.busy:
+                    self.busy -= 1
+                    raise sp.GpuBusy("The GPU is in use by the AI Tagger — pause it to use Search+")
+                return super().ready(wait, progress, stop)
+
+        self.service = Busy(5)                         # more than the 3 drops that end an indexer
+        self.indexer = sp.Indexer(self.store, self.service, catalog=lambda: self.catalog, frames=fake_frames)
+        self.indexer.BUSY_WAIT = 0.01
+        self.indexer.IMAGES_PER_REQUEST = 3
+        self.build()
+        self.assertEqual(self.indexer.state, "done", self.indexer.detail)
+        self.assertEqual(self.store.counts()["indexed"], 4)
+        self.assertEqual(self.service.looks, 6)
+
+    def test_pausing_ends_the_wait_at_once(self):
+        class Busy(FakeService):
+            def ready(self, wait=0, progress=None, stop=None):
+                raise sp.GpuBusy("The GPU is in use by the AI Tagger")
+
+        self.indexer = sp.Indexer(self.store, Busy(), catalog=lambda: self.catalog, frames=fake_frames)
+        self.indexer.BUSY_WAIT = 60
+        self.indexer.start()
+        time.sleep(0.3)
+        self.assertEqual(self.indexer.state, "starting")
+        self.assertIn("waiting", self.indexer.detail)
+        started = time.monotonic()
+        self.indexer.stop(wait_s=5)
+        self.assertFalse(self.indexer.running())
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(self.indexer.state, "stopped")
+
+
+class TestCaptureHelpers(Base):
+    def test_video_frames_can_be_cut_at_given_positions(self):
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(cmd[cmd.index("-ss") + 1])
+            return mock.Mock(stdout=b"jpeg")
+
+        with mock.patch.object(sp.subprocess, "run", side_effect=run):
+            self.assertEqual(len(sp.video_frames("v.mp4", 80000, 2, positions=[0.25, 0.5])), 2)
+            self.assertEqual(calls, ["20.00", "40.00"])
+            calls.clear()
+            sp.video_frames("v.mp4", 80000, 2)                           # as before: spread evenly
+            self.assertEqual(calls, ["20.00", "60.00"])
+
+    def test_animation_frames_can_be_taken_at_given_positions(self):
+        from PIL import Image
+        from immich_organizer.media import animation_frames
+        path = Path(self.tmp.name) / "a.gif"
+        frames = [Image.new("RGB", (50, 50), c) for c in ("red", "green", "blue", "white", "black", "yellow", "pink", "gray")]
+        frames[0].save(path, save_all=True, append_images=frames[1:], duration=100)
+        self.assertEqual(len(animation_frames(str(path), 4)), 4)
+        self.assertEqual(len(animation_frames(str(path), 99, positions=[0.3, 0.7])), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

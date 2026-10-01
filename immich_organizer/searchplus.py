@@ -38,6 +38,7 @@ MODEL_LABEL = "PE-Core G/14 · 448 px (Meta Perception Encoder)"
 SERVICE_URL = os.environ.get("SEARCHPLUS_URL", "http://127.0.0.1:11439")
 CONTAINER = os.environ.get("SEARCHPLUS_CONTAINER", "immich_searchplus")
 COMPOSE = Path(__file__).resolve().parent.parent / "deploy" / "searchplus" / "docker-compose.yml"
+AITAGGER_VLM_CONTAINER = os.environ.get("AITAGGER_VLM_CONTAINER", "immich_aitagger_vlm")   # the AI Tagger's GPU hog
 DEFAULTS = {"indexing": False, "keep_updated": True, "video_frames": 4}
 LIMITS = {"video_frames": (1, 8)}
 FRAME_SIDE = 640              # frames are sent at most this big; the model looks at 448 x 448
@@ -128,11 +129,13 @@ def fetch_catalog() -> list[dict]:
 
 # ---------------------------------------------------------------- frames
 
-def video_frames(path: str, duration_ms: int, n: int, side: int = FRAME_SIDE) -> list[bytes]:
+def video_frames(path: str, duration_ms: int, n: int, side: int = FRAME_SIDE,
+                 positions: list[float] | None = None) -> list[bytes]:
+    """``n`` frames spread over the video, or the frames at ``positions`` (fractions 0-1 of its length)."""
     secs = max(duration_ms / 1000.0, 0.1)
     frames = []
-    for i in range(n):
-        t = secs * (i + 0.5) / n
+    for p in positions or [(i + 0.5) / n for i in range(n)]:
+        t = secs * p
         try:
             data = subprocess.run(
                 ["ffmpeg", "-nostdin", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
@@ -176,7 +179,7 @@ def prepare_frames(item: dict, video_n: int) -> tuple[list[bytes], str]:
     raise ValueError(f"not a playable video: ffmpeg can't open it and Immich has no preview ({_what_is(original)})")
 
 
-def _picture(path: str) -> tuple[bytes | None, str]:
+def _picture(path: str, side: int = FRAME_SIDE) -> tuple[bytes | None, str]:
     """(the file as a small JPEG, "") or (None, why): "truncated" or "unreadable"."""
     import io
 
@@ -184,9 +187,9 @@ def _picture(path: str) -> tuple[bytes | None, str]:
         from PIL import Image
         with Image.open(path) as im:
             if im.format == "JPEG":
-                im.draft("RGB", (FRAME_SIDE, FRAME_SIDE))
+                im.draft("RGB", (side, side))
             im = im.convert("RGB")
-            im.thumbnail((FRAME_SIDE, FRAME_SIDE))
+            im.thumbnail((side, side))
             out = io.BytesIO()
             im.save(out, "JPEG", quality=90)
             return out.getvalue(), ""
@@ -220,6 +223,20 @@ class ServiceDown(Exception):
     """The model server is not answering (stopped, loading, restarting). Not the photo's fault."""
 
 
+class GpuBusy(ServiceDown):
+    """The graphics card is taken by the AI Tagger's language model: Search+ must wait for it to be freed."""
+
+
+def container_running(name: str) -> bool:
+    """Whether a container is up (False when docker or the container is not there)."""
+    try:
+        out = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name],
+                             capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
 class Service:
     """Talks to the model server container."""
 
@@ -247,6 +264,8 @@ class Service:
         state = self.container_state()
         if state == "running":
             return
+        if container_running(AITAGGER_VLM_CONTAINER):       # one language model at a time on the card
+            raise GpuBusy("The GPU is in use by the AI Tagger — pause it to use Search+")
         if state == "missing":
             cmd = ["docker", "compose", "-f", str(self.compose), "up", "-d"]
         else:
@@ -596,6 +615,7 @@ class Indexer:
     """Background thread that fills the index; stop/start at will, it resumes where it was."""
 
     CATALOG_EVERY = 600         # re-read the library list this often (and look for new photos)
+    BUSY_WAIT = 30              # seconds between looks while the AI Tagger has the graphics card
     CHUNK = 96                  # assets prepared per round
     IMAGES_PER_REQUEST = 32
     WORKERS = 6                 # threads reading previews / cutting video frames
@@ -661,8 +681,13 @@ class Indexer:
                     self._wake.clear()
                     continue
                 self.state = "starting"
-                health = self.service.ready(wait=3600, stop=stop,
-                                            progress=lambda d: setattr(self, "detail", d))
+                try:
+                    health = self.service.ready(wait=3600, stop=stop,
+                                                progress=lambda d: setattr(self, "detail", d))
+                except GpuBusy as exc:          # waiting, not a drop: the AI Tagger lets go after a while
+                    self.state, self.detail = "starting", f"waiting: {exc}"
+                    stop.wait(self.BUSY_WAIT)
+                    continue
                 self.store.adopt_model(health["model"], int(health["dim"]))
                 self.state, self.detail = "running", "indexing"
                 try:
