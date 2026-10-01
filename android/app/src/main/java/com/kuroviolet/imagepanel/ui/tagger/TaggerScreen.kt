@@ -107,9 +107,9 @@ data class RuleDraft(val ifAll: String = "", val ifAny: String = "", val unless:
 data class TagDraft(
     val instructions: String = "", val vocabulary: String = "", val blocked: String = "", val language: String = "English",
     val describe: Boolean = true, val characterTags: Boolean = true, val ratingTag: Boolean = true, val writeTags: Boolean = false,
-    val useWd: Boolean = true, val useRam: Boolean = true,
-    val wdStrictness: Float = 0.5f, val ramStrictness: Float = 0.5f, val maxTags: Int = 30,
-    val videoFrames: Int = 6, val batchSize: Int = 8, val vlmParallel: Int = 8, val vramGb: Int = 16, val keepUpdated: Boolean = true,
+    val useWd: Boolean = true, val usePixai: Boolean = true,
+    val wdStrictness: Float = 0.5f, val pixaiStrictness: Float = 0.5f, val maxTags: Int = 30,
+    val videoFrames: Int = 6, val batchSize: Int = 8, val vlmParallel: Int = 8, val vramGb: Int = 8, val keepUpdated: Boolean = true,
     val rules: List<RuleDraft> = emptyList(),
 ) {
     /** The settings as the panel stores them. */
@@ -117,8 +117,8 @@ data class TagDraft(
         "instructions" to JsonPrimitive(instructions), "vocabulary" to JsonPrimitive(vocabulary),
         "blocked" to JsonArray(splitTags(blocked).map { JsonPrimitive(it) }), "language" to JsonPrimitive(language.ifBlank { "English" }),
         "describe" to JsonPrimitive(describe), "character_tags" to JsonPrimitive(characterTags), "rating_tag" to JsonPrimitive(ratingTag),
-        "write_tags" to JsonPrimitive(writeTags), "use_wd" to JsonPrimitive(useWd), "use_ram" to JsonPrimitive(useRam),
-        "wd_strictness" to JsonPrimitive(round2(wdStrictness)), "ram_strictness" to JsonPrimitive(round2(ramStrictness)),
+        "write_tags" to JsonPrimitive(writeTags), "use_wd" to JsonPrimitive(useWd), "use_pixai" to JsonPrimitive(usePixai),
+        "wd_strictness" to JsonPrimitive(round2(wdStrictness)), "pixai_strictness" to JsonPrimitive(round2(pixaiStrictness)),
         "max_tags" to JsonPrimitive(maxTags), "video_frames" to JsonPrimitive(videoFrames), "batch_size" to JsonPrimitive(batchSize),
         "vlm_parallel" to JsonPrimitive(vlmParallel), "vram_gb" to JsonPrimitive(vramGb), "keep_updated" to JsonPrimitive(keepUpdated),
         "rules" to JsonArray(rules.filter { it.isUsable() }.map { r ->
@@ -137,10 +137,10 @@ data class TagDraft(
             instructions = s.str("instructions"), vocabulary = s.str("vocabulary"),
             blocked = s.a("blocked").strings().joinToString(", "), language = s.str("language", "English"),
             describe = s.b("describe") ?: true, characterTags = s.b("character_tags") ?: true, ratingTag = s.b("rating_tag") ?: true,
-            writeTags = s.b("write_tags") ?: false, useWd = s.b("use_wd") ?: true, useRam = s.b("use_ram") ?: true,
-            wdStrictness = (s.d("wd_strictness") ?: 0.5).toFloat(), ramStrictness = (s.d("ram_strictness") ?: 0.5).toFloat(),
+            writeTags = s.b("write_tags") ?: false, useWd = s.b("use_wd") ?: true, usePixai = s.b("use_pixai") ?: true,
+            wdStrictness = (s.d("wd_strictness") ?: 0.5).toFloat(), pixaiStrictness = (s.d("pixai_strictness") ?: 0.5).toFloat(),
             maxTags = s.i("max_tags") ?: 30, videoFrames = s.i("video_frames") ?: 6, batchSize = s.i("batch_size") ?: 8,
-            vlmParallel = s.i("vlm_parallel") ?: 8, vramGb = s.i("vram_gb") ?: 16, keepUpdated = s.b("keep_updated") ?: true,
+            vlmParallel = s.i("vlm_parallel") ?: 8, vramGb = s.i("vram_gb") ?: 8, keepUpdated = s.b("keep_updated") ?: true,
             rules = s.a("rules").objects().map { r ->
                 RuleDraft(r.a("if_all").strings().joinToString(", "), r.a("if_any").strings().joinToString(", "),
                     r.a("unless").strings().joinToString(", "), r.a("add").strings().joinToString(", "), r.a("remove").strings().joinToString(", "))
@@ -157,9 +157,9 @@ private fun RuleDraft.isUsable() =
         (TagDraft.splitTags(add).isNotEmpty() || TagDraft.splitTags(remove).isNotEmpty())
 
 /** Which re-processing a change calls for (see docs/AI-TAGGER.md, "Reprocess modes"). */
-private val FULL_KEYS = setOf("video_frames", "use_wd", "use_ram")
+private val FULL_KEYS = setOf("video_frames", "use_wd", "use_pixai")
 private val DESCRIBE_KEYS = setOf("instructions", "vocabulary", "language", "describe")
-private val RETAG_KEYS = setOf("wd_strictness", "ram_strictness", "rules", "blocked", "max_tags", "write_tags", "character_tags", "rating_tag")
+private val RETAG_KEYS = setOf("wd_strictness", "pixai_strictness", "rules", "blocked", "max_tags", "write_tags", "character_tags", "rating_tag")
 
 class TaggerVm : ViewModel() {
     var status by mutableStateOf<JsonObject?>(null)
@@ -309,7 +309,7 @@ fun TaggerScreen(nav: NavController) {
     LaunchedEffect(vm.tab) { if (vm.tab == 2) vm.loadAssets() }
     val models = vm.status?.o("models")
     Scaffold(topBar = {
-        ScreenTop("AI Tagger", nav, subtitle = models?.let { "${it.str("wd")} · ${it.str("ram")} · ${it.str("vlm")}" } ?: "Tags and describes your library")
+        ScreenTop("AI Tagger", nav, subtitle = models?.let { "${it.str("wd")} · ${it.str("pixai")} · ${it.str("vlm")}" } ?: "Tags and describes your library")
     }) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             LazyVerticalGrid(
@@ -454,7 +454,7 @@ private fun PreviewResult(vm: TaggerVm, p: JsonObject) {
     }
     val m = p.o("models")
     TagChips("WD tagger", m.a("wd").objects().map { it.str("tag") to it.d("score") })
-    TagChips("RAM++", m.a("ram").objects().map { it.str("tag") to it.d("score") })
+    TagChips("PixAI", m.a("pixai").objects().map { it.str("tag") to it.d("score") })
     m.o("rating").takeIf { it.isNotEmpty() }?.let { r ->
         Hint("Rating: " + r.entries.sortedByDescending { (it.value as? JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0 }
             .joinToString(" · ") { "${it.key} %.2f".format((it.value as? JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0) })
@@ -505,8 +505,8 @@ private fun SettingsCards(vm: TaggerVm) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionCard(title = "Instructions") {
             OutlinedTextField(value = d.instructions, onValueChange = { vm.draft = d.copy(instructions = it) },
-                label = { Text("How the describer should look at pictures") }, minLines = 4, modifier = Modifier.fillMaxWidth())
-            Hint("Plain words, e.g. “Mention the background and the setting. Name game and anime characters when sure.”")
+                label = { Text("How to word the description and pick tags") }, minLines = 4, modifier = Modifier.fillMaxWidth())
+            Hint("Plain words for the small text model that writes the description from the tags, e.g. “Mention the setting. Call 1girl a woman.” It does not see the picture, only the tags.")
             OutlinedTextField(value = d.vocabulary, onValueChange = { vm.draft = d.copy(vocabulary = it) },
                 label = { Text("Vocabulary") }, minLines = 3, modifier = Modifier.fillMaxWidth())
             Hint("One per line. “old -> new” renames a tag (e.g. “1girl -> woman”); any other line is a term to prefer.")
@@ -514,7 +514,7 @@ private fun SettingsCards(vm: TaggerVm) {
                 label = { Text("Never use these tags (comma separated)") }, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(value = d.language, onValueChange = { vm.draft = d.copy(language = it) },
                 label = { Text("Language of the description") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            CheckRow("Write a short description", d.describe) { vm.draft = d.copy(describe = it) }
+            CheckRow("Short description from the tags (small text model)", d.describe) { vm.draft = d.copy(describe = it) }
             CheckRow("Character names (anime/game)", d.characterTags) { vm.draft = d.copy(characterTags = it) }
             CheckRow("Content rating tag", d.ratingTag) { vm.draft = d.copy(ratingTag = it) }
             CheckRow("Also add real Immich tags (AI/…)", d.writeTags) { vm.draft = d.copy(writeTags = it) }
@@ -523,9 +523,9 @@ private fun SettingsCards(vm: TaggerVm) {
             CheckRow("WD tagger (illustration, people, clothing)", d.useWd) { vm.draft = d.copy(useWd = it) }
             Text("WD strictness %.2f".format(d.wdStrictness))
             Slider(value = d.wdStrictness, onValueChange = { vm.draft = d.copy(wdStrictness = it) }, valueRange = 0.05f..0.95f)
-            CheckRow("RAM++ (photos: objects, scenes)", d.useRam) { vm.draft = d.copy(useRam = it) }
-            Text("RAM++ strictness %.2f".format(d.ramStrictness))
-            Slider(value = d.ramStrictness, onValueChange = { vm.draft = d.copy(ramStrictness = it) }, valueRange = 0.05f..0.95f)
+            CheckRow("PixAI (anime/illustration, characters, series)", d.usePixai) { vm.draft = d.copy(usePixai = it) }
+            Text("PixAI strictness %.2f".format(d.pixaiStrictness))
+            Slider(value = d.pixaiStrictness, onValueChange = { vm.draft = d.copy(pixaiStrictness = it) }, valueRange = 0.05f..0.95f)
             Hint("0.50 is each model's own recommended cut-off. Higher keeps fewer, surer tags.")
             NumberField("Most tags per asset", d.maxTags, { vm.draft = d.copy(maxTags = it) }, Modifier.fillMaxWidth(), max = range("max_tags", 5, 100).last)
         }
@@ -561,11 +561,11 @@ private fun SettingsCards(vm: TaggerVm) {
             Text("Descriptions at the same time: ${d.vlmParallel}")
             Slider(value = d.vlmParallel.toFloat(), onValueChange = { vm.draft = d.copy(vlmParallel = it.toInt()) },
                 valueRange = par.first.toFloat()..par.last.toFloat())
-            val vram = range("vram_gb", 6, 22)
-            Text("GPU memory: ${d.vramGb} GB")
+            val vram = range("vram_gb", 4, 16)
+            Text("GPU memory for the two taggers: ${d.vramGb} GB")
             Slider(value = d.vramGb.toFloat(), onValueChange = { vm.draft = d.copy(vramGb = it.toInt()) },
                 valueRange = vram.first.toFloat()..vram.last.toFloat())
-            Hint("Changes to memory and parallel descriptions restart the models next time they load.")
+            Hint("The description model uses about 3 GB on its own. Changes to memory and parallel descriptions restart the models next time they load.")
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Keep it up to date (tag new uploads)", modifier = Modifier.weight(1f))
                 Switch(checked = d.keepUpdated, onCheckedChange = { vm.draft = d.copy(keepUpdated = it) })
