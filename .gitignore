@@ -26,3 +26,6 @@ secrets.*
 
 # Search+ model cache location on this machine
 deploy/searchplus/.env
+
+# Agent worktrees (Claude Code)
+.claude/worktrees/
