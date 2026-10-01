@@ -1,0 +1,279 @@
+# AI Tagger — design and contracts
+
+A panel tab that tags every photo and video with two image taggers, lets a vision-language model (VLM) refine
+the tags and write a short description following the user's own instructions, and writes the result into the
+asset's Immich description. It runs in the background like Search+ and keeps new uploads up to date.
+
+This file is the contract between the parts. Change it when an interface changes.
+
+## Decisions
+
+| Topic | Decision |
+|---|---|
+| Tagger 1 | `SmilingWolf/wd-eva02-large-tagger-v3` (ONNX, Apache-2.0): 10,861 Danbooru tags — illustration/anime, people, clothing, pose, characters, rating |
+| Tagger 2 | `xinyu1205/recognize-anything-plus-model` (RAM++, Apache-2.0): 4,585 plain-English tags — real-world objects, scenes, activities |
+| VLM | `Qwen/Qwen3.5-9B` (Apache-2.0, 2026-02) served by vLLM, FP8, thinking off, several frames per request |
+| Captures | photo: 1 · animated image / video: `video_frames` (2 or 6; 1–8 allowed) taken from 8 equal segments, skipping the first and last segment |
+| Where results go | a managed block inside the Immich description; the user's own text is never changed. Optional: native Immich tags under `AI/` |
+| GPU | taggers + VLM share a `vram_gb` budget. Search+ and the tagger never run on the GPU at the same time |
+| Reprocessing | raw tagger scores and the VLM answer are stored, so most setting changes re-apply without the GPU |
+
+## Components and ownership
+
+| Path | What |
+|---|---|
+| `immich_organizer/tagger_service.py` | standalone model server (no package imports), runs in container `immich_aitagger` |
+| `deploy/aitagger/` | `Dockerfile` (tagger service), `docker-compose.yml` (project `immich-aitagger`: `immich_aitagger` + `immich_aitagger_vlm`), `.env.example` |
+| `immich_organizer/aitagger.py` | panel side: settings, store, catalog, frames, indexer, aggregation, rules, VLM client, write-back, services |
+| `immich_organizer/web/server.py` | `/api/aitagger*` routes |
+| `immich_organizer/client.py` | `update_asset`, tag helpers |
+| `immich_organizer/web/static/*` | the "AI Tagger" tab |
+| `tests/test_aitagger.py`, `tests/test_web.py` | tests with fakes; no GPU needed |
+
+## 1. Tagger service (`tagger_service.py`)
+
+Container `immich_aitagger`, published on `127.0.0.1:11440` (container port 8080). It mirrors `embed_service.py`:
+the HTTP server answers at once, the models load in a background thread, and every route except `/health` answers 503
+`{"error", "status"}` until they are loaded. It runs a single GPU worker thread fed by a queue, and a bad image fails
+only its own slot.
+
+Environment: `AITAGGER_VRAM_GB` (memory cap for this process, default 5), `AITAGGER_BATCH` (GPU micro-batch,
+default 16), `IDLE_EXIT_MINUTES` (default 20; **must not exit while a request is in flight**), `WD_MODEL`, `RAM_MODEL`.
+Model files live under `/cache`.
+
+### `GET /health`
+```json
+{"status": "loading|ok|error", "error": null, "device": "cuda", "vramCapGb": 5, "batch": 16,
+ "models": [{"name": "wd-eva02-large-tagger-v3", "kind": "wd", "tags": 10861, "precision": "fp16", "loadedIn": 4.1},
+            {"name": "ram_plus_swin_large_14m", "kind": "ram", "tags": 4585, "precision": "fp16", "loadedIn": 9.8}],
+ "idleExitMinutes": 20, "idleSeconds": 12, "busy": 0}
+```
+
+### `POST /tag`
+Request: `{"images": ["<base64 jpeg/png>", ...], "floor": 0.05}` (maximum 64 images).
+
+Response:
+```json
+{"results": [{"wd": {"general": {"long_hair": 0.93}, "character": {"hatsune_miku": 0.81},
+                     "rating": {"general": 0.02, "sensitive": 0.71, "questionable": 0.2, "explicit": 0.07}},
+              "ram": {"dog": 0.88, "beach": 0.64}}, null],
+ "errors": [null, "cannot identify image file"], "tookMs": 412}
+```
+Scores are **calibrated**, so 0.5 is the model's own recommended threshold for that tag:
+`s' = sigmoid(logit(s) - logit(t))`. Here `t` is 0.35 for WD general tags, 0.75 for WD character tags, and RAM++'s
+shipped per-class threshold for RAM++ tags. Only tags with `s' >= floor` are returned. WD `rating` is the model's raw
+probability for each rating. Tag names are model-native (WD keeps its underscores); the panel normalises them.
+
+## 2. VLM (`immich_aitagger_vlm`)
+
+`vllm/vllm-openai` serving `Qwen/Qwen3.5-9B` as model name `tagger-vlm`, on `127.0.0.1:11441` (container port 8000).
+Flags: `--quantization fp8`, `--gpu-memory-utilization ${AITAGGER_VLM_UTIL}`, `--max-model-len 8192`,
+`--max-num-seqs ${AITAGGER_VLM_SEQS}`, `--limit-mm-per-prompt {"image":8}`. The HF cache is a volume under
+`~/vlm/models/aitagger/hf`. Ready means `GET /health` answers 200.
+
+The panel calls `POST /v1/chat/completions` with:
+- `model: "tagger-vlm"`, `temperature: 0.2`, `max_tokens: 400`
+- `chat_template_kwargs: {"enable_thinking": false}`
+- `response_format: {"type": "json_schema", ...}` (the schema below)
+
+Content: one system message, then one user message with the text part followed by 1–8 images as
+`{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}`. Each image is at most 768 px on its long side.
+
+The answer must match `{"description": str, "add_tags": [str], "remove_tags": [str]}`.
+
+The system prompt says this is a private personal archive, that every picture is described neutrally and factually
+including adult content, and that the model never refuses. The user text lists the detected tags with scores, the
+rating, the user's `instructions` and `vocabulary`, and asks for 1–2 sentences in `language`.
+
+A refusal or an invalid JSON answer is retried once, then stored as `description: ""` and noted in that asset's
+status. It is **not** an asset failure.
+
+## 3. Panel module (`aitagger.py`)
+
+Storage lives in `state_dir()/aitagger/`: `settings.json` and `tagger.sqlite` (WAL, RLock, `check_same_thread=False`).
+
+### Settings
+
+`DEFAULTS` (validate every type explicitly — never `bool("false")`):
+
+| key | default | limits / type | content? |
+|---|---|---|---|
+| indexing | false | bool | |
+| keep_updated | true | bool | |
+| video_frames | 6 | int 1–8 (UI offers 2 / 6) | yes |
+| batch_size | 8 | int 1–64 (assets per round) | |
+| vlm_parallel | 8 | int 1–32 (concurrent VLM requests, also `--max-num-seqs`) | |
+| vram_gb | 16 | int 6–22 (taggers + VLM together) | |
+| describe | true | bool | yes |
+| use_wd, use_ram | true | bool | yes |
+| wd_strictness, ram_strictness | 0.5 | float 0.05–0.95 (calibrated threshold) | yes |
+| character_tags | true | bool | yes |
+| rating_tag | true | bool | yes |
+| max_tags | 30 | int 5–100 | yes |
+| instructions | "" | str ≤ 4000 | yes |
+| vocabulary | "" | str ≤ 4000: one entry per line, `old -> new` renames a tag, any other line is a preferred term passed to the VLM | yes |
+| blocked | [] | list of str (never output) | yes |
+| rules | [] | list of rules (below) | yes |
+| write_tags | false | bool (also attach native Immich tags `AI/<tag>`) | yes |
+| language | "English" | str ≤ 40 | yes |
+
+`settings_version` is stored in `meta` and goes up by one whenever any "content" setting changes. Every result records
+the version it was made with ("outdated" means a smaller version). How much of each GPU the two containers get is
+derived from `vram_gb`:
+- tagger: `AITAGGER_VRAM_GB = 5`
+- VLM: `AITAGGER_VLM_UTIL = round((vram_gb - 5) / total_gpu_gb, 2)`
+
+Changing `vram_gb` or `vlm_parallel` recreates the containers the next time they start.
+
+### Rules
+
+```json
+{"if_all": ["girl", "beach"], "if_any": [], "unless": ["night"], "add": ["summer"], "remove": []}
+```
+A rule fires when all of `if_all` are present, at least one of `if_any` is present (if that list is given), and none of
+`unless` are present. At least one of `if_all` / `if_any` and at least one of `add` / `remove` is required. Rules run
+in order and repeat until nothing changes (at most 5 passes). Tags are compared after normalisation.
+
+### Pipeline per asset
+
+1. **Captures.** A photo uses its Immich preview JPEG, shrunk to 1024 px (reuse `searchplus.fetch_catalog`, `_picture`
+   and `media.shrink_image`). For videos and animated images: split the length into 8 equal segments, take the midpoint
+   of segments 2–7 (six candidates), then pick `video_frames` of them evenly (2 → segments 3 and 6). Frames come from
+   ffmpeg on the original (reuse `searchplus.video_frames` logic with explicit timestamps) or from
+   `media.animation_frames`.
+2. **Tag.** Send all captures to `/tag` (batched across assets). Store per capture and per model the calibrated scores
+   ≥ 0.05, in `raw`.
+3. **Aggregate per tag across captures.** Missing means 0. `combined = 0.5 * median + 0.5 * max`. Keep the tag if
+   `combined >= strictness` of its model. Rating: the mean of the per-capture probabilities, then argmax, giving the tag
+   `rating: <name>` if `rating_tag` is on. WD character tags are kept only if `character_tags` is on.
+4. **Normalise.** Lowercase, `_` becomes a space, `name_(qualifier)` becomes `name (qualifier)`. Apply the vocabulary
+   renames, merge duplicates across models keeping the highest score, and drop `blocked` tags.
+5. **VLM** (if `describe`). Apply its `add_tags` (score 1.0) and `remove_tags`, then normalise, rename and block again.
+6. **Rules**, then `blocked` again. Cap at `max_tags` by score; rule- and VLM-added tags score 1.0.
+7. **Write.** Compose the block and write the description with `PUT /api/assets/{id}`. Read it back and compare. Keep
+   the previous description in `history`. If `write_tags` is on, upsert `AI/<tag>` tags (`PUT /api/tags`), attach them
+   (`PUT /api/tags/assets`), and detach `AI/` tags that are no longer present.
+
+Block format (the markers are how the panel finds its own text; everything outside them belongs to the user):
+```
+<user text, unchanged>
+
+[AI Tagger]
+Tags: girl, beach, summer, rating: general
+Description: A woman walks along a sunny beach at low tide.
+[/AI Tagger]
+```
+
+### Reprocess modes
+
+| mode | taggers | VLM | when |
+|---|---|---|---|
+| `retag` | stored scores | stored answer | strictness, rules, blocked, renames, max_tags, write_tags changed |
+| `describe` | stored scores | run again | instructions, vocabulary, language, describe changed |
+| `full` | run again | run again | video_frames, use_wd/use_ram changed, or asked |
+
+`retag` needs no GPU and runs even while the models are unloaded. The `queue` table holds `(id, mode, at)`; a stronger
+mode replaces a weaker one for the same id.
+
+Scopes: `ids` (list), `tag` (has that tag), `outdated` (version older than current), `all` (every processed asset).
+
+### Tables
+
+- `assets` (same columns as Search+)
+- `raw(id pk, captures, scores_json, rating_json, tagged_at, models)`
+- `results(id pk, tags_json [{tag, score, source: wd|ram|vlm|rule}], vlm_json, description, block, settings_version, processed_at, written_at, note)`
+- `history(id, at, old_description, new_description)`
+- `failed(id pk, error, attempts, at)` (same retry rules as Search+)
+- `queue(id pk, mode, at)`
+- `excluded(id pk, at)`
+- `meta(key pk, value)`
+
+### Indexer
+
+Same shape as Search+:
+- A daemon thread, `instance()`, and `autostart()` (when `settings.indexing`) called from `serve()`.
+- `CATALOG_EVERY = 600`.
+- 6 prep threads; at most 2 tagger requests in flight; `vlm_parallel` VLM requests in flight.
+- Work order: `queue` first, then unprocessed assets (newest first), skipping `excluded`.
+- "Service down" is not the asset's fault.
+- A CUDA OOM answer halves `batch_size` for the session and retries.
+- Status: `{state: stopped|starting|running|done|error, detail, error, ratePerMin, etaMinutes}`.
+
+### Services and GPU
+
+- `Service`-like wrappers for both containers, through `docker compose -p immich-aitagger -f deploy/aitagger/docker-compose.yml up -d <svc>` with the env derived from the settings. Use `--force-recreate` when the derived env changed.
+- **Stop Search+ before starting the tagger** (`searchplus.Service().stop()`).
+- While the tagger VLM container runs, `searchplus.Service.start()` raises `GpuBusy` (a subclass of `ServiceDown`) with "The GPU is in use by the AI Tagger — pause it to use Search+". The Search+ indexer waits on `GpuBusy` without counting it as a drop.
+- Unload stops both containers. The panel also stops the VLM container when the indexer has been idle for `IDLE_EXIT_MINUTES`.
+
+## 4. Panel API
+
+Every route needs the panel token. Errors are `{"error": "..."}`: 400 for invalid input, 503 for models not ready or GPU busy, 404 for unknown.
+
+| Route | Body | Answer |
+|---|---|---|
+| `GET /api/aitagger` | — | status (below) |
+| `POST /api/aitagger/settings` | `{changes: {...}, reprocess?: "none"\|"retag"\|"describe"\|"full", scope?: "outdated"\|"all"}` | status + `queued` |
+| `POST /api/aitagger/index` | `{action: start\|pause\|retry\|clear}` | status |
+| `POST /api/aitagger/load` | — | status (starts both containers; no tagging) |
+| `POST /api/aitagger/unload` | — | status (pauses, stops both containers) |
+| `POST /api/aitagger/preview` | `{id}` | preview (below), writes nothing |
+| `POST /api/aitagger/apply` | `{id}` | preview + `written: true` (process and write now) |
+| `POST /api/aitagger/reprocess` | `{scope, ids?, tag?, mode}` | status + `queued` |
+| `POST /api/aitagger/remove` | `{ids, exclude: bool}` | `{removed, excluded}` (strip the block, forget results) |
+| `GET /api/aitagger/assets` | `?tag=&q=&outdated=1&page=1&size=60` | `{items: [{id, name, type, taken, tags: [str], description, settingsVersion, processedAt}], total, page, tags: [{tag, count}]}` (top 200 tags) |
+| `GET /api/aitagger/sample` | `?type=IMAGE\|VIDEO` | `{id, name, type}` (a random catalog asset) |
+
+Status:
+```json
+{"settings": {...}, "limits": {"video_frames": [1, 8], "batch_size": [1, 64], "vlm_parallel": [1, 32], "vram_gb": [6, 22],
+ "wd_strictness": [0.05, 0.95], "ram_strictness": [0.05, 0.95], "max_tags": [5, 100]},
+ "settingsVersion": 3,
+ "counts": {"assets": 0, "images": 0, "videos": 0, "processed": 0, "pending": 0, "queued": 0, "outdated": 0, "failed": 0, "excluded": 0},
+ "indexer": {"state": "stopped", "detail": "", "error": null, "ratePerMin": null, "etaMinutes": null},
+ "service": {"tagger": {"container": "running|stopped|missing|unknown", "status": "ok|loading|error|down", "error": null},
+             "vlm": {"container": "...", "status": "ok|loading|down", "error": null},
+             "gpu": {"totalGb": 24, "usedGb": 7.1}, "searchplusRunning": false},
+ "models": {"wd": "wd-eva02-large-tagger-v3", "ram": "RAM++ (swin-large)", "vlm": "Qwen3.5-9B (FP8)"},
+ "failures": [{"id", "name", "error", "attempts", "at"}]}
+```
+
+Preview:
+```json
+{"id", "name", "type", "captures": 6, "frames": ["data:image/jpeg;base64,... (256 px)"],
+ "models": {"wd": [{"tag", "score"}], "ram": [{"tag", "score"}], "rating": {"general": 0.1, ...}},
+ "vlm": {"description", "add_tags", "remove_tags", "note"},
+ "rules": [{"rule": 0, "added": [], "removed": []}],
+ "tags": [{"tag", "score", "source"}], "description": "...", "block": "...",
+ "currentDescription": "...", "newDescription": "...", "written": false}
+```
+
+## 5. Web tab
+
+The tab button is "AI Tagger" (`data-panel="tagger"`, section `panel-tagger`). It reuses the Search+ conventions:
+`.card`, `.seg`, `.meter`, `.stats`, `busy()`, `toast()`, 5 s status polling while visible, and `CACHE` bumped in
+`sw.js`.
+
+Cards:
+1. **Model and progress.** State line, meter, and stats (processed / pending / queued / outdated / failed). Buttons:
+   Load models, Start / Pause tagging, Stop & free GPU. A note that Search+ is paused while the tagger uses the GPU.
+2. **How to tag.**
+   - Instructions (textarea) and Vocabulary (textarea, with a help line).
+   - Blocked tags.
+   - Language.
+   - Checkboxes: describe, character tags, rating tag, write native Immich tags.
+   - Strictness sliders for WD and RAM++, and max tags.
+3. **Rules.** Editable rows: IF all of [tags] / any of [tags], UNLESS [tags], THEN add [tags] / remove [tags]. Add or
+   delete a row, and Save.
+4. **Speed and memory.** Captures per video (2 / 6), assets per round, parallel descriptions, GPU memory (GB), keep up
+   to date.
+5. **Test.** An asset id field plus Random photo / Random video, then Preview. It shows the captures, the tags per model
+   with scores, the rating, what the VLM added and removed, which rules fired, the final tags, the description, and the
+   description before and after. A "Write this" button (`apply`).
+6. **Tagged assets.** Top-tag chips, search, an "outdated only" filter, and a list with thumbnails, tags and
+   description. Selection actions: Re-tag, Re-describe, Full re-process, Remove AI text (with "and don't tag again").
+
+Saving "How to tag" or "Rules" opens a choice:
+- **New assets only** (default)
+- **Also update the N already-tagged assets**, with the suggested mode preselected from the keys that changed (`retag`
+  or `describe`).
