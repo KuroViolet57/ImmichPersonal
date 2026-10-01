@@ -6,13 +6,52 @@ asset's Immich description. It runs in the background like Search+ and keeps new
 
 This file is the contract between the parts. Change it when an interface changes.
 
-## Decisions
+## v2 (2026-10-02) — supersedes everything below where they differ
+
+The owner found the 9B vision model too heavy for what it is needed for: stringing the tags into a short
+description. v2 changes:
+
+1. **Tagger 2 is PixAI Tagger v1.0** (`pixai-labs/pixai-tagger-v1.0`, Apache-2.0, 486M params, input 1008×1008 with
+   aspect kept by resize + pad, loaded with transformers `trust_remote_code=True`), replacing RAM++. It has
+   30,877 tags; the categories used are `general`, `character`, `copyright` and `rating`. `style` (artists) and `meta`
+   are ignored. The card's thresholds — general 0.17, character 0.27, copyright 0.24 — are the calibration points
+   (`s' = sigmoid(logit(s) - logit(t))`, so 0.5 = the card's threshold), exactly as for WD. Like WD it is
+   Danbooru-style, so the two vocabularies merge naturally (same normalisation, highest score wins).
+2. **The describer is text-only and small: `Qwen/Qwen3.5-2B`** in the same vLLM container (`immich_aitagger_vlm`,
+   port 11441, served name `tagger-vlm`, `--limit-mm-per-prompt {"image":0}`, thinking off). It receives **no
+   images**: only the final tag list with scores, the rating, and the user's instructions, vocabulary and language. It
+   answers the same JSON `{description, add_tags, remove_tags}` (`maxItems` 12). With no image to look at, its tag
+   edits can only follow the instructions or the tags themselves (e.g. "beach + swimsuit → summer"). The guards stay:
+   a tag in both lists is ignored, it cannot remove a tag scored ≥ 0.9 or the rating, and a tag only it added scores 0.7.
+3. **`/tag` response:** key `ram` is replaced by
+   `"pixai": {"general": {...}, "character": {...}, "copyright": {...}, "rating": {...}}`
+   (calibrated, `rating` raw). The optional request field `"models": ["wd", "pixai"]` stays. `/health` lists kinds
+   `wd` and `pixai`.
+4. **Settings:**
+   - `use_ram` becomes `use_pixai` and `ram_strictness` becomes `pixai_strictness`, with the same defaults, types and
+     reprocess modes.
+   - `character_tags` now covers WD characters, PixAI characters and PixAI copyright (series) tags.
+   - The rating is the mean of WD's and PixAI's rating probabilities, each first averaged over the captures, then the
+     argmax.
+   - `vram_gb` is now **the taggers' memory cap** (`AITAGGER_VRAM_GB = vram_gb`). Its default and limits come from
+     the measurements in the service section.
+   - The describer gets a fixed small share (`AITAGGER_VLM_UTIL`, a constant from the measurements) and no longer
+     derives from `vram_gb`. `vlm_parallel` still sets `--max-num-seqs`.
+   - Old settings files holding `use_ram` / `ram_strictness` are read without error (the unknown keys are ignored).
+   - Stored raw scores without a `pixai` entry are treated as needing a `full` reprocess.
+5. **Labels:** `models` in the status is `{"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0", "vlm":
+   "Qwen3.5-2B (text)"}`. In the preview, `models.pixai` replaces `models.ram`. The preview still returns the capture
+   thumbnails.
+6. **GPU sharing with Search+:** if the measurements show that taggers + describer + Immich ML + Search+ (PE-Core,
+   about 7 GB) fit in 22 GB, the mutual exclusion (`GpuBusy`) is dropped. Otherwise it stays.
+
+## Decisions (v1; see v2 above)
 
 | Topic | Decision |
 |---|---|
 | Tagger 1 | `SmilingWolf/wd-eva02-large-tagger-v3` (ONNX, Apache-2.0): 10,861 Danbooru tags — illustration/anime, people, clothing, pose, characters, rating |
-| Tagger 2 | `xinyu1205/recognize-anything-plus-model` (RAM++, Apache-2.0): 4,585 plain-English tags — real-world objects, scenes, activities |
-| VLM | `Qwen/Qwen3.5-9B` (Apache-2.0, 2026-02) served by vLLM, FP8, thinking off, several frames per request |
+| Tagger 2 | ~~RAM++~~ → **v2: PixAI Tagger v1.0** (30,877 Danbooru-style tags) |
+| VLM | ~~Qwen3.5-9B vision~~ → **v2: Qwen3.5-2B, text only** (strings the tags into a description) |
 | Captures | photo: 1 · animated image / video: `video_frames` (2 or 6; 1–8 allowed) taken from 8 equal segments, skipping the first and last segment |
 | Where results go | a managed block inside the Immich description; the user's own text is never changed. Optional: native Immich tags under `AI/` |
 | GPU | taggers + VLM share a `vram_gb` budget. Search+ and the tagger never run on the GPU at the same time |
