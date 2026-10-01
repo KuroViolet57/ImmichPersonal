@@ -1,0 +1,8 @@
+node_modules/
+package-lock.json
+.tools/
+
+# Intermediate build output; the compiled plugin.wasm is committed so the
+# plugin can be installed without the toolchain.
+dist/index.js
+dist/index.d.ts

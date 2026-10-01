@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A photo frame with a mountain and a sun, plus a small magnifier: an image panel. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFE8EEF9"
+        android:pathData="M30,32h48a4,4 0,0 1,4 4v36a4,4 0,0 1,-4 4h-48a4,4 0,0 1,-4 -4v-36a4,4 0,0 1,4 -4z" />
+    <path android:fillColor="#FF2F6DF6"
+        android:pathData="M31,70l15,-18 10,12 7,-8 14,14z" />
+    <path android:fillColor="#FFF5B342"
+        android:pathData="M66,44m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0" />
+    <path android:fillColor="#FF1B2A4A"
+        android:pathData="M74,66m-9,0a9,9 0,1 1,18 0a9,9 0,1 1,-18 0" />
+    <path android:fillColor="#FFE8EEF9"
+        android:pathData="M74,66m-6,0a6,6 0,1 1,12 0a6,6 0,1 1,-12 0" />
+    <path android:fillColor="#FFE8EEF9"
+        android:pathData="M79.5,72.5l3,-3 7,7 -3,3z" />
+</vector>

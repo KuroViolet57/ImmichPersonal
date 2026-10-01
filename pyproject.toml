@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "immich-organizer"
+version = "1.0.0"
+description = "Organize an Immich photo library into albums using the server's own smart-search AI."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+keywords = ["immich", "photos", "albums", "clip", "smart-search"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Graphics",
+]
+# The core runs on the standard library alone. PyYAML is only needed to read
+# YAML rule files; .json rules work without it.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=5.1"]
+
+[project.scripts]
+immich-organizer = "immich_organizer.cli:main"
+
+[tool.setuptools]
+packages = ["immich_organizer", "immich_organizer.web"]
+
+[tool.setuptools.package-data]
+"immich_organizer.web" = ["static/*"]

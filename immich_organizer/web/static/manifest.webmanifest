@@ -1,0 +1,14 @@
+{
+  "name": "Immich Organizer",
+  "short_name": "Organizer",
+  "description": "Find photos with Immich's smart search and file them into albums.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#101216",
+  "theme_color": "#101216",
+  "orientation": "portrait-primary",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

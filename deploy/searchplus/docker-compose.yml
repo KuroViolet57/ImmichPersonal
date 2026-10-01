@@ -1,0 +1,32 @@
+# Search+ (experimental) model server. The panel starts it when it is needed;
+# it stops by itself after IDLE_EXIT_MINUTES without requests, freeing the GPU.
+#   build once:  docker compose -f deploy/searchplus/docker-compose.yml build
+# The model (~10 GB download the first time, plus a ~5 GB ready-to-load copy)
+# lives in SEARCHPLUS_CACHE (set it in deploy/searchplus/.env).
+name: immich-searchplus
+services:
+  searchplus:
+    build: .
+    image: immich-searchplus:latest
+    container_name: immich_searchplus
+    restart: "no"
+    mem_limit: 16g
+    memswap_limit: 16g
+    ports:
+      - "127.0.0.1:11439:8080"
+    volumes:
+      - ${SEARCHPLUS_CACHE:-~/.cache/immich-searchplus}:/cache
+      - ../../immich_organizer:/app:ro
+    environment:
+      SEARCHPLUS_MODEL: PE-Core-bigG-14-448
+      SEARCHPLUS_PRETRAINED: meta
+      IDLE_EXIT_MINUTES: "20"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

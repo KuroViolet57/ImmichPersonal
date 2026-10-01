@@ -1,0 +1,728 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#14161a">
+<title>Immich Organizer</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <h1>Immich Organizer</h1>
+  <div class="status" id="status">connecting…</div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab is-active" data-panel="search" role="tab">Search</button>
+  <button class="tab" data-panel="splus" role="tab">Search+</button>
+  <button class="tab" data-panel="albums" role="tab">Albums</button>
+  <button class="tab" data-panel="themes" role="tab">Smart albums</button>
+
+  <button class="tab" data-panel="faces" role="tab">Faces</button>
+  <button class="tab" data-panel="history" role="tab">History</button>
+</nav>
+
+<datalist id="album-list"></datalist>
+<datalist id="people-list"></datalist>
+
+<main>
+  <div class="card is-hidden" id="token-card">
+    <h2>Enter the panel's access key</h2>
+    <p class="hint">This device hasn't been given the panel's access key yet (it's the part after
+      <code>?t=</code> in the desktop link, not your Immich API key). Paste the key, or the whole link.
+      It's remembered on this device.</p>
+    <label class="field">
+      <span>Access key or full link</span>
+      <input id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="paste here">
+    </label>
+    <button class="btn btn-primary" id="token-save" type="button">Unlock</button>
+  </div>
+
+  <!-- ------------------------------------------------------- search panel -->
+  <section class="panel is-active" id="panel-search">
+    <div class="card">
+      <div class="seg" id="mode">
+        <button class="seg-btn is-active" data-value="query">Describe it</button>
+        <button class="seg-btn" data-value="like">Like this photo</button>
+      </div>
+      <div class="seg seg-small" id="engine" style="margin-top:10px">
+        <button class="seg-btn is-active" data-value="immich" type="button">Immich model</button>
+        <button class="seg-btn" data-value="searchplus" type="button">Search+ model</button>
+      </div>
+      <small class="hint" id="engine-hint" style="display:block;margin:6px 0 12px"></small>
+
+      <label class="field" id="field-query">
+        <span>What are you looking for? (optional if you pick people)</span>
+        <input id="query" type="text" placeholder="person in a mountain" autocomplete="off">
+      </label>
+
+      <label class="field is-hidden" id="field-like">
+        <span>Reference asset ID</span>
+        <input id="like" type="text" placeholder="paste an asset UUID" autocomplete="off" spellcheck="false">
+        <small>Open a photo in Immich — the ID is the last part of the URL.</small>
+      </label>
+
+      <div class="field">
+        <span>People in the photo</span>
+        <div class="chip-add">
+          <input id="people-input" type="text" list="people-list" placeholder="Name, then Enter" autocomplete="off">
+          <button class="btn btn-quiet" id="people-add" type="button">Add</button>
+        </div>
+        <div class="chips" id="people-chips"></div>
+        <div class="seg seg-small is-hidden" id="people-match">
+          <button class="seg-btn is-active" data-value="all" type="button">All of them together</button>
+          <button class="seg-btn" data-value="any" type="button">Any of them</button>
+        </div>
+        <small id="people-hint">Pick one or more people. Leave the description empty to get every
+          photo of them (newest first).</small>
+      </div>
+
+      <details class="more" open>
+        <summary>Filters &amp; refinement</summary>
+        <div class="grid-2">
+          <label class="field">
+            <span>Max results</span>
+            <input id="limit" type="number" value="200" min="1" max="10000" inputmode="numeric">
+            <small>Up to 10,000. Best matches come first; the end of a long list is usually unrelated.</small>
+          </label>
+          <label class="field">
+            <span>Type</span>
+            <select id="type">
+              <option value="">Photos &amp; videos</option>
+              <option value="IMAGE">Photos only</option>
+              <option value="VIDEO">Videos only</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Taken after</span>
+            <input id="takenAfter" type="date">
+          </label>
+          <label class="field">
+            <span>Taken before</span>
+            <input id="takenBefore" type="date">
+          </label>
+        </div>
+
+        <div class="field">
+          <span>Skip photos that are in these albums</span>
+          <div class="chip-add">
+            <input id="skip-input" type="text" list="album-list" placeholder="Album name, then Enter" autocomplete="off">
+            <button class="btn btn-quiet" id="skip-add" type="button">Skip</button>
+          </div>
+          <div class="chips" id="skip-chips"></div>
+          <small>Skipped photos don't count toward Max results — the search keeps going
+            further down the list, so you still get new ones.</small>
+        </div>
+
+        <label class="check">
+          <input id="unfiled" type="checkbox">
+          <span>Only photos that are in no album at all</span>
+        </label>
+        <label class="field">
+          <span>Must also match (comma separated)</span>
+          <input id="allOf" type="text" placeholder="snow, hiking boots" autocomplete="off">
+          <small>Keeps only photos that also show up when searching these.</small>
+        </label>
+        <label class="field">
+          <span>Must not match</span>
+          <input id="noneOf" type="text" placeholder="ski resort" autocomplete="off">
+        </label>
+      </details>
+
+      <div class="row">
+        <button class="btn btn-primary" id="run">Search</button>
+        <button class="btn" id="save-as-rule" type="button">Save as smart album…</button>
+      </div>
+    </div>
+
+    <div class="card is-hidden" id="results-card">
+      <div class="results-head">
+        <strong id="results-count">0 results</strong>
+        <div class="results-actions">
+          <button class="btn btn-quiet" id="select-all">All</button>
+          <button class="btn btn-quiet" id="select-none">None</button>
+        </div>
+      </div>
+      <p class="hint" id="results-note">Click a photo to include or exclude it; Shift+click
+        to change a whole range. Smart search has no confidence score, so the tail of a
+        long list is usually noise.</p>
+      <div class="grid" id="results"></div>
+    </div>
+
+    <div class="card is-hidden" id="file-card">
+      <div class="seg" id="file-mode">
+        <button class="seg-btn is-active" data-value="add">Add — keep in current albums</button>
+        <button class="seg-btn" data-value="move">Move — take out of other albums</button>
+      </div>
+      <p class="hint" id="file-mode-hint">The photos stay in any albums they are already in, and are also added here.</p>
+      <label class="field">
+        <span>Album (existing, or type a new name to create it)</span>
+        <input id="album" type="text" list="album-list" placeholder="Mountains" autocomplete="off">
+      </label>
+      <label class="check"><input id="archive" type="checkbox"><span>Archive them (hide from main timeline)</span></label>
+      <label class="check"><input id="favorite" type="checkbox"><span>Mark as favorite</span></label>
+      <label class="check"><input id="skip-filed" type="checkbox" checked><span>Leave them out of my next searches</span></label>
+      <button class="btn btn-primary" id="file"><span id="file-verb">Add</span> <span id="file-count">0</span> to album</button>
+    </div>
+  </section>
+
+  <!-- -------------------------------------------------------- rules panel -->
+  <section class="panel" id="panel-rules">
+    <div class="card">
+      <h2>What is a rule?</h2>
+      <p class="hint">A rule is a saved search with a destination — “photos that look like
+        <em>a mountain</em> go into the album <em>Mountains</em>”. Instead of redoing the same
+        search by hand, save it once. <strong>Preview</strong> shows what it would add without
+        changing anything; <strong>Apply</strong> adds them. Running a rule again later only adds
+        photos that aren't in the album yet, so it keeps albums up to date as you upload more.
+        Rules only ever <em>add</em> to albums — they never move or delete anything.</p>
+      <p class="hint">Tip: set up a search on the Search tab until the results look right,
+        then press <strong>Save as rule…</strong>.</p>
+    </div>
+
+    <div class="card">
+      <div class="results-head">
+        <h2>Saved rules</h2>
+        <button class="btn btn-quiet" id="new-rule" type="button">+ New rule</button>
+      </div>
+      <p class="hint" id="rules-path">No rules file loaded.</p>
+      <div id="rules-list"></div>
+      <div class="row">
+        <button class="btn" id="preview-rules">Preview all</button>
+        <button class="btn btn-danger" id="apply-rules">Apply all</button>
+      </div>
+    </div>
+
+    <div class="card is-hidden" id="rule-editor">
+      <h2 id="rule-editor-title">New rule</h2>
+      <div class="grid-2">
+        <label class="field">
+          <span>Rule name</span>
+          <input id="r-name" type="text" placeholder="Mountains" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>Put matches in album</span>
+          <input id="r-album" type="text" list="album-list" placeholder="Mountains" autocomplete="off">
+        </label>
+      </div>
+      <div class="seg" id="r-mode">
+        <button class="seg-btn is-active" data-value="query">Describe it</button>
+        <button class="seg-btn" data-value="like">Like this photo</button>
+      </div>
+      <label class="field" id="r-field-query">
+        <span>What should the photos show? (optional if you pick people)</span>
+        <input id="r-query" type="text" placeholder="person in a mountain" autocomplete="off">
+      </label>
+      <label class="field is-hidden" id="r-field-like">
+        <span>Reference asset ID</span>
+        <input id="r-like" type="text" placeholder="paste an asset UUID" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="field">
+        <span>People in the photo</span>
+        <div class="chip-add">
+          <input id="r-people-input" type="text" list="people-list" placeholder="Name, then Enter" autocomplete="off">
+          <button class="btn btn-quiet" id="r-people-add" type="button">Add</button>
+        </div>
+        <div class="chips" id="r-people-chips"></div>
+        <div class="seg seg-small is-hidden" id="r-people-match">
+          <button class="seg-btn is-active" data-value="all" type="button">All of them together</button>
+          <button class="seg-btn" data-value="any" type="button">Any of them</button>
+        </div>
+        <small>With no description, the rule files every photo of these people.</small>
+      </div>
+      <div class="grid-2">
+        <label class="field">
+          <span>Max photos</span>
+          <input id="r-limit" type="number" value="200" min="1" max="10000" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>Type</span>
+          <select id="r-type">
+            <option value="">Photos &amp; videos</option>
+            <option value="IMAGE">Photos only</option>
+            <option value="VIDEO">Videos only</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Taken after</span>
+          <input id="r-takenAfter" type="date">
+        </label>
+        <label class="field">
+          <span>Taken before</span>
+          <input id="r-takenBefore" type="date">
+        </label>
+      </div>
+      <div class="field">
+        <span>Skip photos that are in these albums</span>
+        <div class="chip-add">
+          <input id="r-skip-input" type="text" list="album-list" placeholder="Album name, then Enter" autocomplete="off">
+          <button class="btn btn-quiet" id="r-skip-add" type="button">Skip</button>
+        </div>
+        <div class="chips" id="r-skip-chips"></div>
+      </div>
+      <label class="check"><input id="r-unfiled" type="checkbox"><span>Only photos that are in no album at all</span></label>
+      <label class="field">
+        <span>Must also match (comma separated)</span>
+        <input id="r-allOf" type="text" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>Must not match</span>
+        <input id="r-noneOf" type="text" autocomplete="off">
+      </label>
+      <label class="check"><input id="r-archive" type="checkbox"><span>Archive filed photos</span></label>
+      <label class="check"><input id="r-favorite" type="checkbox"><span>Mark filed photos as favorite</span></label>
+      <label class="check"><input id="r-enabled" type="checkbox" checked><span>Enabled (included in “Preview all / Apply all”)</span></label>
+      <div class="row">
+        <button class="btn btn-primary" id="r-save" type="button">Save rule</button>
+        <button class="btn" id="r-cancel" type="button">Cancel</button>
+      </div>
+    </div>
+
+    <div class="card is-hidden" id="plan-card">
+      <h2>Plan</h2>
+      <div id="plan-body"></div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------- albums panel -->
+  <section class="panel" id="panel-albums">
+    <div id="albums-list-view">
+      <div class="card">
+        <div class="results-head">
+          <h2>Albums</h2>
+          <button class="btn btn-quiet" id="albums-new" type="button">+ New album</button>
+        </div>
+        <div class="grid-2">
+          <label class="field">
+            <span>Find</span>
+            <input id="albums-find" type="text" placeholder="Album name" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>Sort</span>
+            <select id="albums-sort">
+              <option value="name">Name A–Z</option>
+              <option value="small">Fewest photos first</option>
+              <option value="big">Most photos first</option>
+              <option value="updated">Recently changed</option>
+            </select>
+          </label>
+        </div>
+        <label class="check"><input id="albums-small" type="checkbox"><span>Only albums with <input id="albums-small-n" type="number" value="5" min="0" class="inline-num"> photos or fewer</span></label>
+        <p class="hint" id="albums-summary"></p>
+        <div class="bulkbar is-hidden" id="albums-bulk">
+          <strong id="albums-bulk-count">0 selected</strong>
+          <button class="btn btn-quiet" id="albums-merge" type="button">Merge into…</button>
+          <button class="btn btn-quiet danger-text" id="albums-delete" type="button">Delete albums</button>
+          <button class="btn btn-quiet" id="albums-clear" type="button">Clear</button>
+        </div>
+      </div>
+      <div class="card"><div id="albums-rows"></div></div>
+    </div>
+
+    <div id="album-view" class="is-hidden">
+      <div class="card">
+        <div class="results-head">
+          <button class="btn btn-quiet" id="album-back" type="button">← All albums</button>
+          <div class="results-actions">
+            <button class="btn btn-quiet" id="album-rename" type="button">Rename</button>
+            <button class="btn btn-quiet" id="album-merge" type="button">Merge into…</button>
+            <button class="btn btn-quiet danger-text" id="album-delete" type="button">Delete</button>
+          </div>
+        </div>
+        <h2 id="album-title">Album</h2>
+        <p class="hint" id="album-meta"></p>
+        <label class="field">
+          <span>Sort</span>
+          <select id="album-sort">
+            <option value="taken_desc">Date taken — newest first</option>
+            <option value="taken_asc">Date taken — oldest first</option>
+            <option value="added_desc">Date added to this album — newest first</option>
+            <option value="added_asc">Date added to this album — oldest first</option>
+            <option value="uploaded_desc">Date uploaded to Immich — newest first</option>
+            <option value="uploaded_asc">Date uploaded to Immich — oldest first</option>
+            <option value="name_asc">File name</option>
+            <option value="relevance">Most relevant to a description (like Search)</option>
+          </select>
+        </label>
+        <div class="field is-hidden" id="album-q-field">
+          <span>Relevant to</span>
+          <div class="chip-add">
+            <input id="album-q" type="text" placeholder="e.g. people dancing" autocomplete="off">
+            <button class="btn btn-quiet" id="album-q-go" type="button">Sort</button>
+          </div>
+          <small>Ranks this album's photos by the same score Search uses, most confident first. Empty = the
+            album's theme description, or else its name.</small>
+        </div>
+        <div class="seg seg-small" id="album-media">
+          <button class="seg-btn is-active" type="button" data-value="">Photos &amp; videos</button>
+          <button class="seg-btn" type="button" data-value="IMAGE">Only photos</button>
+          <button class="seg-btn" type="button" data-value="VIDEO">Only videos</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="results-head">
+          <strong id="album-count">0 photos</strong>
+          <div class="results-actions">
+            <button class="btn btn-quiet" id="album-all" type="button">All</button>
+            <button class="btn btn-quiet" id="album-none" type="button">None</button>
+          </div>
+        </div>
+        <p class="hint">Click photos to select them (Shift+click for a range), then act on the selection below.
+          Tap ⤢ on a photo (or double-click it) to view it full size.</p>
+        <div class="grid" id="album-grid"></div>
+      </div>
+      <div class="card" id="album-actions">
+        <label class="field">
+          <span>Target album (existing, or type a new name)</span>
+          <input id="album-target" type="text" list="album-list" placeholder="Album name" autocomplete="off">
+        </label>
+        <div class="row">
+          <button class="btn btn-primary" id="album-move" type="button">Move <span class="sel-n">0</span> there</button>
+          <button class="btn" id="album-copy" type="button">Copy <span class="sel-n">0</span> there</button>
+        </div>
+        <button class="btn btn-danger row-gap" id="album-remove" type="button">Remove <span class="sel-n">0</span> from this album</button>
+        <p class="hint">Move takes them out of this album only. Removing or deleting never deletes photos — they stay in your library. Everything can be undone from History.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------- themes panel -->
+  <section class="panel" id="panel-themes">
+    <div class="card">
+      <div class="results-head">
+        <h2>Smart albums</h2>
+        <button class="btn btn-quiet" id="themes-new" type="button">+ New smart album</button>
+      </div>
+      <p class="hint">A smart album says what belongs in it — a description (a thing, a franchise, an action like
+        “people dancing”), “photos like this one”, or just people — plus filters, and adds every match to its album.
+        It only ever <em>adds</em>: nothing is moved or removed, a photo you take out is never put back, and every
+        run can be undone from History. Your former rules are here too (as “best N”, not running hourly).</p>
+      <p class="hint" id="themes-schedule"></p>
+      <div id="themes-rows"></div>
+      <button class="btn" id="themes-run-all" type="button">Run all hourly smart albums now</button>
+    </div>
+
+    <div class="card is-hidden" id="theme-editor">
+      <h2 id="theme-editor-title">New smart album</h2>
+      <span class="field"><span>Model that scores the photos</span></span>
+      <div class="seg seg-small" id="t-engine" style="margin-bottom:6px">
+        <button class="seg-btn is-active" type="button" data-value="immich">Immich (SigLIP2)</button>
+        <button class="seg-btn" type="button" data-value="searchplus">Search+ (PE-Core)</button>
+      </div>
+      <small class="hint" id="t-engine-hint" style="display:block;margin-bottom:12px"></small>
+      <div class="seg" id="t-source">
+        <button class="seg-btn is-active" type="button" data-value="text">Describe it</button>
+        <button class="seg-btn" type="button" data-value="like">Like this photo</button>
+        <button class="seg-btn" type="button" data-value="none">Only people</button>
+      </div>
+      <label class="field" id="t-description-field">
+        <span>Description (any language — this is what the photos are compared with)</span>
+        <input id="t-description" type="text" placeholder="Five Nights at Freddy's" autocomplete="off">
+      </label>
+      <label class="field is-hidden" id="t-like-field">
+        <span>Reference photo ID</span>
+        <input id="t-like" type="text" placeholder="paste an asset UUID" autocomplete="off" spellcheck="false">
+        <small>Open the photo in Immich — the ID is the last part of the URL. Scores here are photo-to-photo, so
+          good cut-offs are much higher (often 0.6–0.9): use the preview.</small>
+      </label>
+      <div class="grid-2">
+        <label class="field">
+          <span>Name</span>
+          <input id="t-name" type="text" placeholder="same as the description" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>Album it fills</span>
+          <input id="t-album" type="text" list="album-list" placeholder="same as the name" autocomplete="off">
+        </label>
+      </div>
+
+      <span class="field"><span>Which matches to add</span></span>
+      <div class="seg seg-small" id="t-mode" style="margin-bottom:12px">
+        <button class="seg-btn is-active" type="button" data-value="cutoff">Every photo above a score</button>
+        <button class="seg-btn" type="button" data-value="top">The best N</button>
+      </div>
+      <div class="grid-2">
+        <label class="field" id="t-cutoff-field">
+          <span>Cut-off score</span>
+          <input id="t-cutoff" type="number" step="0.001" min="0.01" max="0.99" value="0.100" inputmode="decimal">
+          <small>Higher = stricter. Easiest: preview, then click the last photo that still belongs.</small>
+        </label>
+        <label class="field is-hidden" id="t-limit-field">
+          <span>How many (best first)</span>
+          <input id="t-limit" type="number" min="1" max="10000" value="200" inputmode="numeric">
+        </label>
+        <label class="check" style="align-self:center"><input id="t-enabled" type="checkbox" checked><span>Run every hour</span></label>
+      </div>
+
+      <details class="more" id="t-filters">
+        <summary>Filters</summary>
+        <label class="field">
+          <span>What it may add</span>
+          <select id="t-media">
+            <option value="">Photos and videos</option>
+            <option value="IMAGE">Only photos</option>
+            <option value="VIDEO">Only videos</option>
+          </select>
+        </label>
+        <div class="field">
+          <span>People in the photo</span>
+          <div class="chip-add">
+            <input id="t-people-input" type="text" list="people-list" placeholder="Name, then Enter" autocomplete="off">
+            <button class="btn btn-quiet" id="t-people-add" type="button">Add</button>
+          </div>
+          <div class="chips" id="t-people-chips"></div>
+          <div class="seg seg-small is-hidden" id="t-people-match">
+            <button class="seg-btn is-active" data-value="all" type="button">All of them together</button>
+            <button class="seg-btn" data-value="any" type="button">Any of them</button>
+          </div>
+        </div>
+        <div class="grid-2">
+          <label class="field"><span>Taken after</span><input id="t-after" type="date"></label>
+          <label class="field"><span>Taken before</span><input id="t-before" type="date"></label>
+        </div>
+        <div class="field">
+          <span>Skip photos that are in these albums</span>
+          <div class="chip-add">
+            <input id="t-skip-input" type="text" list="album-list" placeholder="Album name, then Enter" autocomplete="off">
+            <button class="btn btn-quiet" id="t-skip-add" type="button">Skip</button>
+          </div>
+          <div class="chips" id="t-skip-chips"></div>
+        </div>
+        <label class="check"><input id="t-unfiled" type="checkbox"><span>Only photos that are in no album at all</span></label>
+        <div class="grid-2">
+          <label class="field">
+            <span>Must also match (comma separated)</span>
+            <input id="t-allof" type="text" placeholder="snow, hiking boots" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>Must not match</span>
+            <input id="t-noneof" type="text" placeholder="ski resort" autocomplete="off">
+          </label>
+        </div>
+        <small class="hint" style="display:block">Extra words are checked with the same cut-off as the description
+          (0.10 next to “like this photo”).</small>
+        <span class="field" style="margin-top:10px"><span>When it adds photos, also…</span></span>
+        <label class="check"><input id="t-archive" type="checkbox"><span>Archive them (hide from the main timeline)</span></label>
+        <label class="check"><input id="t-favorite" type="checkbox"><span>Mark them as favourites</span></label>
+      </details>
+
+      <div class="row">
+        <button class="btn" id="t-preview" type="button">Preview matches</button>
+        <button class="btn btn-primary" id="t-save" type="button">Save</button>
+      </div>
+      <div class="row row-gap">
+        <button class="btn btn-quiet" id="t-forget" type="button">Allow re-adding photos I removed</button>
+        <button class="btn btn-quiet" id="t-cancel" type="button">Close</button>
+      </div>
+      <p class="hint" id="t-count"></p>
+      <div class="grid" id="t-grid"></div>
+    </div>
+  </section>
+
+  <!-- -------------------------------------------------------- faces panel -->
+  <!-- ------------------------------------------------ Search+ (experimental) -->
+  <section class="panel" id="panel-splus">
+    <div class="card">
+      <div class="results-head">
+        <h2>Search+ <span class="badge">experimental</span></h2>
+      </div>
+      <p class="hint" id="sp-about">A second “describe it” search with a bigger AI model: <b>PE-Core G/14</b>
+        (Meta's Perception Encoder, 448&nbsp;px) instead of Immich's SigLIP2. Videos and GIFs are indexed on several
+        frames, so a scene in the middle of a clip can be found too. It has its own index; nothing in Immich changes.</p>
+      <div class="seg" id="sp-mode">
+        <button class="seg-btn is-active" data-value="text" type="button">Describe it</button>
+        <button class="seg-btn" data-value="like" type="button">More like a photo</button>
+      </div>
+      <label class="field" id="sp-field-text">
+        <span>What are you looking for?</span>
+        <input id="sp-text" type="text" placeholder="two people hiking at sunset" autocomplete="off" enterkeyhint="search">
+      </label>
+      <div class="field is-hidden" id="sp-field-like">
+        <span>The photo to match</span>
+        <div class="sp-like-row">
+          <img id="sp-like-thumb" class="is-hidden" alt="">
+          <input id="sp-like" type="text" placeholder="asset ID — or open any photo and press “Similar”" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+      <div class="grid-2">
+        <label class="field">
+          <span>Type</span>
+          <select id="sp-type">
+            <option value="">Photos &amp; videos</option>
+            <option value="IMAGE">Photos only</option>
+            <option value="VIDEO">Videos only</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Max results</span>
+          <input id="sp-limit" type="number" value="200" min="1" max="1000" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>Taken after</span>
+          <input id="sp-after" type="date">
+        </label>
+        <label class="field">
+          <span>Taken before</span>
+          <input id="sp-before" type="date">
+        </label>
+      </div>
+      <label class="check"><input id="sp-compare" type="checkbox"><span>Compare with Immich's own smart search, side by side</span></label>
+      <div class="row">
+        <button class="btn btn-primary" id="sp-run" type="button">Search</button>
+      </div>
+    </div>
+
+    <div class="card is-hidden" id="sp-results-card">
+      <div class="results-head">
+        <strong id="sp-count">0 results</strong>
+        <div class="results-actions">
+          <button class="btn btn-quiet" id="sp-all" type="button">All</button>
+          <button class="btn btn-quiet" id="sp-none" type="button">None</button>
+        </div>
+      </div>
+      <p class="hint" id="sp-note"></p>
+      <div class="sp-cols" id="sp-cols">
+        <div class="sp-col">
+          <h3 class="sp-col-head is-hidden" id="sp-head-mine"></h3>
+          <div class="grid" id="sp-grid"></div>
+        </div>
+        <div class="sp-col is-hidden" id="sp-col-immich">
+          <h3 class="sp-col-head" id="sp-head-immich"></h3>
+          <div class="grid" id="sp-grid-immich"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card is-hidden" id="sp-file-card">
+      <label class="field">
+        <span>Add the selected ones to an album (existing, or type a new name)</span>
+        <input id="sp-album" type="text" list="album-list" placeholder="Mountains" autocomplete="off">
+      </label>
+      <button class="btn btn-primary" id="sp-file" type="button">Add <span id="sp-file-count">0</span> to album</button>
+    </div>
+
+    <div class="card">
+      <div class="results-head">
+        <h2>Index</h2>
+        <div class="results-actions">
+          <button class="btn btn-quiet" id="sp-toggle" type="button">Build index</button>
+          <button class="btn btn-quiet" id="sp-unload" type="button">Stop &amp; free GPU</button>
+        </div>
+      </div>
+      <p class="d-state" id="sp-state">…</p>
+      <div class="meter" aria-hidden="true"><div class="meter-fill" id="sp-meter"></div></div>
+      <p class="hint" id="sp-progress"></p>
+      <div class="stats" id="sp-stats"></div>
+      <label class="field">
+        <span>Frames per video / GIF: <b id="sp-frames-v"></b></span>
+        <input class="slider" id="sp-frames" type="range" min="1" max="8" step="1">
+        <small>Each frame is one more picture to index; more frames find short scenes inside long clips.
+          Applies to videos indexed from now on.</small>
+      </label>
+      <label class="check"><input id="sp-keep" type="checkbox"><span>Keep it up to date: index new uploads
+        automatically (the model loads for them, then unloads after 20 quiet minutes)</span></label>
+      <p class="hint">The model needs about 6 GB of graphics memory while it runs. It loads when you search or
+        index and unloads by itself after 20 minutes without use; “Stop &amp; free GPU” unloads it now. The first
+        start downloads it (about 10 GB).</p>
+      <details class="more is-hidden" id="sp-fail-box">
+        <summary id="sp-fail-sum">Could not index</summary>
+        <p class="hint" id="sp-fail-hint"></p>
+        <div id="sp-failures"></div>
+        <div class="row row-gap">
+          <button class="btn btn-quiet" id="sp-retry" type="button">Try again</button>
+          <button class="btn btn-quiet" id="sp-clear" type="button">Clear list</button>
+        </div>
+      </details>
+      <div class="row row-gap">
+        <button class="btn btn-quiet btn-danger" id="sp-reset" type="button">Start over…</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-faces">
+    <div class="card">
+      <h2>Clean up unnamed people</h2>
+      <p class="hint">Every unnamed person, blurriest first. The score measures how much fine detail
+        their <em>sharpest</em> face has at the size Immich's recognizer looks at — dark faces are not
+        penalised. Roughly: under ~8 is usually an unrecognisable smudge, above ~20 is almost always
+        clear. Heavily pixelated faces can still score high, so have a look before hiding. Hiding only
+        removes someone from the People page; nothing is deleted and you can unhide any time.</p>
+      <p class="hint" id="faces-meta"></p>
+      <div class="grid-2">
+        <label class="field">
+          <span>Show</span>
+          <select id="faces-show">
+            <option value="visible">Visible people</option>
+            <option value="hidden">Hidden people</option>
+            <option value="all">Everyone</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Select everyone scoring below</span>
+          <div class="chip-add">
+            <input id="faces-cut" type="number" value="8" min="0" step="1" inputmode="numeric">
+            <button class="btn btn-quiet" id="faces-select-cut" type="button">Select</button>
+          </div>
+        </label>
+      </div>
+      <div class="row">
+        <button class="btn btn-danger" id="faces-hide" type="button">Hide selected</button>
+        <button class="btn" id="faces-unhide" type="button">Unhide selected</button>
+      </div>
+      <div class="row row-gap">
+        <button class="btn btn-quiet" id="faces-clear" type="button">Clear selection</button>
+        <button class="btn btn-quiet" id="faces-measure" type="button">Re-measure</button>
+        <button class="btn btn-quiet" id="faces-covers" type="button">Use sharpest face as cover</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="results-head"><strong id="faces-count">—</strong></div>
+      <div class="grid" id="faces-grid"></div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------ history panel -->
+  <section class="panel" id="panel-history">
+    <div class="card">
+      <div class="results-head">
+        <h2>Recent changes</h2>
+        <button class="btn btn-quiet" id="refresh-history" type="button">Refresh</button>
+      </div>
+      <p class="hint">Every add, move and rule run is recorded here. Undo removes the photos a
+        change added and, for a move, puts them back in the albums they were taken out of.
+        Albums are never deleted.</p>
+      <div id="history-list"></div>
+    </div>
+  </section>
+</main>
+
+<div class="viewer is-hidden" id="viewer" role="dialog" aria-modal="true" aria-label="Media viewer">
+  <div class="viewer-top">
+    <span class="viewer-count" id="v-count"></span>
+    <span class="viewer-name" id="v-name"></span>
+    <div class="viewer-actions">
+      <button class="vbtn" id="v-select" type="button">Select</button>
+      <button class="vbtn" id="v-similar" type="button" title="Find more like this with Search+">Similar</button>
+      <button class="vbtn" id="v-full" type="button" title="Full quality">HD</button>
+      <button class="vbtn" id="v-info" type="button" aria-label="Details" title="Details (i)">ⓘ</button>
+      <a class="vbtn" id="v-download" href="#" aria-label="Download original" title="Download original">⤓</a>
+      <button class="vbtn" id="v-close" type="button" aria-label="Close" title="Close (Esc)">✕</button>
+    </div>
+  </div>
+  <div class="viewer-stage" id="v-stage"></div>
+  <button class="viewer-nav prev" id="v-prev" type="button" aria-label="Previous">‹</button>
+  <button class="viewer-nav next" id="v-next" type="button" aria-label="Next">›</button>
+  <div class="viewer-info is-hidden" id="v-details"></div>
+</div>
+
+<div class="toast is-hidden" id="toast"></div>
+<div class="veil is-hidden" id="veil"><div class="spinner"></div><span id="veil-text">Working…</span></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

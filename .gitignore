@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+/build/
+/dist/
+*.egg-info/
+.pytest_cache/
+
+# Local, machine-specific, or sensitive
+rules.yaml
+rules.json
+config.json
+*.local.yaml
+preview*.html
+plan*.html
+
+# Credentials. This repository is public; an API key committed here is scraped
+# within minutes and survives rotation in the git history. Keys belong in the
+# environment (IMMICH_API_KEY, IMMICH_PLUGIN_API_KEY), never in a file here.
+.env
+.env.*
+*.key
+secrets.*
+*secret*.json
+
+# Search+ model cache location on this machine
+deploy/searchplus/.env
