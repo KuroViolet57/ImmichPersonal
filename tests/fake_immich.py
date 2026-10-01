@@ -56,6 +56,11 @@ class FakeImmich:
         self.plugins: list[dict] = []
         self.plugin_methods: list[dict] = []
         self.workflows: list[dict] = []
+        # AI Tagger: native tags (id -> tag, asset id -> tag ids) and asset edits
+        self.tags: dict[str, dict] = {}
+        self.asset_tags: dict[str, list[str]] = {}
+        self.asset_puts: list[tuple[str, dict]] = []
+        self.mangle_description = None      # a callable that changes a description as it is stored (Immich "trimming")
         self.requests: list[tuple[str, str]] = []
         self.fail_next: dict[str, int] = {}
         self._server: ThreadingHTTPServer | None = None
@@ -294,7 +299,48 @@ class FakeImmich:
                 match = re.fullmatch(r"/api/assets/([0-9a-f-]+)", path)
                 if match and method == "GET":
                     asset = outer.by_id.get(match.group(1))
-                    return self._send(200, asset) if asset else self._send(404, {"message": "no"})
+                    return self._send(200, outer._asset_view(asset)) if asset else self._send(404, {"message": "no"})
+                if match and method == "PUT":
+                    asset = outer.by_id.get(match.group(1))
+                    if not asset:
+                        return self._send(404, {"message": "no"})
+                    body = self._body()
+                    outer.asset_puts.append((match.group(1), body))
+                    for key, value in body.items():
+                        if key == "description":
+                            if outer.mangle_description:
+                                value = outer.mangle_description(value)
+                            asset.setdefault("exifInfo", {})["description"] = value
+                        else:
+                            asset[key] = value
+                    return self._send(200, outer._asset_view(asset))
+
+                if path == "/api/tags" and method == "GET":
+                    return self._send(200, list(outer.tags.values()))
+                if path == "/api/tags" and method == "PUT":
+                    return self._send(200, outer._upsert_tags(self._body().get("tags") or []))
+                if path == "/api/tags/assets" and method == "PUT":
+                    body = self._body()
+                    count = 0
+                    for tag_id in body.get("tagIds", []):
+                        if tag_id not in outer.tags:
+                            return self._send(400, {"message": "unknown tag"})
+                        for asset_id in body.get("assetIds", []):
+                            have = outer.asset_tags.setdefault(asset_id, [])
+                            if tag_id not in have:
+                                have.append(tag_id)
+                                count += 1
+                    return self._send(200, {"count": count})
+                match = re.fullmatch(r"/api/tags/([0-9a-f-]+)/assets", path)
+                if match and method == "DELETE":
+                    out = []
+                    for asset_id in self._body().get("ids", []):
+                        have = outer.asset_tags.get(asset_id, [])
+                        ok = match.group(1) in have
+                        if ok:
+                            have.remove(match.group(1))
+                        out.append({"id": asset_id, "success": ok, **({} if ok else {"error": "not_found"})})
+                    return self._send(200, out)
 
                 if path == "/api/assets" and method == "PUT":
                     outer.updates.append(self._body())
@@ -319,7 +365,7 @@ class FakeImmich:
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._server.daemon_threads = True
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         self._thread.start()
         return self
 
@@ -331,6 +377,27 @@ class FakeImmich:
             self._thread.join(timeout=5)
 
     # ------------------------------------------------------------- endpoints
+
+    def _asset_view(self, asset: dict) -> dict:
+        """The asset as GET /assets/{id} shows it: with its native tags."""
+        return {**asset, "tags": [self.tags[t] for t in self.asset_tags.get(asset["id"], []) if t in self.tags]}
+
+    def _upsert_tags(self, names: list[str]) -> list[dict]:
+        """PUT /tags: create missing tags (and their parents for a path like AI/beach); answer the named ones."""
+        out = []
+        for name in names:
+            parent_id = None
+            for i, part in enumerate(name.split("/")):
+                value = "/".join(name.split("/")[: i + 1])
+                tag = next((t for t in self.tags.values() if t["value"] == value), None)
+                if tag is None:
+                    tag_id = str(uuid.uuid4())
+                    tag = {"id": tag_id, "name": part, "value": value, "createdAt": "2026-01-01T00:00:00.000Z",
+                           "updatedAt": "2026-01-01T00:00:00.000Z", **({"parentId": parent_id} if parent_id else {})}
+                    self.tags[tag_id] = tag
+                parent_id = tag["id"]
+            out.append(tag)
+        return out
 
     def _page(self, ids: list[str], body: dict) -> dict:
         size = int(body.get("size") or 100)

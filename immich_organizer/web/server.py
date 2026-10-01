@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from ..client import ImmichClient, ImmichError
+from .. import aitagger as aitagger_mod
 from .. import albums as albums_mod
 from .. import searchplus as searchplus_mod
 from .. import themes as themes_mod
@@ -101,6 +102,7 @@ class OrganizerHandler(BaseHTTPRequestHandler):
     theme_backend = None  # tests inject a fake; None = the real Docker/ML backend
     theme_sp_engine = None  # tests inject a fake Search+ scorer for smart albums; None = the real index
     searchplus_parts = None  # tests inject (store, service, indexer); None = the real ones
+    aitagger_parts = None  # tests inject (store, services, indexer) for the AI Tagger; None = the real ones
 
     # -------------------------------------------------------------- utilities
 
@@ -196,6 +198,10 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 return self._json(200, self._themes_list())
             if route == "/api/searchplus":
                 return self._json(200, self._searchplus_status())
+            if route == "/api/aitagger":
+                return self._json(200, self._aitagger_status())
+            if route.startswith("/api/aitagger/"):
+                return self._json(200, self._aitagger_get(route[len("/api/aitagger/"):], query))
             if route == "/api/albums/list":
                 return self._json(200, {"albums": albums_mod.summarise_albums(self.client)})
             if route.startswith("/api/albums/") and route.endswith("/items"):
@@ -214,6 +220,8 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             return self._error(400, str(exc))
         except ImmichError as exc:
             return self._error(502, str(exc))
+        except aitagger_mod.NotFound as exc:
+            return self._error(404, str(exc))
         except Exception as exc:  # pragma: no cover - defensive
             return self._error(500, f"{type(exc).__name__}: {exc}")
 
@@ -262,12 +270,23 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 return self._json(200, self._theme_action(route[len("/api/themes/"):], body))
             if route.startswith("/api/searchplus/"):
                 return self._json(200, self._searchplus_action(route[len("/api/searchplus/"):], body))
+            if route.startswith("/api/aitagger/"):
+                return self._json(200, self._aitagger_action(route[len("/api/aitagger/"):], body))
         except (ValueError, RuleError) as exc:
             return self._error(400, str(exc))
+        except searchplus_mod.GpuBusy as exc:
+            return self._error(503, str(exc))
+        except aitagger_mod.ImmichDown as exc:
+            return self._error(502, f"Immich is not answering ({exc}).")
         except searchplus_mod.ServiceDown as exc:
+            if route.startswith("/api/aitagger"):
+                return self._error(503, f"The AI Tagger models are loading or not running ({exc}). "
+                                        "Try again in a minute.")
             return self._error(503, f"The Search+ model is not ready yet ({exc}). Try again in a moment.")
         except ImmichError as exc:
             return self._error(502, str(exc))
+        except aitagger_mod.NotFound as exc:
+            return self._error(404, str(exc))
         except LookupError:
             return self._error(404, "Not found")
         except Exception as exc:  # pragma: no cover - defensive
@@ -383,6 +402,111 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                            "date": str(view.taken[p]) if p is not None else "",
                            "name": view.names[p] if p is not None else ""})
         return {"model": model, "assets": assets[:limit]}
+
+    # ------------------------------------------------------------ AI Tagger
+
+    def _at(self):
+        return self.aitagger_parts or aitagger_mod.instance(self.client)
+
+    def _aitagger_status(self) -> dict:
+        store, service, indexer = self._at()
+        counts = store.counts()
+        return {
+            "settings": aitagger_mod.load_settings(),
+            "limits": {k: list(v) for k, v in aitagger_mod.LIMITS.items()},
+            "settingsVersion": store.settings_version, "counts": counts, "indexer": indexer.status(counts),
+            "service": service.status(), "models": dict(aitagger_mod.MODEL_LABELS), "failures": store.failures(),
+            "reprocessKeys": {mode: list(keys) for mode, keys in aitagger_mod.REPROCESS.items()},
+        }
+
+    def _asset_ids(self, value, name: str = "ids", limit: int = 5000) -> list[str]:
+        if not isinstance(value, list) or not value or not all(isinstance(i, str) for i in value):
+            raise ValueError(f"{name} must be a non-empty list of asset ids")
+        if len(value) > limit:
+            raise ValueError(f"at most {limit} assets at a time")
+        return [self._uuid(i) for i in value]
+
+    def _aitagger_get(self, what: str, query: dict[str, list[str]]) -> dict:
+        store, _service, indexer = self._at()
+        arg = lambda name, default="": (query.get(name) or [default])[0]  # noqa: E731
+        if what == "assets":
+            try:
+                page, size = max(int(arg("page", "1")), 1), max(1, min(int(arg("size", "60")), 200))
+            except ValueError:
+                raise ValueError("page and size must be numbers") from None
+            return store.list_assets(tag=arg("tag").strip(), q=arg("q").strip(),
+                                     outdated=arg("outdated") in ("1", "true"), page=page, size=size)
+        if what == "sample":
+            kind = arg("type")
+            if kind not in ("", "IMAGE", "VIDEO"):
+                raise ValueError("type must be IMAGE or VIDEO")
+            item = store.random_asset(kind)
+            if item is None and not store.meta("catalog_at"):
+                indexer.refresh_catalog()           # nothing has been read from Immich yet
+                item = store.random_asset(kind)
+            if item is None:
+                raise aitagger_mod.NotFound(f"There is no {kind.lower() or 'photo'} in the library list.")
+            return {"id": item["id"], "name": item["name"], "type": item["type"]}
+        raise aitagger_mod.NotFound("Not found")
+
+    def _aitagger_action(self, action: str, body: dict) -> dict:
+        store, service, indexer = self._at()
+        if action == "settings":
+            changes = body.get("changes")
+            if not isinstance(changes, dict) or not changes:
+                raise ValueError("Nothing to change.")
+            mode, scope = body.get("reprocess", "none"), body.get("scope", "outdated")
+            if mode not in ("none",) + aitagger_mod.MODES:
+                raise ValueError("reprocess must be none, retag, describe or full")
+            if scope not in ("outdated", "all"):
+                raise ValueError("scope must be outdated or all")
+            settings, changed = aitagger_mod.apply_settings({k: v for k, v in changes.items() if k != "indexing"}, store)
+            queued = aitagger_mod.reprocess(store, scope, mode) if mode != "none" else 0
+            if queued:
+                indexer.start() if settings["indexing"] else indexer.poke()
+            return {**self._aitagger_status(), "queued": queued, "changed": changed,
+                    "suggest": aitagger_mod.suggest_mode(changed)}
+        if action == "index":
+            what = body.get("action")
+            if what == "start":
+                aitagger_mod.apply_settings({"indexing": True}, store)
+                indexer.start()
+            elif what == "pause":
+                aitagger_mod.apply_settings({"indexing": False}, store)
+                indexer.stop()
+            elif what == "retry":
+                store.retry_failed()
+                indexer.start() if aitagger_mod.load_settings()["indexing"] else indexer.poke()
+            elif what == "clear":
+                store.clear_failed()
+            else:
+                raise ValueError("action must be start, pause, retry or clear")
+            return self._aitagger_status()
+        if action == "load":
+            service.load()                      # starts the containers; they keep loading in the background
+            return self._aitagger_status()
+        if action == "unload":
+            aitagger_mod.apply_settings({"indexing": False}, store)
+            indexer.stop(wait_s=5)
+            service.unload()
+            return self._aitagger_status()
+        if action in ("preview", "apply"):
+            return indexer.test(self._uuid(str(body.get("id") or "")), write=action == "apply")
+        if action == "reprocess":
+            scope, ids = body.get("scope"), body.get("ids")
+            if scope == "ids":
+                ids = self._asset_ids(ids)
+            queued = aitagger_mod.reprocess(store, str(scope or ""), str(body.get("mode") or ""), ids,
+                                            body.get("tag") or "")
+            if queued:
+                indexer.start() if aitagger_mod.load_settings()["indexing"] else indexer.poke()
+            return {**self._aitagger_status(), "queued": queued}
+        if action == "remove":
+            exclude = body.get("exclude", False)
+            if not isinstance(exclude, bool):
+                raise ValueError("exclude must be true or false")
+            return indexer.remove(self._asset_ids(body.get("ids")), exclude)
+        raise LookupError(action)
 
     # --------------------------------------------------------------- themes
 
@@ -1202,6 +1326,7 @@ def serve(
         return 1
     httpd.daemon_threads = True
     searchplus_mod.autostart()            # resume building the Search+ index if it was on
+    aitagger_mod.autostart(client)        # ... and tagging with the AI Tagger
 
     shown_host = _local_ip() if host in ("0.0.0.0", "::") else host
     url = f"http://{shown_host}:{port}/?t={token}"

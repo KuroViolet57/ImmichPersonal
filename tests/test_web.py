@@ -1233,3 +1233,286 @@ class TestSearchPlus(WebCase):
         with self.assertRaises(urllib.error.HTTPError) as err:
             self.post("settings", {"changes": {"video_frames": 99}})
         self.assertEqual(err.exception.code, 400)
+
+    def test_gpu_busy_is_a_503_with_its_own_message(self):
+        message = "The GPU is in use by the AI Tagger \u2014 pause it to use Search+"
+        self.service.ready = mock.Mock(side_effect=self.sp.GpuBusy(message))
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            self.post("search", {"text": "dog"})
+        self.assertEqual(err.exception.code, 503)
+        self.assertEqual(json.loads(err.exception.read())["error"], message)
+
+
+class TestAiTagger(WebCase):
+    """The /api/aitagger* routes, over the fake Immich and the fake model containers."""
+
+    def setUp(self):
+        super().setUp()
+        from immich_organizer import aitagger as at
+        from tests import test_aitagger as t
+        self.at, self.t = at, t
+        self.services = t.FakeServices()
+        self.store = at.Store(Path(self.tmp.name) / "at")
+        self.addCleanup(self.store.conn.close)
+        self.catalog = t.catalog_for(self.ids)
+        self.indexer = at.Indexer(self.store, self.services, client=self.client, catalog=lambda: self.catalog,
+                                  frames=t.fake_frames)
+        self.indexer.DROP_WAIT = 0.01
+        self.addCleanup(self.indexer.stop, 5)
+        self.httpd.RequestHandlerClass.aitagger_parts = (self.store, self.services, self.indexer)
+        self.addCleanup(setattr, self.httpd.RequestHandlerClass, "aitagger_parts", None)
+
+    def post(self, action, body=None):
+        return request(self.base + f"/api/aitagger/{action}", method="POST", body=body or {})[1]
+
+    def get(self, path):
+        return request(self.base + path)[1]
+
+    def refused(self, call, code):
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            call()
+        self.assertEqual(err.exception.code, code)
+        return json.loads(err.exception.read())["error"]
+
+    def build(self, pause=False, **settings):
+        """Tag everything through the routes (and, with ``pause``, leave tagging switched off afterwards)."""
+        self.post("settings", {"changes": {"keep_updated": False, **settings}})
+        self.post("index", {"action": "start"})
+        self.indexer.thread.join(30)
+        self.assertFalse(self.indexer.running())
+        if pause:
+            self.post("index", {"action": "pause"})
+
+    def description(self, i):
+        return (self.fake.by_id[self.ids[i]].get("exifInfo") or {}).get("description") or ""
+
+    def test_every_route_needs_the_token(self):
+        for path in ("/api/aitagger", "/api/aitagger/assets", "/api/aitagger/sample"):
+            self.refused(lambda: request(self.base + path, token=None), 401)
+        for action in ("settings", "index", "load", "unload", "preview", "apply", "reprocess", "remove"):
+            self.refused(lambda: request(self.base + f"/api/aitagger/{action}", method="POST", body={}, token=None), 401)
+
+    def test_the_old_tag_routes_are_still_gone_and_unknown_ones_are_404(self):
+        for path in ("/api/tags", "/api/describer", "/api/aitagger/nothing"):
+            self.refused(lambda: request(self.base + path), 404)
+        self.refused(lambda: self.post("nothing"), 404)
+
+    def test_status_has_the_contract_shape(self):
+        data = self.get("/api/aitagger")
+        self.assertEqual(data["settings"], self.at.DEFAULTS)
+        self.assertEqual(data["limits"], {"video_frames": [1, 8], "batch_size": [1, 64], "vlm_parallel": [1, 32],
+                                          "vram_gb": [6, 22], "wd_strictness": [0.05, 0.95], "ram_strictness": [0.05, 0.95],
+                                          "max_tags": [5, 100]})
+        self.assertEqual(data["settingsVersion"], 1)
+        self.assertEqual(data["counts"], {"assets": 0, "images": 0, "videos": 0, "processed": 0, "pending": 0, "queued": 0,
+                                          "outdated": 0, "failed": 0, "retrying": 0, "cleared": 0, "excluded": 0,
+                                          "catalogAt": None})
+        self.assertEqual(data["indexer"], {"state": "stopped", "detail": "", "error": None, "running": False,
+                                           "ratePerMin": None, "etaMinutes": None})
+        self.assertEqual(data["service"]["tagger"]["status"], "down")
+        self.assertEqual(data["service"]["gpu"], {"totalGb": 24, "usedGb": 1.0})
+        self.assertFalse(data["service"]["searchplusRunning"])
+        self.assertEqual(data["models"], {"wd": "wd-eva02-large-tagger-v3", "ram": "RAM++ (swin-large)", "vlm": "Qwen3.5-9B (FP8)"})
+        self.assertEqual(data["failures"], [])
+        self.assertIn("rules", data["reprocessKeys"]["retag"])
+
+    def test_tagging_everything_through_the_routes(self):
+        self.build()
+        data = self.get("/api/aitagger")
+        self.assertTrue(data["settings"]["indexing"])
+        self.assertEqual(data["indexer"]["state"], "done")
+        c = data["counts"]
+        self.assertEqual((c["assets"], c["images"], c["videos"], c["processed"], c["pending"], c["failed"]), (5, 4, 1, 3, 0, 2))
+        self.assertEqual(sorted(f["name"] for f in data["failures"]), ["IMG_0003.jpg", "IMG_0004.jpg"])
+        self.assertEqual(set(data["failures"][0]), {"id", "name", "error", "attempts", "at"})
+        self.assertIn("[AI Tagger]", self.description(0))
+
+    def test_settings_are_validated_saved_and_versioned(self):
+        data = self.post("settings", {"changes": {"max_tags": 12, "instructions": "Be brief.", "blocked": ["Cat"]}})
+        self.assertEqual((data["settings"]["max_tags"], data["settings"]["instructions"], data["settings"]["blocked"]),
+                         (12, "Be brief.", ["cat"]))
+        self.assertEqual(data["settingsVersion"], 2)
+        self.assertEqual(sorted(data["changed"]), ["blocked", "instructions", "max_tags"])
+        self.assertEqual(data["suggest"], "describe")
+        self.assertEqual(data["queued"], 0)
+        data = self.post("settings", {"changes": {"batch_size": 4, "indexing": True}})          # not content; indexing is ignored here
+        self.assertEqual((data["settingsVersion"], data["settings"]["indexing"], data["suggest"]), (2, False, "none"))
+        self.assertEqual(self.get("/api/aitagger")["settings"]["max_tags"], 12)
+        for changes in ({"max_tags": 3}, {"describe": "false"}, {"video_frames": "6"}, {"wd_strictness": 2}, {"nope": 1},
+                        {"rules": [{"if_all": ["a"]}]}, {"language": ""}):
+            self.refused(lambda: self.post("settings", {"changes": changes}), 400)
+        for body in ({}, {"changes": {}}, {"changes": [1]}, {"changes": {"indexing": True, "max_tags": "x"}}):
+            self.refused(lambda: self.post("settings", body), 400)
+        self.assertEqual(self.get("/api/aitagger")["settingsVersion"], 2)                      # refused changes saved nothing
+
+    def test_settings_can_reprocess_the_old_results(self):
+        self.build(pause=True)
+        data = self.post("settings", {"changes": {"max_tags": 5}, "reprocess": "retag", "scope": "outdated"})
+        self.assertEqual((data["queued"], data["suggest"], data["counts"]["queued"], data["counts"]["outdated"]), (3, "retag", 3, 3))
+        self.post("index", {"action": "start"})
+        self.indexer.thread.join(30)
+        data = self.get("/api/aitagger")
+        self.assertEqual((data["counts"]["queued"], data["counts"]["outdated"]), (0, 0))
+        self.assertEqual(self.services.tag_calls, [6])                                            # the retag used no GPU
+        for body, why in [({"changes": {"max_tags": 6}, "reprocess": "everything"}, "reprocess"),
+                          ({"changes": {"max_tags": 6}, "reprocess": "retag", "scope": "some"}, "scope")]:
+            self.assertIn(why, self.refused(lambda: self.post("settings", body), 400))
+        self.assertEqual(self.get("/api/aitagger")["settings"]["max_tags"], 5)                    # nothing was saved
+        data = self.post("settings", {"changes": {"max_tags": 7}, "reprocess": "none"})
+        self.assertEqual(data["queued"], 0)
+        self.post("index", {"action": "pause"})
+        data = self.post("settings", {"changes": {"use_ram": False}, "reprocess": "full", "scope": "all"})
+        self.assertEqual((data["queued"], data["suggest"]), (3, "full"))
+        self.assertEqual(data["counts"]["queued"], 3)
+
+    def test_index_actions(self):
+        self.post("settings", {"changes": {"keep_updated": False}})
+        data = self.post("index", {"action": "start"})
+        self.assertTrue(data["settings"]["indexing"])
+        self.indexer.thread.join(30)
+        data = self.post("index", {"action": "pause"})
+        self.assertFalse(data["settings"]["indexing"])
+        self.assertEqual(data["counts"]["retrying"], 2)
+        data = self.post("index", {"action": "clear"})
+        self.assertEqual((data["counts"]["failed"], data["counts"]["cleared"]), (0, 2))
+        data = self.post("index", {"action": "retry"})
+        self.assertEqual((data["counts"]["failed"], data["counts"]["pending"]), (0, 2))
+        self.refused(lambda: self.post("index", {"action": "reset"}), 400)
+        self.refused(lambda: self.post("index", {}), 400)
+
+    def test_load_and_unload(self):
+        data = self.post("load")
+        self.assertEqual(self.services.loads, 1)
+        self.assertEqual(data["indexer"]["state"], "stopped")                   # loading does not start tagging
+        self.assertFalse(data["settings"]["indexing"])
+        self.post("index", {"action": "start"})
+        data = self.post("unload")
+        self.assertEqual(self.services.unloads, 1)
+        self.assertFalse(data["settings"]["indexing"])
+        self.indexer.thread.join(10)
+        self.assertFalse(self.indexer.running())
+
+    def test_loading_failures_are_503(self):
+        self.services.load = mock.Mock(side_effect=self.at.ServiceDown("could not start immich_aitagger: no such image"))
+        self.assertIn("no such image", self.refused(lambda: self.post("load"), 503))
+
+    def test_preview_writes_nothing_and_apply_writes(self):
+        self.services.answer = lambda *a: {"description": "A girl on a beach.", "add_tags": [], "remove_tags": [], "note": ""}
+        data = self.post("preview", {"id": self.ids[0]})
+        self.assertEqual((data["id"], data["name"], data["type"], data["captures"], data["written"]),
+                         (self.ids[0], "IMG_0000.jpg", "IMAGE", 1, False))
+        self.assertEqual(set(data), {"id", "name", "type", "captures", "frames", "models", "vlm", "rules", "tags", "description",
+                                     "block", "currentDescription", "newDescription", "written"})
+        self.assertEqual(set(data["models"]), {"wd", "ram", "rating"})
+        self.assertEqual(data["description"], "A girl on a beach.")
+        self.assertEqual(data["tags"][0], {"tag": "girl", "score": 0.9, "source": "wd"})
+        self.assertEqual(data["currentDescription"], "")
+        self.assertEqual(data["newDescription"], data["block"])
+        self.assertEqual(self.description(0), "")
+        data = self.post("apply", {"id": self.ids[0]})
+        self.assertTrue(data["written"])
+        self.assertEqual(self.description(0), data["newDescription"])
+        self.assertEqual(self.get("/api/aitagger")["counts"]["processed"], 1)
+
+    def test_preview_errors(self):
+        self.assertIn("asset id", self.refused(lambda: self.post("preview", {"id": "not-an-id"}), 400))
+        self.refused(lambda: self.post("preview", {}), 400)
+        self.assertIn("library list", self.refused(lambda: self.post("preview", {"id": "00000000-0000-0000-0000-0000000000ee"}), 404))
+        self.assertIn("Could not read", self.refused(lambda: self.post("preview", {"id": self.ids[3]}), 400))
+        self.services.down = True
+        message = self.refused(lambda: self.post("preview", {"id": self.ids[0]}), 503)
+        self.assertIn("Try again in a minute", message)
+        self.refused(lambda: self.post("apply", {"id": self.ids[0]}), 503)
+        self.services.down = False
+        self.services.vlm_down = True
+        self.refused(lambda: self.post("preview", {"id": self.ids[0]}), 503)
+
+    def test_immich_not_answering_is_502_not_503(self):
+        self.fake.fail_next[f"/api/assets/{self.ids[0]}"] = 5
+        self.refused(lambda: self.post("apply", {"id": self.ids[0]}), 502)
+
+    def test_reprocess_by_ids_tag_outdated_and_all(self):
+        self.build(pause=True)
+        got = self.post("reprocess", {"scope": "ids", "ids": self.ids[:2], "mode": "describe"})
+        self.assertEqual((got["queued"], got["counts"]["queued"]), (2, 2))
+        got = self.post("reprocess", {"scope": "ids", "ids": [self.ids[0]], "mode": "full"})
+        self.assertEqual(got["counts"]["queued"], 2)
+        self.assertEqual({q["id"]: q["mode"] for q in self.store.queue()}, {self.ids[0]: "full", self.ids[1]: "describe"})
+        got = self.post("reprocess", {"scope": "tag", "tag": "Dog", "mode": "retag"})
+        self.assertEqual(got["queued"], 2)                                  # the dog photo and the video (already queued: kept)
+        self.assertEqual({q["id"]: q["mode"] for q in self.store.queue()}[self.ids[1]], "describe")
+        self.assertEqual({q["id"]: q["mode"] for q in self.store.queue()}[self.ids[2]], "retag")
+        got = self.post("reprocess", {"scope": "all", "mode": "retag"})
+        self.assertEqual((got["queued"], got["counts"]["queued"]), (3, 3))
+        self.assertEqual(self.post("reprocess", {"scope": "outdated", "mode": "retag"})["queued"], 0)     # nothing is outdated
+        self.post("settings", {"changes": {"max_tags": 9}})
+        self.assertEqual(self.post("reprocess", {"scope": "outdated", "mode": "retag"})["queued"], 3)
+        for body in ({"scope": "ids", "mode": "retag"}, {"scope": "ids", "ids": [], "mode": "retag"},
+                     {"scope": "ids", "ids": ["x"], "mode": "retag"}, {"scope": "tag", "mode": "retag"},
+                     {"scope": "everything", "mode": "retag"}, {"scope": "all"}, {"scope": "all", "mode": "again"}, {}):
+            self.refused(lambda: self.post("reprocess", body), 400)
+
+    def test_reprocessing_starts_the_indexer_only_when_tagging_is_on(self):
+        self.build()                                                       # tagging is on; the thread has finished
+        self.assertFalse(self.indexer.running())
+        self.post("reprocess", {"scope": "all", "mode": "retag"})
+        self.indexer.thread.join(30)
+        self.assertEqual(self.get("/api/aitagger")["counts"]["queued"], 0)       # it ran
+        self.post("index", {"action": "pause"})
+        got = self.post("reprocess", {"scope": "all", "mode": "retag"})
+        self.assertFalse(self.indexer.running())
+        self.assertEqual((got["queued"], got["counts"]["queued"]), (3, 3))       # paused: it waits in the queue
+
+    def test_remove_strips_the_text_and_can_exclude(self):
+        self.build()
+        self.fake.by_id[self.ids[0]]["exifInfo"]["description"] = "Mine.\n\n" + self.description(0)
+        data = self.post("remove", {"ids": [self.ids[0], self.ids[1]], "exclude": True})
+        self.assertEqual((data["removed"], data["excluded"], data["failed"]), (2, 2, []))
+        self.assertEqual((self.description(0), self.description(1)), ("Mine.", ""))
+        self.assertEqual(self.get("/api/aitagger")["counts"]["excluded"], 2)
+        self.assertEqual(self.get("/api/aitagger")["counts"]["processed"], 1)
+        data = self.post("remove", {"ids": [self.ids[2]]})
+        self.assertEqual((data["removed"], data["excluded"]), (1, 0))
+        self.assertEqual(self.description(2), "")
+        for body in ({}, {"ids": []}, {"ids": "x"}, {"ids": ["x"]}, {"ids": [self.ids[0]], "exclude": "yes"}):
+            self.refused(lambda: self.post("remove", body), 400)
+
+    def test_asset_list_filters_and_pages(self):
+        self.build()
+        data = self.get("/api/aitagger/assets")
+        self.assertEqual((data["total"], data["page"]), (3, 1))
+        self.assertEqual([i["id"] for i in data["items"]], self.ids[:3])
+        first = data["items"][0]
+        self.assertEqual(set(first), {"id", "name", "type", "taken", "tags", "description", "settingsVersion", "processedAt"})
+        self.assertEqual((first["name"], first["type"], first["settingsVersion"], first["description"]),
+                         ("IMG_0000.jpg", "IMAGE", 1, "A nice picture."))
+        self.assertEqual(first["tags"][:2], ["girl", "beach"])
+        self.assertEqual(data["tags"][0], {"tag": "rating: general", "count": 3})
+        self.assertEqual(dict((t["tag"], t["count"]) for t in data["tags"])["dog"], 2)
+        self.assertEqual([i["id"] for i in self.get("/api/aitagger/assets?tag=dog")["items"]], self.ids[1:3])
+        self.assertEqual([i["id"] for i in self.get("/api/aitagger/assets?q=beach")["items"]], [self.ids[0]])
+        self.assertEqual(self.get("/api/aitagger/assets?q=nice")["total"], 3)
+        self.assertEqual(self.get("/api/aitagger/assets?outdated=1")["total"], 0)
+        self.post("settings", {"changes": {"max_tags": 9}})
+        self.assertEqual(self.get("/api/aitagger/assets?outdated=1")["total"], 3)
+        paged = self.get("/api/aitagger/assets?size=2&page=2")
+        self.assertEqual((paged["total"], len(paged["items"]), paged["page"]), (3, 1, 2))
+        self.assertEqual(len(self.get("/api/aitagger/assets?size=1")["items"]), 1)
+        self.assertEqual(self.get("/api/aitagger/assets?size=100000")["total"], 3)           # the size is capped, not refused
+        self.refused(lambda: self.get("/api/aitagger/assets?page=x"), 400)
+
+    def test_sample_gives_a_random_asset_of_the_kind_asked(self):
+        got = self.get("/api/aitagger/sample?type=VIDEO")
+        self.assertEqual(got, {"id": self.ids[2], "name": "IMG_0002.jpg", "type": "VIDEO"})
+        for _ in range(5):
+            self.assertEqual(self.get("/api/aitagger/sample?type=IMAGE")["type"], "IMAGE")
+        self.assertIn(self.get("/api/aitagger/sample")["id"], self.ids[:5])
+        self.refused(lambda: self.get("/api/aitagger/sample?type=AUDIO"), 400)
+        self.catalog = []
+        self.store.sync_catalog([])
+        self.assertIn("no video", self.refused(lambda: self.get("/api/aitagger/sample?type=VIDEO"), 404))
+
+    def test_the_gpu_being_busy_is_a_503_with_the_message_as_is(self):
+        message = "The GPU is in use by the AI Tagger — pause it to use Search+"
+        self.services.ensure_ready = mock.Mock(side_effect=self.at.GpuBusy(message))
+        self.assertEqual(self.refused(lambda: self.post("preview", {"id": self.ids[0]}), 503), message)

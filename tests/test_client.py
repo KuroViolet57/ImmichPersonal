@@ -123,6 +123,40 @@ class TestClient(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.thumbnail(self.fake.assets[0]["id"], size="enormous")
 
+    def test_update_asset_sends_only_the_given_fields(self):
+        asset_id = self.fake.assets[0]["id"]
+        self.fake.asset_puts.clear()
+        out = self.client.update_asset(asset_id, description="A nice day.")
+        self.assertEqual(self.fake.asset_puts, [(asset_id, {"description": "A nice day."})])
+        self.assertEqual(out["exifInfo"]["description"], "A nice day.")
+        self.assertEqual(self.client.get_asset(asset_id)["exifInfo"]["description"], "A nice day.")
+        self.assertIn(("PUT", f"/api/assets/{asset_id}"), self.fake.requests)
+        with self.assertRaises(NotFoundError):
+            self.client.update_asset("00000000-0000-0000-0000-0000000000ff", description="x")
+
+    def test_tags_are_upserted_attached_listed_and_detached(self):
+        asset_id = self.fake.assets[1]["id"]
+        tags = self.client.upsert_tags(["AI/beach", "AI/girl"])
+        self.assertEqual([t["value"] for t in tags], ["AI/beach", "AI/girl"])
+        self.assertEqual([t["name"] for t in tags], ["beach", "girl"])
+        self.assertEqual(self.client.upsert_tags(["AI/beach"])[0]["id"], tags[0]["id"])      # again: the same tag
+        self.assertTrue({"AI", "AI/beach", "AI/girl"} <= {t["value"] for t in self.client.list_tags()})
+        ids = [t["id"] for t in tags]
+        self.assertEqual(self.client.tag_assets(ids, [asset_id]), {"count": 2})
+        self.assertEqual(self.client.tag_assets(ids, [asset_id]), {"count": 0})              # already attached
+        self.assertEqual(sorted(t["value"] for t in self.client.get_asset(asset_id)["tags"]), ["AI/beach", "AI/girl"])
+        self.assertEqual(self.client.untag_assets(ids[0], [asset_id]), [{"id": asset_id, "success": True}])
+        self.assertEqual([t["value"] for t in self.client.get_asset(asset_id)["tags"]], ["AI/girl"])
+        self.assertIn(("DELETE", f"/api/tags/{ids[0]}/assets"), self.fake.requests)
+
+    def test_tag_calls_with_nothing_to_do_make_no_request(self):
+        before = len(self.fake.requests)
+        self.assertEqual(self.client.upsert_tags([]), [])
+        self.assertEqual(self.client.tag_assets([], ["a"]), {"count": 0})
+        self.assertEqual(self.client.tag_assets(["t"], []), {"count": 0})
+        self.assertEqual(self.client.untag_assets("t", []), [])
+        self.assertEqual(len(self.fake.requests), before)
+
 
 if __name__ == "__main__":
     unittest.main()

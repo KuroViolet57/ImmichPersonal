@@ -25,8 +25,11 @@ def shrink_image(data: bytes, max_side: int) -> bytes:
         return data
 
 
-def animation_frames(path: str, n: int) -> list[bytes]:
-    """Up to n frames spread over an animated GIF/WebP/PNG, as JPEGs (one frame = not animated)."""
+def animation_frames(path: str, n: int, positions: list[float] | None = None) -> list[bytes]:
+    """Up to n frames spread over an animated GIF/WebP/PNG, as JPEGs (one frame = not animated).
+
+    ``positions`` (fractions 0-1 of the animation's length) picks the frames instead of spreading ``n`` evenly.
+    """
     try:
         import io
 
@@ -36,7 +39,8 @@ def animation_frames(path: str, n: int) -> list[bytes]:
             if total < 2:
                 return []
             out = []
-            for i in sorted({int(total * (k + 0.5) / n) for k in range(n)}):
+            spots = positions if positions else [(k + 0.5) / n for k in range(n)]
+            for i in sorted({int(total * p) for p in spots}):
                 im.seek(min(i, total - 1))
                 frame = im.convert("RGBA")
                 bg = Image.new("RGBA", frame.size, (255, 255, 255, 255))

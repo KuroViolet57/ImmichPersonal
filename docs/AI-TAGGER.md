@@ -64,6 +64,12 @@ Scores are **calibrated**, so 0.5 is the model's own recommended threshold for t
 shipped per-class threshold for RAM++ tags. Only tags with `s' >= floor` are returned. WD `rating` is the model's raw
 probability for each rating. Tag names are model-native (WD keeps its underscores); the panel normalises them.
 
+**Errors.** 503 while loading (above). A bad picture fails only its own slot (`results[i]` is `null`, `errors[i]` says
+why). **Out of graphics memory** is reported as HTTP 500 `{"error": "... CUDA out of memory ..."}`, or as such a text in
+a slot's `errors[i]`; the panel looks for the words `out of memory` (any case), halves its `batch_size` for the session
+and sends the assets again in smaller requests. Any other 5xx counts as "the service fell over" (the assets stay
+untagged and are tried again); a 4xx is a bug in the request.
+
 ## 2. VLM (`immich_aitagger_vlm`)
 
 `vllm/vllm-openai` serving `Qwen/Qwen3.5-9B` as model name `tagger-vlm`, on `127.0.0.1:11441` (container port 8000).
@@ -186,7 +192,8 @@ Scopes: `ids` (list), `tag` (has that tag), `outdated` (version older than curre
 - `failed(id pk, error, attempts, at)` (same retry rules as Search+)
 - `queue(id pk, mode, at)`
 - `excluded(id pk, at)`
-- `meta(key pk, value)`
+- `meta(key pk, value)`: `settings_version`, `catalog_at`, `native_tags`, `services_env`
+- `asset_tags(id, tag)` (extra): one row per tag of a result, for the tag filter and the top-tags list
 
 ### Indexer
 
@@ -205,6 +212,67 @@ Same shape as Search+:
 - **Stop Search+ before starting the tagger** (`searchplus.Service().stop()`).
 - While the tagger VLM container runs, `searchplus.Service.start()` raises `GpuBusy` (a subclass of `ServiceDown`) with "The GPU is in use by the AI Tagger — pause it to use Search+". The Search+ indexer waits on `GpuBusy` without counting it as a drop.
 - Unload stops both containers. The panel also stops the VLM container when the indexer has been idle for `IDLE_EXIT_MINUTES`.
+
+### Implementation notes (what `aitagger.py` does where this file leaves room)
+
+**Settings.** Types are checked strictly: a bool must be a JSON bool (`"false"`, `0`, `null` are refused), an int a whole
+number (`6.0` is accepted, `"6"` and `true` are not), a float a finite number. `language` is stripped and not empty;
+text keeps its text, with `\r\n` as `\n`. `blocked` and every list inside a rule are stored **normalised** (see step 4,
+duplicates and empties dropped), so the UI shows the canonical form. Rule checks: at most 100 rules, 50 tags per list,
+no unknown field, a tag cannot be in both `add` and `remove`; the error says "Rule N: ...". A change is all or
+nothing. A bad value in a hand-edited `settings.json` falls back to the default. The file is written first and
+`settings_version` bumped after; readers read the version first, so a race at worst makes a fresh result look
+"outdated". `meta.native_tags = "1"` is set once `write_tags` has ever been on: from then on every write also keeps the
+`AI/` tags in step (detaching them all when `write_tags` is off). Without that flag the panel never touches tags.
+
+**Vocabulary.** `old -> new` (or `old → new`); both sides are normalised. A line with an arrow and an empty side is
+ignored. The `new` side is also passed to the VLM as a preferred term. The VLM sees the already renamed tags.
+
+**Normalising.** Besides lowercase and `_` → space: `,` and `/` become spaces (a tag cannot split the `Tags:` line or
+the native tag path), `[`/`]` become `(`/`)` (a tag cannot forge the block markers), a trailing `.` goes, at most
+60 characters. `blocked` is checked against a tag's name both before and after the renames.
+
+**Step 3, 6.** `combined` is compared with the strictness with a 1e-9 tolerance. A tag a capture does not list counts
+as 0 for that capture; a capture the tagger could not read is not a capture. **The rating tag is exempt from the cap:**
+the cap keeps the best `max_tags - 1` other tags plus `rating: <name>`, and `rating:` tags are listed last. Equal
+scores sort by name. `video_frames` above 6 behaves as 6 (there are six candidate segments).
+
+**Block.** The description inside the block is one line; `[AI Tagger]` / `[/AI Tagger]` inside it are removed. A block
+is found by looking for `[/AI Tagger]` and taking the nearest `[AI Tagger]` before it, so a stray marker in the owner's
+text is the owner's. A new block is appended after `\n\n`. An existing block is replaced where it stands, so text
+before and after it stays byte for byte. Removing a block removes the `\n\n` the panel added before it when the block
+was last (so the owner's text is exactly what it was), or the line break after it otherwise. A second block is leftover
+and removed. When there is nothing to say (no tags, no description) the block is "" and an old block is removed.
+
+**Pipeline and failures.** Raw scores are stored as soon as the tagger answers, the result before it is written
+(`written_at` is null until Immich holds it and the read-back matched). An asset whose result is stored but not written
+counts as *pending* and is finished later **without the GPU** (as a `retag`): Immich being down loses no GPU work. The
+read-back compares after turning `\r\n` into `\n` and trimming the ends. Failure bookkeeping is Search+'s (3 attempts,
+retried after 900 s, a `ValueError` is final); `failed` rows also leave the queue when final. Not the asset's fault, so
+no failure row: a model server or Immich that does not answer (5xx, unreachable), a refused API key (the indexer stops
+with an error). Immich saying 404 for an asset is a final failure ("not found").
+
+**Queue.** `enqueue` makes a stronger mode replace a weaker one (`full` > `describe` > `retag`); asking for an asset
+also forgets its earlier failures and its "exclude". A queue row leaves the queue when the work done is at least what
+was asked; a `describe` asked while `describe` is off is done by a retag and counts. A `retag` or `describe` for an
+asset with no stored scores becomes `full`. Excluding an asset takes it off the queue.
+
+**Indexer.** Pipelined: pictures are prepared (6 threads), tagged (≤ 2 requests in flight, ≤ `batch_size` assets and ≤ 64
+pictures each), then described and written (`vlm_parallel` at a time) while the next assets are already being
+prepared. 3 servers going away in a row, with nothing finished in between, end the run with an error. A CUDA
+out-of-memory answer sets a session cap on the batch size (half of the failed batch) that is dropped when the owner
+changes `batch_size`; a single picture that does not fit fails that asset only.
+
+**Services.** Compose services are `aitagger` and `vlm` in `deploy/aitagger/docker-compose.yml` (project
+`immich-aitagger`); the command is `docker compose -p immich-aitagger -f <file> up -d [--force-recreate] <service>`
+with `AITAGGER_VRAM_GB`, `AITAGGER_VLM_UTIL`, `AITAGGER_VLM_SEQS` in its environment. The env each container was last
+started with is remembered in `meta.services_env`; a stopped container whose env differs (or is unknown) is recreated.
+`AITAGGER_VLM_UTIL = min(round((vram_gb - 5) / total_gpu_gb, 2), 0.95)`, `total_gpu_gb` from
+`nvidia-smi --query-gpu=memory.total` (MiB / 1024), 24 if that fails. Container states are remembered for 5 s. Starting
+any container first stops Search+. One idle clock (`last_used`: tagging, describing, Test, load) is checked by the
+indexer while it waits and by a small panel thread every minute, so the VLM container is also stopped after 20 idle
+minutes while tagging is paused. `GpuBusy` is raised by `searchplus.Service.start()` only when Search+ would have to be
+started; a Search+ that is already running is left alone.
 
 ## 4. Panel API
 
@@ -247,6 +315,27 @@ Preview:
  "tags": [{"tag", "score", "source"}], "description": "...", "block": "...",
  "currentDescription": "...", "newDescription": "...", "written": false}
 ```
+
+**Details and extras of the routes** (all additions are optional for the UI):
+- Status: `counts` also has `retrying`, `cleared` (failures hidden with "clear") and `catalogAt`; `indexer` also has
+  `running`; each failure has `name` and `at`; `reprocessKeys` is `{retag: [...], describe: [...], full: [...]}`, the
+  settings keys that suggest each mode (the strongest of the changed keys wins). `counts.processed` counts assets whose
+  result is written to Immich; `pending` are assets with no written result that have not failed; `queued` is the queue.
+- `settings` answers the status plus `queued`, `changed` (the content keys that really changed) and `suggest`
+  (`none|retag|describe|full`). `indexing` inside `changes` is ignored (use `index`). `reprocess` defaults to `none`,
+  `scope` to `outdated`; the check of `reprocess` / `scope` happens before anything is saved. When tagging is on and
+  something was queued the indexer is woken (or started).
+- `reprocess` takes `ids` (asset ids) or `tag`; `queued` is the number of assets matched. `remove` answers
+  `{removed, excluded, failed: [{id, error}]}`: results are kept for the ones that failed; `exclude` is applied to all.
+- `preview` / `apply` read the library list from Immich first when the panel has none yet (the Test card works before the
+  first start). In `models.wd` / `models.ram` every entry also has `kept` (passed that model's strictness); entries are
+  the scores from 0.2 up, at most 80, best first.
+- `GET /api/aitagger/assets`: `size` is capped at 200; `q` matches the file name, the description and the tags (plain
+  text, `%` and `_` are not wildcards); `tags` is the top 200 over all tagged assets (not only the filtered ones).
+  Only assets whose result is written are listed. `sample` answers 404 when the library list has no such asset.
+- Errors: 400 invalid input (including a photo Immich has no file for), 404 unknown asset / route, 503 the models are not
+  ready ("... Try again in a minute.") or `GpuBusy` (its own message, also from the Search+ routes), 502 Immich does not
+  answer. `preview` / `apply` wait at most 90 s for the models (starting them if needed), then answer 503.
 
 ## 5. Web tab
 
