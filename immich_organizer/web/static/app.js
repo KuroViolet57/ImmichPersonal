@@ -71,7 +71,9 @@
         askForToken("Access key missing or wrong — enter it below.");
         throw new Error("Access key missing or wrong — enter it at the top of the page.");
       }
-      throw new Error(detail);
+      const failure = new Error(detail);
+      failure.status = res.status;               // lets a caller treat 503 (models not ready) differently
+      throw failure;
     }
     return payload;
   }
@@ -654,6 +656,7 @@
     if (name === "albums" && !albumsState.loaded) loadAlbumList();
     if (name === "themes") loadThemes();
     if (name === "splus") startSearchPlus(); else stopSearchPlus();
+    if (name === "tagger") startTagger(); else stopTagger();
   }
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.addEventListener("click", () => showTab(tab.dataset.panel));
@@ -1757,6 +1760,839 @@
   $("sp-reset").addEventListener("click", () => {
     if (!confirm("Delete the Search+ index and start again from nothing? (Immich is not touched.)")) return;
     searchPlusCall("index", { action: "reset", confirm: "reset" }, "Index deleted. Press Build index to start again.");
+  });
+
+  // -------------------------------------------------------------- AI Tagger
+  // Two image taggers plus a vision model write tags and a description into the Immich description
+  // (see aitagger.py and docs/AI-TAGGER.md). Same shape as Search+: status polled every 5 s while the tab shows.
+
+  const tagState = {
+    data: null, timer: null, failKey: "",
+    base: {},              // form values as last loaded or saved: tells which keys the person changed
+    seen: {},              // the server value each form field was last filled from
+    rules: [],             // the rule rows being edited
+    list: { items: [], total: 0, page: 1, size: 60, tags: [], tag: "", q: "", outdated: false, allTags: false, seq: 0, loaded: false, version: null },
+    selected: new Set(),   // asset ids ticked in the list (kept across pages)
+    qTimer: null,
+  };
+  const tgEl = (tag, cls, text) => {
+    const x = document.createElement(tag);
+    if (cls) x.className = cls;
+    if (text != null) x.textContent = text;
+    return x;
+  };
+  const tgSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const tgScore = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(2) : "");
+  const TG_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+  // Every setting the form edits. `kind` says how to read and write it.
+  const TG_FIELDS = {
+    instructions:   { id: "tg-instructions", kind: "text" },
+    vocabulary:     { id: "tg-vocabulary", kind: "text" },
+    blocked:        { id: "tg-blocked", kind: "list" },
+    language:       { id: "tg-language", kind: "line" },
+    describe:       { id: "tg-describe", kind: "bool" },
+    use_wd:         { id: "tg-use-wd", kind: "bool" },
+    use_ram:        { id: "tg-use-ram", kind: "bool" },
+    character_tags: { id: "tg-character", kind: "bool" },
+    rating_tag:     { id: "tg-rating", kind: "bool" },
+    write_tags:     { id: "tg-write-tags", kind: "bool" },
+    wd_strictness:  { id: "tg-wd", kind: "float" },
+    ram_strictness: { id: "tg-ram", kind: "float" },
+    max_tags:       { id: "tg-max", kind: "int" },
+    video_frames:   { kind: "frames" },
+    batch_size:     { id: "tg-batch", kind: "int" },
+    vlm_parallel:   { id: "tg-parallel", kind: "int" },
+    vram_gb:        { id: "tg-vram", kind: "int" },
+  };
+  const TG_LABELS = {
+    instructions: "Instructions", vocabulary: "Vocabulary", blocked: "Blocked tags", language: "Language",
+    describe: "Write a description", use_wd: "WD tagger", use_ram: "RAM++ tagger", character_tags: "Character names",
+    rating_tag: "Rating tag", write_tags: "Immich tags", wd_strictness: "WD strictness", ram_strictness: "RAM++ strictness",
+    max_tags: "Most tags per photo", rules: "Rules", video_frames: "Captures per video", batch_size: "Assets per round",
+    vlm_parallel: "Parallel descriptions", vram_gb: "GPU memory",
+  };
+  // Which settings change what is written, and the lightest reprocess mode that applies them.
+  const TG_MODE_OF = {
+    wd_strictness: "retag", ram_strictness: "retag", rules: "retag", blocked: "retag", max_tags: "retag",
+    write_tags: "retag", character_tags: "retag", rating_tag: "retag",
+    instructions: "describe", vocabulary: "describe", language: "describe", describe: "describe",
+    video_frames: "full", use_wd: "full", use_ram: "full",
+  };
+  const TG_MODES = [
+    ["retag", "Re-tag", "quick, re-applies the stored results, no GPU needed"],
+    ["describe", "Re-describe", "asks the description model again"],
+    ["full", "Full re-process", "runs the taggers and the description model again, slowest"],
+  ];
+  const TG_GROUPS = {
+    how: ["instructions", "vocabulary", "blocked", "language", "describe", "use_wd", "use_ram", "character_tags",
+      "rating_tag", "write_tags", "wd_strictness", "ram_strictness", "max_tags"],
+    rules: ["rules"],
+    speed: ["video_frames", "batch_size", "vlm_parallel", "vram_gb"],
+  };
+  const TG_LIMIT_IDS = { wd_strictness: "tg-wd", ram_strictness: "tg-ram", max_tags: "tg-max", batch_size: "tg-batch",
+    vlm_parallel: "tg-parallel", vram_gb: "tg-vram" };
+  const TG_RULE_KEYS = ["if_all", "if_any", "unless", "add", "remove"];
+
+  const tgFrames = segmented("tg-frames");
+  const FRAMES_NOTE = "Pictures taken along the clip and tagged together. Photos always use one.";
+
+  function tgRead(key) {
+    if (key === "rules") return tgCleanRules(tagState.rules);
+    const f = TG_FIELDS[key];
+    if (f.kind === "frames") return Number(tgFrames.get());
+    const el = $(f.id);
+    switch (f.kind) {
+      case "bool": return el.checked;
+      case "list": return splitTerms(el.value);
+      case "float": return Number(el.value);
+      case "int": return el.value.trim() === "" ? NaN : Number(el.value);
+      case "line": return el.value.trim();
+      default: return el.value;
+    }
+  }
+
+  function tgWrite(key, value) {
+    if (key === "rules") {
+      tagState.rules = tgCleanRules(value);
+      tgRenderRules();
+      return;
+    }
+    const f = TG_FIELDS[key];
+    if (f.kind === "frames") {
+      tgFrames.set(String(value));
+      $("tg-frames-note").textContent = [2, 6].includes(Number(value)) ? FRAMES_NOTE : `Set to ${value} at the moment. ${FRAMES_NOTE}`;
+      return;
+    }
+    const el = $(f.id);
+    if (f.kind === "bool") el.checked = !!value;
+    else {
+      const text = f.kind === "list" ? (Array.isArray(value) ? value : []).join(", ") : String(value == null ? "" : value);
+      if (el.value !== text) el.value = text;
+    }
+    tgShowSliders();
+  }
+
+  function tgShowSliders() {
+    $("tg-wd-v").textContent = tgScore($("tg-wd").value);
+    $("tg-ram-v").textContent = tgScore($("tg-ram").value);
+    $("tg-vram-v").textContent = `${$("tg-vram").value} GB`;
+  }
+  ["tg-wd", "tg-ram", "tg-vram"].forEach((id) => $(id).addEventListener("input", tgShowSliders));
+
+  // The ranges come from the server (`limits`), never from here. Set them before filling in values.
+  function tgApplyLimits(limits) {
+    Object.entries(TG_LIMIT_IDS).forEach(([key, id]) => {
+      const range = limits && limits[key];
+      if (!range) return;
+      const el = $(id);
+      el.min = String(range[0]);
+      el.max = String(range[1]);
+      if (el.type !== "number") return;
+      const label = el.closest("label");
+      const small = label.querySelector("small") || label.appendChild(document.createElement("small"));
+      if (small.dataset.base == null) small.dataset.base = small.textContent;
+      small.textContent = `${range[0]} to ${range[1]}.${small.dataset.base ? ` ${small.dataset.base}` : ""}`;
+    });
+  }
+
+  // Fill the form from the server's settings, but never over something the person is in the middle of editing.
+  function tgSync(settings) {
+    [...Object.keys(TG_FIELDS), "rules"].forEach((key) => {
+      if (!(key in settings)) return;
+      const first = !(key in tagState.base);
+      const changedOnServer = !tgSame(settings[key], tagState.seen[key]);
+      if (first || (changedOnServer && tgSame(tgRead(key), tagState.base[key]))) {
+        tgWrite(key, settings[key]);
+        tagState.base[key] = tgRead(key);
+        tagState.seen[key] = settings[key];
+      }
+    });
+    $("tg-keep").checked = !!settings.keep_updated;
+  }
+
+  // ------------------------------------------------------------------ status
+
+  function startTagger() {
+    loadTagger();
+    clearInterval(tagState.timer);
+    tagState.timer = setInterval(() => { if (!document.hidden) loadTagger(); }, 5000);
+    if (!tagState.list.loaded) tgLoadAssets();
+  }
+  function stopTagger() { clearInterval(tagState.timer); tagState.timer = null; }
+  async function loadTagger() {
+    try { renderTagger(await api("/api/aitagger")); }
+    catch (err) { $("tg-state").textContent = err.message; }
+  }
+
+  function tagError(err) {
+    let message = err.message || "Something went wrong.";
+    if (err.status === 503) {
+      message += `${/[.!?]$/.test(message) ? "" : "."} The models may still be loading — try again in a minute.`;
+    }
+    toast(message, true);
+  }
+
+  async function tagCall(path, body, message) {
+    try {
+      const data = await api(`/api/aitagger/${path}`, { method: "POST", body: JSON.stringify(body) });
+      if (data && data.settings) renderTagger(data);
+      if (message) toast(typeof message === "function" ? message(data) : message);
+      return data;
+    } catch (err) { tagError(err); loadTagger(); return null; }
+  }
+
+  function tgServiceWord(s) {
+    s = s || {};
+    if (s.status === "ok") return "ready";
+    if (s.status === "loading" || (s.container === "running" && !s.status)) return "loading…";
+    if (s.status === "error") return `failed${s.error ? ` (${s.error})` : ""}`;
+    if (s.container === "missing") return "not installed yet";
+    return "not loaded";
+  }
+
+  function renderTagger(data) {
+    tagState.data = data;
+    const c = data.counts || {}, ix = data.indexer || {}, sv = data.service || {}, cfg = data.settings || {};
+    const tg = sv.tagger || {}, vl = sv.vlm || {}, gpu = sv.gpu || {}, models = data.models || {};
+    const processed = c.processed || 0, total = c.assets || 0;
+
+    let text, cls = "";
+    if (ix.state === "running") { text = `Tagging · ${ix.ratePerMin ? `${Math.round(ix.ratePerMin).toLocaleString()} per minute` : "warming up"}`; cls = "ok"; }
+    else if (ix.state === "starting") text = ix.detail ? ix.detail.charAt(0).toUpperCase() + ix.detail.slice(1) : "Starting…";
+    else if (ix.state === "done") { text = "Up to date"; cls = "ok"; }
+    else if (ix.state === "error") { text = `Stopped — ${ix.error || ix.detail || "see the log"}`; cls = "warn"; }
+    else text = processed ? "Paused" : "Not started yet";
+    const stateEl = $("tg-state");
+    stateEl.className = `d-state ${cls}`;
+    stateEl.textContent = text;
+    if (ix.detail && (ix.state === "running" || (ix.state === "done"))) {
+      const sub = document.createElement("small");
+      sub.textContent = ix.detail;
+      stateEl.appendChild(sub);
+    }
+
+    const pct = total ? (100 * processed) / total : 0;
+    $("tg-meter").style.width = `${pct.toFixed(1)}%`;
+    let prog = `${processed.toLocaleString()} of ${total.toLocaleString()} photos and videos tagged (${pct.toFixed(pct > 99 || pct < 1 ? 1 : 0)}%)`;
+    if (ix.etaMinutes && c.pending) prog += ` · about ${fmtMinutes(ix.etaMinutes)} left`;
+    if (!total) prog = "The library list is read when tagging starts.";
+    $("tg-progress").textContent = prog;
+
+    const stats = [[processed, "tagged"], [c.pending || 0, "still to do"], [c.queued || 0, "queued to redo"],
+      [c.outdated || 0, "older settings"], [c.failed || 0, "could not tag"]];
+    if (c.excluded) stats.push([c.excluded, "left alone"]);
+    const box = $("tg-stats"); box.textContent = "";
+    stats.forEach(([n, label]) => {
+      const d = tgEl("div", "stat");
+      d.append(tgEl("b", "", Number(n).toLocaleString()), tgEl("span", "", label));
+      box.appendChild(d);
+    });
+
+    const lines = [`Taggers: ${tgServiceWord(tg)} · Description model: ${tgServiceWord(vl)}`
+      + (gpu.totalGb ? ` · GPU ${gpu.usedGb != null ? gpu.usedGb : "?"} of ${gpu.totalGb} GB in use` : "")];
+    if (sv.searchplusRunning) lines.push("Search+ is using the GPU right now; it is stopped when the tagger starts.");
+    const names = [models.wd, models.ram, models.vlm].filter(Boolean);
+    if (names.length) lines.push(`Models: ${names.join(" · ")}`);
+    $("tg-service").textContent = lines.join("\n");
+
+    const toggle = $("tg-toggle");
+    toggle.textContent = cfg.indexing ? "Pause" : (processed ? "Resume tagging" : "Start tagging");
+    toggle.classList.toggle("btn-primary", !cfg.indexing);
+    $("tg-load").disabled = tg.status === "ok" && vl.status === "ok";
+    $("tg-unload").disabled = ![tg, vl].some((s) => s.container === "running") && !cfg.indexing;
+
+    const fails = data.failures || [];
+    $("tg-fail-box").classList.toggle("is-hidden", !c.failed && !fails.length);
+    $("tg-fail-sum").textContent = `Could not tag ${plural(c.failed || fails.length, "item")}`;
+    const key = fails.map((f) => `${f.id}:${f.error}`).join("|");
+    if (key !== tagState.failKey) {
+      tagState.failKey = key;
+      const fb = $("tg-failures"); fb.textContent = "";
+      fails.forEach((f) => {
+        const row = tgEl("div", "desc-row");
+        const img = document.createElement("img");
+        img.loading = "lazy"; img.alt = ""; img.src = thumbUrl(f.id);
+        img.onerror = () => { img.style.visibility = "hidden"; };
+        const d = document.createElement("div");
+        d.appendChild(tgEl("p", "", f.error || "Failed"));
+        d.appendChild(tgEl("small", "", `${f.name || f.id}${f.attempts ? ` · tried ${f.attempts}×` : ""}`));
+        row.append(img, d);
+        fb.appendChild(row);
+      });
+    }
+
+    $("tg-outdated-row").classList.toggle("is-hidden", !c.outdated);
+    $("tg-outdated-text").textContent = `${plural(c.outdated || 0, "tagged asset")} still ${c.outdated === 1 ? "has" : "have"} tags from older settings.`;
+
+    tgApplyLimits(data.limits);
+    tgSync(cfg);
+    if (tagState.list.loaded && tagState.list.version !== data.settingsVersion) tgRenderAssets();
+  }
+
+  // --------------------------------------------------------------- a dialog
+  // One modal for the choices below. `build(body)` fills it and returns a function that reads the answer;
+  // the promise gives that answer, or null if the person cancelled.
+  function tgModal(title, confirmLabel, build, danger = false) {
+    return new Promise((resolve) => {
+      const dlg = $("tg-dialog"), body = $("tg-dialog-body"), ok = $("tg-dialog-ok");
+      $("tg-dialog-title").textContent = title;
+      body.textContent = "";
+      const read = build(body);
+      ok.textContent = confirmLabel;
+      ok.classList.toggle("btn-danger", danger);
+      ok.classList.toggle("btn-primary", !danger);
+      let answer = null;
+      ok.onclick = () => { answer = read(); dlg.close(); };
+      $("tg-dialog-cancel").onclick = () => dlg.close();
+      dlg.addEventListener("close", () => resolve(answer), { once: true });
+      dlg.showModal();
+    });
+  }
+
+  // A mode picker with a one-line explanation of the chosen mode underneath. Returns the <select>.
+  function tgModeSelect(box, selected, suggested) {
+    const select = document.createElement("select");
+    TG_MODES.forEach(([value, label]) => {
+      const o = document.createElement("option");
+      o.value = value;
+      o.textContent = `${label}${value === suggested ? " (recommended)" : ""}`;
+      select.appendChild(o);
+    });
+    select.value = selected;
+    const note = tgEl("small", "hint", "");
+    const showNote = () => { note.textContent = (TG_MODES.find((m) => m[0] === select.value) || [])[2] || ""; };
+    select.addEventListener("change", showNote);
+    showNote();
+    box.append(select, note);
+    return select;
+  }
+
+  const tgSuggestMode = (keys) => keys.reduce((best, k) => {
+    const rank = { retag: 1, describe: 2, full: 3 };
+    return rank[TG_MODE_OF[k]] > rank[best] ? TG_MODE_OF[k] : best;
+  }, "retag");
+
+  // "New assets only" or "also update the N already-tagged assets" (and how). Gives "none" or a mode.
+  function tgAskReprocess(keys, n) {
+    const suggested = tgSuggestMode(keys);
+    return tgModal("Apply to assets already tagged?", "Save", (box) => {
+      box.appendChild(tgEl("p", "hint", `You changed: ${keys.map((k) => TG_LABELS[k] || k).join(", ")}.`));
+      const option = (value, label, note, checked) => {
+        const row = tgEl("label", "check");
+        const input = document.createElement("input");
+        input.type = "radio"; input.name = "tg-choice"; input.value = value; input.checked = checked;
+        const span = document.createElement("span");
+        span.append(label);
+        if (note) span.appendChild(tgEl("small", "", note));
+        row.append(input, span);
+        box.appendChild(row);
+        return input;
+      };
+      const only = option("none", "New assets only", "Already-tagged ones keep their tags and are marked as made with older settings. You can update them later.", true);
+      const also = option("also", `Also update the ${plural(n, "already-tagged asset")}`, "", false);
+      const select = tgModeSelect(box, suggested, suggested);
+      select.disabled = true;
+      const sync = () => { select.disabled = !also.checked; };
+      only.addEventListener("change", sync);
+      also.addEventListener("change", sync);
+      return () => (also.checked ? select.value : "none");
+    });
+  }
+
+  // ------------------------------------------------------------- rules editor
+
+  const tgBlankRule = () => ({ if_all: [], if_any: [], unless: [], add: [], remove: [] });
+  function tgCleanRules(list) {
+    return (Array.isArray(list) ? list : []).map((r) => {
+      const out = {};
+      TG_RULE_KEYS.forEach((k) => {
+        out[k] = (r && Array.isArray(r[k]) ? r[k] : []).map((t) => String(t).trim()).filter(Boolean);
+      });
+      return out;
+    });
+  }
+
+  const TG_RULE_FIELDS = [
+    ["if_all", "IF all of", "girl, beach"],
+    ["if_any", "IF any of", "dog, cat"],
+    ["unless", "UNLESS", "night"],
+    ["add", "THEN add", "summer"],
+    ["remove", "THEN remove", "indoors"],
+  ];
+
+  function tgRenderRules() {
+    const box = $("tg-rules");
+    box.textContent = "";
+    if (!tagState.rules.length) box.appendChild(tgEl("p", "hint", "No rules yet."));
+    tagState.rules.forEach((rule, i) => {
+      const row = tgEl("div", "tg-rule");
+      const head = tgEl("div", "tg-rule-head");
+      head.appendChild(tgEl("span", "", `Rule ${i + 1}`));
+      const del = tgEl("button", "btn btn-quiet danger-text", "Delete");
+      del.type = "button";
+      del.addEventListener("click", () => { tagState.rules.splice(i, 1); tgRenderRules(); });
+      head.appendChild(del);
+      row.appendChild(head);
+      const field = (key) => {
+        const [, label, example] = TG_RULE_FIELDS.find((f) => f[0] === key);
+        const wrap = tgEl("label", "field");
+        wrap.appendChild(tgEl("span", "", label));
+        const input = document.createElement("input");
+        input.type = "text"; input.autocomplete = "off"; input.spellcheck = false;
+        input.placeholder = example;
+        input.value = rule[key].join(", ");
+        input.addEventListener("input", () => { rule[key] = splitTerms(input.value); row.classList.remove("is-bad"); });
+        wrap.appendChild(input);
+        return wrap;
+      };
+      const pair = (a, b) => { const g = tgEl("div", "grid-2"); g.append(field(a), field(b)); return g; };
+      row.append(pair("if_all", "if_any"), field("unless"), pair("add", "remove"));
+      box.appendChild(row);
+    });
+  }
+
+  // Rows left completely empty are ignored; a half-filled one stops the save.
+  function tgReadRules() {
+    const rows = [...document.querySelectorAll("#tg-rules .tg-rule")];
+    rows.forEach((r) => r.classList.remove("is-bad"));
+    const out = [];
+    tgCleanRules(tagState.rules).forEach((rule, i) => {
+      if (TG_RULE_KEYS.every((k) => !rule[k].length)) return;
+      if (!rule.if_all.length && !rule.if_any.length) {
+        if (rows[i]) { rows[i].classList.add("is-bad"); rows[i].scrollIntoView({ block: "center" }); }
+        throw new Error(`Rule ${i + 1} needs a condition: fill in IF all of or IF any of.`);
+      }
+      if (!rule.add.length && !rule.remove.length) {
+        if (rows[i]) { rows[i].classList.add("is-bad"); rows[i].scrollIntoView({ block: "center" }); }
+        throw new Error(`Rule ${i + 1} needs an action: fill in THEN add or THEN remove.`);
+      }
+      out.push(rule);
+    });
+    return out;
+  }
+
+  $("tg-rule-add").addEventListener("click", () => {
+    tagState.rules.push(tgBlankRule());
+    tgRenderRules();
+    const inputs = document.querySelectorAll("#tg-rules .tg-rule:last-child input");
+    if (inputs.length) inputs[0].focus();
+  });
+
+  // -------------------------------------------------------------------- save
+
+  // Which of `keys` the person changed since the form was filled, checked against the server's ranges.
+  function tgCollect(keys) {
+    const limits = (tagState.data && tagState.data.limits) || {};
+    const changes = {};
+    keys.forEach((key) => {
+      const value = key === "rules" ? tgReadRules() : tgRead(key);
+      const kind = (TG_FIELDS[key] || {}).kind;
+      const label = TG_LABELS[key] || key;
+      if (kind === "int" || kind === "frames") {
+        if (!Number.isInteger(value)) throw new Error(`${label} must be a whole number.`);
+      } else if (kind === "float" && !Number.isFinite(value)) {
+        throw new Error(`${label} must be a number.`);
+      }
+      if (kind === "line" && !value) throw new Error(`${label} can't be empty.`);
+      const range = limits[key];
+      if (range && typeof value === "number" && (value < range[0] || value > range[1])) {
+        throw new Error(`${label} must be between ${range[0]} and ${range[1]}.`);
+      }
+      if (!tgSame(value, tagState.base[key])) changes[key] = value;
+    });
+    return changes;
+  }
+
+  async function tgSave(keys) {
+    if (!tagState.data) return toast("Still loading — try again in a moment.", true);
+    let changes;
+    try { changes = tgCollect(keys); } catch (err) { return toast(err.message, true); }
+    const names = Object.keys(changes);
+    if (!names.length) return toast("Nothing changed.");
+    const content = names.filter((k) => k in TG_MODE_OF);
+    const done = (tagState.data.counts || {}).processed || 0;
+    let reprocess = "none";
+    if (content.length && done > 0) {
+      const choice = await tgAskReprocess(content, done);
+      if (choice === null) return;
+      reprocess = choice;
+    }
+    busy(true, "Saving…");
+    try {
+      const body = { changes, reprocess };
+      if (reprocess !== "none") body.scope = "all";
+      const data = await api("/api/aitagger/settings", { method: "POST", body: JSON.stringify(body) });
+      names.forEach((k) => { tagState.base[k] = changes[k]; tagState.seen[k] = (data.settings || {})[k]; });
+      if (names.includes("rules")) { tagState.rules = tgCleanRules(changes.rules); tgRenderRules(); }
+      renderTagger(data);
+      if (reprocess !== "none") {
+        toast(`Saved. ${plural(data.queued || 0, "asset")} queued to be redone${data.settings && data.settings.indexing ? "." : " — press Start tagging to begin."}`);
+      } else if (content.length) {
+        toast("Saved. New photos and videos use it; the ones already tagged keep their tags for now.");
+      } else toast("Saved.");
+      if (reprocess !== "none" || content.length) tgLoadAssets();
+    } catch (err) { tagError(err); } finally { busy(false); }
+  }
+  $("tg-save-how").addEventListener("click", () => tgSave(TG_GROUPS.how));
+  $("tg-save-rules").addEventListener("click", () => tgSave(TG_GROUPS.rules));
+  $("tg-save-speed").addEventListener("click", () => tgSave(TG_GROUPS.speed));
+  $("tg-keep").addEventListener("change", () => tagCall("settings", { changes: { keep_updated: $("tg-keep").checked } }));
+
+  // ----------------------------------------------------------------- buttons
+  $("tg-load").addEventListener("click", async () => {
+    busy(true, "Starting the models… the first start downloads them and can take several minutes.");
+    try { await tagCall("load", {}, "The models are starting. Loading can take a few minutes the first time."); }
+    finally { busy(false); }
+  });
+  $("tg-toggle").addEventListener("click", () => {
+    const on = tagState.data && tagState.data.settings.indexing;
+    tagCall("index", { action: on ? "pause" : "start" },
+      on ? "Paused. The models unload by themselves after a quiet spell (or press Stop & free GPU)."
+        : "Tagging started — it picks up by itself after a restart. Search+ is paused meanwhile.");
+  });
+  $("tg-unload").addEventListener("click", async () => {
+    busy(true, "Stopping and freeing the GPU…");
+    try { await tagCall("unload", {}, "Stopped; the models are unloaded and the GPU is free."); }
+    finally { busy(false); }
+  });
+  $("tg-retry").addEventListener("click", () => tagCall("index", { action: "retry" }, "They will be tried again."));
+  $("tg-clear").addEventListener("click", () => tagCall("index", { action: "clear" }, "Cleared — those items are skipped (Try again brings them back)."));
+
+  // -------------------------------------------------------------------- test
+
+  const tgTestId = () => { const m = $("tg-test-id").value.match(TG_UUID); return m ? m[0].toLowerCase() : ""; };
+  function tgTestThumb() {
+    const id = tgTestId();
+    const img = $("tg-test-thumb");
+    img.classList.toggle("is-hidden", !id);
+    if (id) img.src = thumbUrl(id);
+    $("tg-test-name").textContent = "";
+  }
+  $("tg-test-id").addEventListener("input", tgTestThumb);
+  $("tg-test-id").addEventListener("keydown", (e) => { if (e.key === "Enter") tgRunTest("preview"); });
+  $("tg-test-thumb").addEventListener("error", () => $("tg-test-thumb").classList.add("is-hidden"));
+
+  async function tgSample(type) {
+    try {
+      const s = await api(`/api/aitagger/sample?type=${type}`);
+      $("tg-test-id").value = s.id;
+      tgTestThumb();
+      $("tg-test-name").textContent = `${s.name || s.id} · ${s.type === "VIDEO" ? "video" : "photo"}`;
+    } catch (err) { toast(err.message, true); }
+  }
+  $("tg-rand-photo").addEventListener("click", () => tgSample("IMAGE"));
+  $("tg-rand-video").addEventListener("click", () => tgSample("VIDEO"));
+  $("tg-preview").addEventListener("click", () => tgRunTest("preview"));
+
+  // "preview" tags one asset and writes nothing; "apply" does the same and writes it.
+  async function tgRunTest(path) {
+    const id = tgTestId();
+    if (!id) return toast("Pick a photo or video: paste its ID, or press Random photo / Random video.", true);
+    const d = tagState.data, sv = (d && d.service) || {};
+    const ready = sv.tagger && sv.tagger.status === "ok" && (!d.settings.describe || (sv.vlm && sv.vlm.status === "ok"));
+    busy(true, ready ? (path === "apply" ? "Tagging and writing…" : "Tagging…")
+      : "Loading the models (can take a few minutes the first time), then tagging…");
+    try {
+      const p = await api(`/api/aitagger/${path}`, { method: "POST", body: JSON.stringify({ id }) });
+      renderPreview(p);
+      if (path === "apply") {
+        toast(p.written ? "Written to the description." : "Nothing needed writing.");
+        loadTagger();
+        tgLoadAssets();
+      } else loadTagger();
+    } catch (err) { tagError(err); } finally { busy(false); }
+  }
+
+  function tgChips(parent, list, cls = "") {
+    const row = tgEl("div", "tg-tags");
+    const sorted = list.slice().sort((a, b) => (b.score || 0) - (a.score || 0));
+    sorted.slice(0, 60).forEach((t) => {
+      const chip = tgEl("span", `tg-tag ${cls}`.trim(), t.tag);
+      if (t.score != null && t.source !== "vlm" && t.source !== "rule") chip.appendChild(tgEl("small", "", tgScore(t.score)));
+      if (t.source) chip.appendChild(tgEl("span", "badge", t.source));
+      row.appendChild(chip);
+    });
+    if (sorted.length > 60) row.appendChild(tgEl("small", "hint", `+${sorted.length - 60} weaker ones not shown`));
+    parent.appendChild(row);
+  }
+
+  function renderPreview(p) {
+    const out = $("tg-test-out");
+    out.textContent = "";
+    out.classList.remove("is-hidden");
+    const heading = (text) => out.appendChild(tgEl("h3", "tg-h", text));
+    const frames = (p.frames || []).filter((f) => typeof f === "string" && f.startsWith("data:image/"));
+
+    heading(`${p.name || p.id} · ${p.type === "VIDEO" ? "video" : "photo"} · ${plural(p.captures || frames.length, "capture")}`);
+    if (frames.length) {
+      const strip = tgEl("div", "tg-frames");
+      frames.forEach((src, i) => {
+        const img = document.createElement("img");
+        img.src = src; img.alt = `Capture ${i + 1}`;
+        strip.appendChild(img);
+      });
+      out.appendChild(strip);
+    }
+
+    const m = p.models || {};
+    if (m.wd) { heading(`Illustration / people tagger (WD) · ${m.wd.length}`); tgChips(out, m.wd); }
+    if (m.ram) { heading(`Everyday objects tagger (RAM++) · ${m.ram.length}`); tgChips(out, m.ram); }
+    if (m.rating) {
+      const ratings = Object.entries(m.rating).sort((a, b) => b[1] - a[1]);
+      if (ratings.length) {
+        heading("Rating");
+        const line = tgEl("p", "hint", "");
+        ratings.forEach(([name, score], i) => {
+          if (i) line.append(" · ");
+          const part = tgEl(i === 0 ? "b" : "span", "", `${name} ${tgScore(score)}`);
+          line.appendChild(part);
+        });
+        out.appendChild(line);
+      }
+    }
+
+    const v = p.vlm;
+    heading("Description model");
+    if (!v || (!v.description && !(v.add_tags || []).length && !(v.remove_tags || []).length)) {
+      out.appendChild(tgEl("p", "hint", (v && v.note) || "It was not used for this one."));
+    } else {
+      if (v.description) out.appendChild(tgEl("p", "", v.description));
+      if ((v.add_tags || []).length) {
+        out.appendChild(tgEl("small", "hint", "Added"));
+        tgChips(out, v.add_tags.map((tag) => ({ tag: `+ ${tag}` })), "add");
+      }
+      if ((v.remove_tags || []).length) {
+        out.appendChild(tgEl("small", "hint", "Removed"));
+        tgChips(out, v.remove_tags.map((tag) => ({ tag })), "remove");
+      }
+      if (v.note) out.appendChild(tgEl("p", "hint", v.note));
+    }
+
+    heading("Rules that fired");
+    const fired = p.rules || [];
+    if (!fired.length) out.appendChild(tgEl("p", "hint", "None."));
+    fired.forEach((r) => {
+      const bits = [];
+      if ((r.added || []).length) bits.push(`added ${r.added.join(", ")}`);
+      if ((r.removed || []).length) bits.push(`removed ${r.removed.join(", ")}`);
+      out.appendChild(tgEl("p", "hint", `Rule ${Number(r.rule) + 1}: ${bits.join(" · ") || "no change"}`));
+    });
+
+    heading(`Final tags · ${(p.tags || []).length}`);
+    tgChips(out, p.tags || [], "final");
+
+    heading("Description to write");
+    out.appendChild(tgEl("p", "", p.description || "(none)"));
+
+    const ba = tgEl("div", "tg-ba");
+    [["Before", p.currentDescription], ["After", p.newDescription]].forEach(([label, text]) => {
+      const col = tgEl("div", "");
+      col.appendChild(tgEl("small", "hint", label));
+      col.appendChild(tgEl("pre", "tg-block", text || "(empty)"));
+      ba.appendChild(col);
+    });
+    out.appendChild(ba);
+
+    const write = tgEl("button", `btn ${p.written ? "" : "btn-primary"}`.trim(), p.written ? "Written ✓" : "Write this");
+    write.type = "button";
+    write.disabled = !!p.written;
+    write.style.marginTop = "14px";
+    write.addEventListener("click", () => tgRunTest("apply"));
+    out.appendChild(write);
+  }
+
+  // ---------------------------------------------------------- tagged assets
+
+  const tgViewerHooks = {
+    isSelected: (item) => tagState.selected.has(item.id),
+    toggle: (item, index) => {
+      if (tagState.selected.has(item.id)) tagState.selected.delete(item.id); else tagState.selected.add(item.id);
+      const row = $("tg-list").children[index];
+      const box = row && row.querySelector("input[type=checkbox]");
+      if (box) box.checked = tagState.selected.has(item.id);
+      tgUpdateSelection();
+    },
+  };
+
+  function tgUpdateSelection() {
+    const n = tagState.selected.size;
+    $("tg-bulk").classList.toggle("is-hidden", !n);
+    $("tg-bulk-count").textContent = `${n.toLocaleString()} selected`;
+  }
+
+  async function tgLoadAssets(page) {
+    const L = tagState.list;
+    if (page) L.page = page;
+    const seq = ++L.seq;
+    const params = new URLSearchParams({ page: String(L.page), size: String(L.size) });
+    if (L.tag) params.set("tag", L.tag);
+    if (L.q) params.set("q", L.q);
+    if (L.outdated) params.set("outdated", "1");
+    try {
+      const data = await api(`/api/aitagger/assets?${params}`);
+      if (seq !== L.seq) return;
+      L.items = data.items || [];
+      L.total = data.total || 0;
+      L.page = data.page || L.page;
+      L.tags = data.tags || [];
+      L.loaded = true;
+      tgRenderAssets();
+    } catch (err) {
+      if (seq === L.seq) $("tg-count").textContent = err.message;
+    }
+  }
+
+  function tgRenderAssets() {
+    const L = tagState.list;
+    const current = tagState.data ? tagState.data.settingsVersion : null;
+    L.version = current;
+
+    const top = $("tg-top-tags");
+    top.textContent = "";
+    const shown = L.allTags ? L.tags : L.tags.slice(0, 18);
+    const tagChip = (name, count) => {
+      const b = tgEl("button", `tg-tag${L.tag === name ? " is-on" : ""}`, name);
+      b.type = "button";
+      if (count != null) b.appendChild(tgEl("small", "", count.toLocaleString()));
+      b.addEventListener("click", () => { L.tag = L.tag === name ? "" : name; tgLoadAssets(1); });
+      return b;
+    };
+    if (L.tag && !shown.some((t) => t.tag === L.tag)) top.appendChild(tagChip(L.tag, null));
+    shown.forEach((t) => top.appendChild(tagChip(t.tag, t.count)));
+    if (L.tags.length > 18) {
+      const more = tgEl("button", "tg-tag", L.allTags ? "Fewer tags" : `All ${L.tags.length} tags`);
+      more.type = "button";
+      more.addEventListener("click", () => { L.allTags = !L.allTags; tgRenderAssets(); });
+      top.appendChild(more);
+    }
+
+    $("tg-count").textContent = plural(L.total, "asset");
+    const list = $("tg-list");
+    list.textContent = "";
+    if (!L.items.length) {
+      list.appendChild(tgEl("p", "hint", L.loaded && (L.tag || L.q || L.outdated)
+        ? "Nothing matches these filters." : "Nothing has been tagged yet."));
+    }
+    const frag = document.createDocumentFragment();
+    L.items.forEach((a, i) => {
+      const row = tgEl("div", "desc-row tg-item");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = tagState.selected.has(a.id);
+      box.setAttribute("aria-label", `Select ${a.name || a.id}`);
+      box.addEventListener("change", () => {
+        if (box.checked) tagState.selected.add(a.id); else tagState.selected.delete(a.id);
+        tgUpdateSelection();
+      });
+      const thumb = tgEl("button", "tg-thumb");
+      thumb.type = "button";
+      thumb.setAttribute("aria-label", `View ${a.name || "photo"} full size`);
+      const img = document.createElement("img");
+      img.loading = "lazy"; img.decoding = "async"; img.alt = ""; img.src = thumbUrl(a.id);
+      img.onerror = () => { img.style.visibility = "hidden"; };
+      thumb.appendChild(img);
+      if (a.type === "VIDEO") thumb.appendChild(tgEl("span", "tg-vid", "▶"));
+      thumb.addEventListener("click", () => openViewer(L.items, i, tgViewerHooks));
+
+      const text = tgEl("div", "tg-text");
+      const title = tgEl("p", "");
+      title.appendChild(tgEl("b", "", a.name || a.id));
+      if (current != null && a.settingsVersion != null && a.settingsVersion < current) {
+        const badge = tgEl("span", "badge", "older settings");
+        badge.title = "Tagged before your latest settings change";
+        title.appendChild(badge);
+      }
+      text.appendChild(title);
+      const date = (a.taken || "").slice(0, 10);
+      if (date) text.appendChild(tgEl("small", "", date));
+      if ((a.tags || []).length) text.appendChild(tgEl("small", "tg-tagline", a.tags.join(", ")));
+      if (a.description) text.appendChild(tgEl("p", "tg-desc", a.description));
+      text.addEventListener("click", () => row.classList.toggle("is-open"));
+      row.append(box, thumb, text);
+      frag.appendChild(row);
+    });
+    list.appendChild(frag);
+
+    const pages = Math.max(1, Math.ceil(L.total / L.size));
+    $("tg-pager").classList.toggle("is-hidden", pages <= 1);
+    $("tg-page").textContent = `Page ${L.page} of ${pages}`;
+    $("tg-prev").disabled = L.page <= 1;
+    $("tg-next").disabled = L.page >= pages;
+    tgUpdateSelection();
+  }
+
+  const tgGoPage = (page) => { tgLoadAssets(page); $("tg-assets").scrollIntoView({ block: "start" }); };
+  $("tg-prev").addEventListener("click", () => tgGoPage(tagState.list.page - 1));
+  $("tg-next").addEventListener("click", () => tgGoPage(tagState.list.page + 1));
+  $("tg-refresh").addEventListener("click", () => { loadTagger(); tgLoadAssets(); });
+  const tgSearch = () => { clearTimeout(tagState.qTimer); tagState.list.q = $("tg-q").value.trim(); tgLoadAssets(1); };
+  $("tg-q-go").addEventListener("click", tgSearch);
+  $("tg-q").addEventListener("keydown", (e) => { if (e.key === "Enter") tgSearch(); });
+  $("tg-q").addEventListener("input", () => { clearTimeout(tagState.qTimer); tagState.qTimer = setTimeout(tgSearch, 500); });
+  $("tg-outdated").addEventListener("change", () => { tagState.list.outdated = $("tg-outdated").checked; tgLoadAssets(1); });
+  $("tg-sel-page").addEventListener("click", () => {
+    tagState.list.items.forEach((a) => tagState.selected.add(a.id));
+    [...$("tg-list").querySelectorAll("input[type=checkbox]")].forEach((b) => { b.checked = true; });
+    tgUpdateSelection();
+  });
+  $("tg-sel-none").addEventListener("click", () => {
+    tagState.selected.clear();
+    [...$("tg-list").querySelectorAll("input[type=checkbox]")].forEach((b) => { b.checked = false; });
+    tgUpdateSelection();
+  });
+
+  async function tgReprocess(mode) {
+    const ids = [...tagState.selected];
+    if (!ids.length) return;
+    const data = await tagCall("reprocess", { scope: "ids", ids, mode }, (d) =>
+      `${plural((d && d.queued) != null ? d.queued : ids.length, "asset")} queued${d && d.settings && d.settings.indexing ? "." : " — press Start tagging to begin."}`);
+    if (!data) return;
+    tagState.selected.clear();
+    tgLoadAssets();
+  }
+  $("tg-act-retag").addEventListener("click", () => tgReprocess("retag"));
+  $("tg-act-describe").addEventListener("click", () => tgReprocess("describe"));
+  $("tg-act-full").addEventListener("click", () => tgReprocess("full"));
+
+  $("tg-act-remove").addEventListener("click", async () => {
+    const ids = [...tagState.selected];
+    if (!ids.length) return;
+    const exclude = await tgModal(`Remove the AI text from ${plural(ids.length, "asset")}?`, "Remove AI text", (box) => {
+      box.appendChild(tgEl("p", "hint", "The [AI Tagger] block is taken out of their descriptions and the results are forgotten. "
+        + "Anything you wrote yourself stays."));
+      const row = tgEl("label", "check");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      row.append(input, tgEl("span", "", "And don't tag them again"));
+      box.appendChild(row);
+      return () => input.checked;
+    }, true);
+    if (exclude === null) return;
+    busy(true, "Removing…");
+    try {
+      const r = await api("/api/aitagger/remove", { method: "POST", body: JSON.stringify({ ids, exclude }) });
+      toast(`Removed the AI text from ${plural(r.removed != null ? r.removed : ids.length, "asset")}${exclude ? `; ${r.excluded != null ? r.excluded : ids.length} will not be tagged again` : ""}.`);
+      tagState.selected.clear();
+      loadTagger();
+      tgLoadAssets();
+    } catch (err) { tagError(err); } finally { busy(false); }
+  });
+
+  // Every tagged asset made with older settings, in one go.
+  $("tg-update-outdated").addEventListener("click", async () => {
+    const n = (tagState.data && tagState.data.counts.outdated) || 0;
+    const mode = await tgModal(`Update ${plural(n, "asset")}?`, "Update", (box) => {
+      box.appendChild(tgEl("p", "hint", "These were tagged before your latest settings change. Re-tag is enough for strictness, "
+        + "rules, blocked tags and the like; pick Re-describe after changing the instructions, and a full re-process after "
+        + "changing the captures or the taggers."));
+      const select = tgModeSelect(box, "retag", "retag");
+      return () => select.value;
+    });
+    if (mode === null) return;
+    const data = await tagCall("reprocess", { scope: "outdated", mode }, (d) =>
+      `${plural((d && d.queued) != null ? d.queued : n, "asset")} queued${d && d.settings && d.settings.indexing ? "." : " — press Start tagging to begin."}`);
+    if (data) tgLoadAssets();
   });
 
   // ------------------------------------------------------------ smart albums
