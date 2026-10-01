@@ -1741,7 +1741,7 @@ class FakeRunner:
         if cmd[:2] == ["docker", "stop"]:
             self.state[cmd[-1]] = "stopped"
             return at._Done(0)
-        if cmd[0] == "nvidia-smi":
+        if os.path.basename(cmd[0]) == "nvidia-smi":
             return at._Done(0, self.gpu + "\n") if self.gpu else at._Done(127, "", "not found")
         raise AssertionError(f"unexpected command {cmd}")
 

@@ -755,6 +755,13 @@ def run_command(cmd: list[str], env: dict | None = None, timeout: float = 60):
         return _Done(127, "", str(exc))
 
 
+def _nvidia_smi() -> str:
+    """nvidia-smi's path. Under WSL it lives in /usr/lib/wsl/lib, which systemd services don't have on PATH."""
+    import shutil
+    return shutil.which("nvidia-smi") or next(
+        (p for p in ("/usr/lib/wsl/lib/nvidia-smi",) if os.path.exists(p)), "nvidia-smi")
+
+
 class ComposeService:
     """One container of the docker compose project, started and stopped through ``runner``."""
 
@@ -849,7 +856,7 @@ class Services:
         with self._lock:
             if self._gpu and now - self._gpu[0] < STATE_TTL:
                 return self._gpu[1]
-        out = self.runner(["nvidia-smi", "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"],
+        out = self.runner([_nvidia_smi(), "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"],
                           timeout=10)
         total = used = None
         if out.returncode == 0 and out.stdout.strip():
