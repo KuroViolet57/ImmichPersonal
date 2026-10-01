@@ -45,6 +45,7 @@ import com.kuroviolet.imagepanel.ui.more.SmartAlbumsScreen
 import com.kuroviolet.imagepanel.ui.search.SearchScreen
 import com.kuroviolet.imagepanel.ui.setup.SetupScreen
 import com.kuroviolet.imagepanel.ui.splus.SearchPlusScreen
+import com.kuroviolet.imagepanel.ui.tagger.TaggerScreen
 import com.kuroviolet.imagepanel.ui.viewer.ViewerScreen
 
 private data class TabItem(val route: String, val label: String, val icon: ImageVector)
@@ -114,6 +115,7 @@ fun AppRoot() {
             composable("smart") { SmartAlbumsScreen(nav) }
             composable("theme/{id}") { back -> SmartAlbumEditorScreen(nav, back.arguments?.getString("id") ?: "new") }
             composable("faces") { FacesScreen(nav) }
+            composable("tagger") { TaggerScreen(nav) }
             composable("more") { MoreScreen(nav) }
             composable("history") { HistoryScreen(nav) }
             composable("diag") { DiagnosticsScreen(nav) }

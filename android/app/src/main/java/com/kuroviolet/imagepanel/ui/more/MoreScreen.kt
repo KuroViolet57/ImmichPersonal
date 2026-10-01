@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.LocalOffer
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -37,6 +38,7 @@ fun MoreScreen(nav: NavController) {
     val crashed = remember { Diag.lastCrash() != null }
     Scaffold(topBar = { ScreenTop("More", subtitle = "Image Panel ${BuildConfig.VERSION_NAME} · ${Graph.settings.baseUrl}") }) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())) {
+            Entry("AI Tagger", "Tag and describe photos and videos with AI; your instructions and rules", Icons.Filled.LocalOffer) { nav.navigate("tagger") }
             Entry("Faces", "Clean up unnamed people: hide the blurry ones, sharper covers", Icons.Filled.Face) { nav.navigate("faces") }
             Entry("History", "Recent album changes, with undo", Icons.Filled.History) { nav.navigate("history") }
             Entry(
