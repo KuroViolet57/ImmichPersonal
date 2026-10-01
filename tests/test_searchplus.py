@@ -368,6 +368,23 @@ class TestGpuBusy(Base):
             with self.assertRaises(sp.GpuBusy):
                 service.ready(wait=1)
 
+    def test_the_exclusive_switch_is_the_one_place_that_decides(self):
+        self.assertTrue(sp.AITAGGER_EXCLUSIVE)                                  # the shipped value: they take turns
+        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):
+            with self.assertRaises(sp.GpuBusy):
+                sp.Service().start()
+        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", False):
+            with self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):      # the tagger runs: Search+ starts anyway
+                sp.Service().start()
+            self.assertEqual(self.docker_calls[-1], ["docker", "start", "immich_searchplus"])
+            with self.docker({"immich_aitagger_vlm": True}):                                  # and from nothing, by compose
+                sp.Service().start()
+            self.assertEqual(self.docker_calls[-1][:3], ["docker", "compose", "-f"])
+            service = sp.Service()
+            with self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}), \
+                    mock.patch.object(service, "health", side_effect=[None, {"status": "ok"}]):
+                self.assertEqual(service.ready(wait=30), {"status": "ok"})                      # ready() no longer says GpuBusy
+
     def test_search_plus_starts_as_before_when_the_language_model_is_not_running(self):
         for tagger in ({}, {"immich_aitagger_vlm": False}):
             with self.docker({"immich_searchplus": False, **tagger}):

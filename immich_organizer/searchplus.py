@@ -39,6 +39,10 @@ SERVICE_URL = os.environ.get("SEARCHPLUS_URL", "http://127.0.0.1:11439")
 CONTAINER = os.environ.get("SEARCHPLUS_CONTAINER", "immich_searchplus")
 COMPOSE = Path(__file__).resolve().parent.parent / "deploy" / "searchplus" / "docker-compose.yml"
 AITAGGER_VLM_CONTAINER = os.environ.get("AITAGGER_VLM_CONTAINER", "immich_aitagger_vlm")   # the AI Tagger's GPU hog
+# Whether Search+ and the AI Tagger take turns on the graphics card. True: Search+ will not start while the tagger's
+# language model runs (GpuBusy), and the AI Tagger stops a running Search+ before it starts its own containers.
+# False: they may run at the same time (set it when the card has room for both); nothing is stopped or refused.
+AITAGGER_EXCLUSIVE = True
 DEFAULTS = {"indexing": False, "keep_updated": True, "video_frames": 4}
 LIMITS = {"video_frames": (1, 8)}
 FRAME_SIDE = 640              # frames are sent at most this big; the model looks at 448 x 448
@@ -264,7 +268,7 @@ class Service:
         state = self.container_state()
         if state == "running":
             return
-        if container_running(AITAGGER_VLM_CONTAINER):       # one language model at a time on the card
+        if AITAGGER_EXCLUSIVE and container_running(AITAGGER_VLM_CONTAINER):       # take turns on the card
             raise GpuBusy("The GPU is in use by the AI Tagger — pause it to use Search+")
         if state == "missing":
             cmd = ["docker", "compose", "-f", str(self.compose), "up", "-d"]

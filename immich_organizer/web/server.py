@@ -415,7 +415,8 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             "settings": aitagger_mod.load_settings(),
             "limits": {k: list(v) for k, v in aitagger_mod.LIMITS.items()},
             "settingsVersion": store.settings_version, "counts": counts, "indexer": indexer.status(counts),
-            "service": service.status(), "models": dict(aitagger_mod.MODEL_LABELS), "failures": store.failures(),
+            "service": {**service.status(), "exclusive": searchplus_mod.AITAGGER_EXCLUSIVE},
+            "models": dict(aitagger_mod.MODEL_LABELS), "failures": store.failures(),
             "reprocessKeys": {mode: list(keys) for mode, keys in aitagger_mod.REPROCESS.items()},
         }
 

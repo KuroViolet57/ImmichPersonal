@@ -45,6 +45,46 @@ description. v2 changes:
 6. **GPU sharing with Search+:** if the measurements show that taggers + describer + Immich ML + Search+ (PE-Core,
    about 7 GB) fit in 22 GB, the mutual exclusion (`GpuBusy`) is dropped. Otherwise it stays.
 
+### v2, panel side: as built (what extends or differs from the list above)
+
+The panel code (`aitagger.py`, `searchplus.py`, the web tab) follows the list above. Where it adds to it or chose
+something the list leaves open:
+
+- **Memory constants** sit together at the top of `aitagger.py`, marked provisional: `VRAM_GB_DEFAULT = 8`,
+  `VRAM_GB_LIMITS = (4, 16)` and `VLM_UTIL = 0.14` (the describer's share of the whole card, about 3 GB on 24 GB).
+  `vram_gb` is passed as `AITAGGER_VRAM_GB`; `AITAGGER_VLM_UTIL` is `VLM_UTIL`, whatever the card or `vram_gb`. The
+  nvidia-smi reading is now only shown in the status. A container is still recreated when its remembered env differs,
+  so changing a constant in the code takes effect at the next start. An old `settings.json` with `vram_gb` 18-21 is out
+  of range now, so that one value falls back to the default.
+- **Exclusivity** is one module-level switch, `searchplus.AITAGGER_EXCLUSIVE` (default `True`). `False`: Search+ starts
+  while the describer container runs (no `GpuBusy`), and the AI Tagger no longer stops a running Search+ before it
+  starts its containers. The status `service` has `exclusive` (the switch), so the tab hides its "Search+ is paused"
+  notes when it is `False`.
+- **Stored scores.** `raw.scores[i]` is `{"wd": {general, character} | null, "pixai": {general, character, copyright} |
+  null}` and `raw.ratings[i]` is `{"wd": {...} | null, "pixai": {...} | null}` (the raw rating probabilities; the
+  `raw` table is unchanged). The panel assumes PixAI names its ratings like WD (general, sensitive, questionable,
+  explicit): a name one model lacks counts as 0 in that model's mean.
+- **Rating tag.** Its `source` is the model that was surest of the winning rating (a tie goes to `wd`), and the
+  Test card's `models.rating` is the combined mean. Other tags merge WD and PixAI by highest score, keeping that
+  model's name as `source`.
+- **Scores from the v1 service (no `pixai` entry).** They count as needing a `full` reprocess:
+  - The first time a store that holds such rows is opened, `settings_version` goes up once (`meta.raw_format` = 2
+    remembers it), so every result made from them is "outdated" and shows in that counter and in the `outdated` scope.
+  - A `retag` or `describe` that reaches an asset whose stored scores lack PixAI (a queued request, or a result that
+    was stored but not yet written) is run as `full` instead: it tags again and describes again. This applies only while
+    `use_pixai` is on; with it off nothing is lost by using the old scores, and switching it on is a `full` change as before.
+  - Nothing is re-queued by itself: the owner starts it, for example "Also update the N already-tagged assets".
+- **`describe` needs no pictures.** The describer sees only tags, so a `describe` run uses the stored scores and starts
+  only the describer container; the captures are not cut. `full` still cuts them for the taggers.
+- **Nothing to describe from.** With no tag at all for an asset (or both taggers off), the describer is not called
+  (a text model given nothing would invent a description): the result has no description and the note "no description:
+  the taggers found no tags to describe from". With both taggers off the describer container is not started either.
+- **The prompt** names a video as such ("several frames of it, combined") but sends no pictures and no frame count.
+  `add_tags` / `remove_tags` are asked "at most 8 each, normally empty"; the schema's `maxItems` 12 stays.
+- **Labels.** `character_tags` reads "character and series names" in the tab, since it also gates PixAI's series tags.
+- **Not done here:** the Android app (`TaggerScreen.kt`) still sends and reads `use_ram`, `ram_strictness` and
+  `models.ram`. The panel refuses the old keys as unknown settings (400), so the app needs the same rename.
+
 ## Decisions (v1; see v2 above)
 
 | Topic | Decision |

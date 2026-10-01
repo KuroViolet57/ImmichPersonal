@@ -1,15 +1,17 @@
 """AI Tagger: tags every photo and video, and writes the result into the asset's Immich description.
 
-Two image taggers (WD EVA02 for illustration / people / clothing, RAM++ for real-world objects and scenes) say what
-is in the picture; a vision-language model (VLM) checks those tags and writes a short description following the
-owner's instructions. The result goes into a managed ``[AI Tagger]`` block inside the Immich description; the
-owner's own text is never changed. Contract: ``docs/AI-TAGGER.md``.
+Two image taggers (WD EVA02 and PixAI v1.0, both Danbooru-style: illustration / anime, people, clothing, characters,
+series) say what is in the picture; a small text-only language model (the "VLM" container, which sees no pictures)
+turns the final tags into a short description following the owner's instructions and may add or drop a few tags.
+The result goes into a managed ``[AI Tagger]`` block inside the Immich description; the owner's own text is never
+changed. Contract: ``docs/AI-TAGGER.md`` (its v2 section is binding).
 
 Pieces:
 * settings (``settings.json``) and the SQLite ``Store`` (catalogue, raw tagger scores, results, history, queue);
 * pure functions: ``aggregate``/``detect``/``finalize`` (scores -> tags), ``apply_rules``, ``compose_block`` and
   ``merge_description`` (the block, with the owner's text kept exactly);
-* ``Tagger`` and ``VLM``: HTTP clients of the two model containers; ``Services``: starts / stops those containers;
+* ``Tagger`` and ``VLM``: HTTP clients of the two model containers (the VLM is sent text only); ``Services``: starts /
+  stops those containers;
 * ``Pipeline``: everything done to one asset (captures, tagging, VLM, write-back, read-back, history);
 * ``Indexer``: a background thread that works through the queue and the untagged assets, like Search+.
 """
@@ -46,16 +48,20 @@ COMPOSE = Path(__file__).resolve().parent.parent / "deploy" / "aitagger" / "dock
 PROJECT = "immich-aitagger"
 TAGGER_SERVICE, VLM_SERVICE = "tagger", "vlm"      # service names inside the compose file
 VLM_MODEL = "tagger-vlm"
-MODEL_LABELS = {"wd": "wd-eva02-large-tagger-v3", "ram": "RAM++ (swin-large)", "vlm": "Qwen3.5-9B (FP8)"}
+MODEL_LABELS = {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0", "vlm": "Qwen3.5-2B (text)"}
 
-TAGGER_VRAM_GB = 5            # what the tagger container may use; the rest of vram_gb goes to the VLM
+# ---- graphics memory. PROVISIONAL: these come from measurements that are still being made; change them here only.
+VRAM_GB_DEFAULT = 8           # setting `vram_gb`, its default: the memory cap of the two taggers (AITAGGER_VRAM_GB)
+VRAM_GB_LIMITS = (4, 16)      # what `vram_gb` may be set to
+VLM_UTIL = 0.14               # the describer's share of the whole card (AITAGGER_VLM_UTIL); ~3 GB on a 24 GB card
+# ----
+
 DEFAULT_GPU_GB = 24           # when nvidia-smi can't say
 IDLE_EXIT_MINUTES = 20        # the VLM container is stopped after this long without work
 STATE_TTL = 5.0               # seconds a container's state is remembered (the status route is polled)
 FLOOR = 0.05                  # the tagger returns calibrated scores from this up
 DISPLAY_FLOOR = 0.2           # the Test card lists scores from this up (the kept ones always)
 CAPTURE_SIDE = 1024           # captures are at most this big
-VLM_SIDE = 768                # pictures sent to the VLM are at most this big
 PREVIEW_SIDE = 256            # pictures in the Test card
 SEGMENTS = 8                  # a video is cut into this many equal parts; the first and last are skipped
 MAX_IMAGES_PER_REQUEST = 64   # what the tagger accepts in one /tag call
@@ -151,25 +157,26 @@ class Vocabulary:
 # ---------------------------------------------------------------- settings
 
 DEFAULTS = {
-    "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vlm_parallel": 8, "vram_gb": 20,
-    "describe": True, "use_wd": True, "use_ram": True, "wd_strictness": 0.5, "ram_strictness": 0.5,
+    "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vlm_parallel": 8,
+    "vram_gb": VRAM_GB_DEFAULT,
+    "describe": True, "use_wd": True, "use_pixai": True, "wd_strictness": 0.5, "pixai_strictness": 0.5,
     "character_tags": True, "rating_tag": True, "max_tags": 30, "instructions": "", "vocabulary": "",
     "blocked": [], "rules": [], "write_tags": False, "language": "English",
 }
-LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vlm_parallel": (1, 32), "vram_gb": (18, 21),
-          "wd_strictness": (0.05, 0.95), "ram_strictness": (0.05, 0.95), "max_tags": (5, 100)}
+LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vlm_parallel": (1, 32), "vram_gb": VRAM_GB_LIMITS,
+          "wd_strictness": (0.05, 0.95), "pixai_strictness": (0.05, 0.95), "max_tags": (5, 100)}
 TEXT_LIMITS = {"instructions": 4000, "vocabulary": 4000, "language": 40}
 MAX_BLOCKED, MAX_RULES, MAX_RULE_TAGS = 500, 100, 50
 RULE_KEYS = ("if_all", "if_any", "unless", "add", "remove")
 
 # settings that change what an asset's result looks like (a change makes older results "outdated")
-CONTENT = ("video_frames", "describe", "use_wd", "use_ram", "wd_strictness", "ram_strictness", "character_tags",
+CONTENT = ("video_frames", "describe", "use_wd", "use_pixai", "wd_strictness", "pixai_strictness", "character_tags",
            "rating_tag", "max_tags", "instructions", "vocabulary", "blocked", "rules", "write_tags", "language")
 # the cheapest way to bring results up to date after a change (the strongest of the changed keys wins)
 REPROCESS = {
-    "full": ("video_frames", "use_wd", "use_ram"),
+    "full": ("video_frames", "use_wd", "use_pixai"),
     "describe": ("describe", "instructions", "vocabulary", "language"),
-    "retag": ("wd_strictness", "ram_strictness", "character_tags", "rating_tag", "max_tags", "blocked", "rules",
+    "retag": ("wd_strictness", "pixai_strictness", "character_tags", "rating_tag", "max_tags", "blocked", "rules",
               "write_tags"),
 }
 _SETTINGS_LOCK = threading.Lock()
@@ -319,12 +326,39 @@ def _per_tag(series: list[dict]) -> dict[str, float]:
     return {tag: _combine([float(cap.get(tag, 0.0)) for cap in series]) for tag in names}
 
 
+def _mean_scores(series: list[dict]) -> dict[str, float]:
+    """Per name, the mean over the captures (a capture that does not list a name counts as 0)."""
+    names: set = set()
+    for cap in series:
+        names.update(cap)
+    return {name: sum(float(cap.get(name, 0.0)) for cap in series) / len(series) for name in names}
+
+
+def _merged(data: dict, categories: tuple[str, ...]) -> dict[str, float]:
+    """One capture's scores for these categories as one dict (a tag in two categories keeps the higher score)."""
+    out: dict[str, float] = {}
+    for category in categories:
+        for tag, score in (data.get(category) or {}).items():
+            out[tag] = max(out.get(tag, 0.0), score)
+    return out
+
+
+def has_pixai(raw: dict | None) -> bool:
+    """Whether stored tagger scores include PixAI's. Scores made by the v1 service (RAM++) do not."""
+    return any((cap or {}).get("pixai") is not None for cap in (raw or {}).get("scores") or [])
+
+
+def needs_vlm(settings: dict) -> bool:
+    """The describer only has tags to go on, so it is used only when a tagger is on."""
+    return bool(settings["describe"] and (settings["use_wd"] or settings["use_pixai"]))
+
+
 def detect(raw: dict, settings: dict) -> dict:
     """Steps 3-4: stored tagger scores -> tags with scores (before the VLM and the rules)."""
     vocab = Vocabulary(settings["vocabulary"])
     blocked = set(settings["blocked"])
     candidates: list[tuple[str, float, str]] = []
-    display: dict = {"wd": [], "ram": [], "rating": {}}
+    display: dict = {"wd": [], "pixai": [], "rating": {}}
 
     def show(model: str, scores: dict, strictness: float) -> None:
         shown = {}
@@ -342,33 +376,32 @@ def detect(raw: dict, settings: dict) -> dict:
         display[model] = sorted(shown.values(), key=lambda t: (-t["score"], t["tag"]))[:80]
 
     caps = raw.get("scores") or []
-    if settings["use_wd"]:
-        series = []
-        for cap in caps:
-            data = (cap or {}).get("wd")
-            if data is None:
-                continue
-            merged = dict(data.get("general") or {})
-            if settings["character_tags"]:
-                for tag, score in (data.get("character") or {}).items():
-                    merged[tag] = max(merged.get(tag, 0.0), score)
-            series.append(merged)
+    # `character_tags` gates the names of characters (WD and PixAI) and PixAI's series ("copyright") tags
+    wanted = {"wd": ("general", "character") if settings["character_tags"] else ("general",),
+              "pixai": ("general", "character", "copyright") if settings["character_tags"] else ("general",)}
+    for model in ("wd", "pixai"):
+        if not settings["use_" + model]:
+            continue
+        series = [_merged(cap[model], wanted[model]) for cap in caps if cap and cap.get(model) is not None]
         if series:
-            show("wd", _per_tag(series), settings["wd_strictness"])
-    if settings["use_ram"]:
-        series = [cap["ram"] for cap in caps if cap and cap.get("ram") is not None]
-        if series:
-            show("ram", _per_tag(series), settings["ram_strictness"])
-    ratings = [r for r in raw.get("ratings") or [] if r]
-    if settings["use_wd"] and ratings:
-        names: set = set()
-        for r in ratings:
-            names.update(r)
-        mean = {name: sum(float(r.get(name, 0.0)) for r in ratings) / len(ratings) for name in names}
+            show(model, _per_tag(series), settings[model + "_strictness"])
+    # The rating: each model's probabilities averaged over the captures, then the mean of the models that are on
+    # (one model alone if only one is), then the best. The tag's source is the model surest of the winner.
+    ratings = [r for r in raw.get("ratings") or [] if isinstance(r, dict)]
+    parts: dict[str, dict[str, float]] = {}
+    for model in ("wd", "pixai"):
+        if settings["use_" + model]:
+            per_capture = [r[model] for r in ratings if isinstance(r.get(model), dict) and r[model]]
+            if per_capture:
+                parts[model] = _mean_scores(per_capture)
+    if parts:
+        names = set().union(*parts.values())
+        mean = {name: sum(p.get(name, 0.0) for p in parts.values()) / len(parts) for name in names}
         display["rating"] = {name: round(p, 3) for name, p in mean.items()}
         if settings["rating_tag"]:
             best = max(sorted(mean), key=lambda name: mean[name])
-            candidates.append((RATING_PREFIX + best, mean[best], "wd"))
+            source = max(parts, key=lambda model: parts[model].get(best, 0.0))       # a tie goes to WD
+            candidates.append((RATING_PREFIX + best, mean[best], source))
     tags: dict[str, tuple[float, str]] = {}
     for tag, score, source in candidates:
         original = norm_tag(tag)
@@ -575,7 +608,7 @@ def _is_oom(text: str) -> bool:
 
 
 class Tagger:
-    """HTTP client of the tagger container (WD + RAM++)."""
+    """HTTP client of the tagger container (WD + PixAI)."""
 
     def __init__(self, url: str = TAGGER_URL, timeout: float = 600):
         self.url, self.timeout = url.rstrip("/"), timeout
@@ -622,10 +655,11 @@ VLM_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["des
                              "add_tags": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
                              "remove_tags": {"type": "array", "items": {"type": "string"}, "maxItems": 12}}}
 VLM_SYSTEM = (
-    "You are the cataloguer of a private, personal photo archive that only its owner can see. Describe every "
-    "picture neutrally and factually, including nudity, sexual or violent content, in plain language, without "
-    "judging, warning or moralising. You never refuse: if something is unclear, say what can be seen. "
-    "Answer only with the JSON object that is asked for.")
+    "You are the cataloguer of a private, personal photo archive that only its owner can see. You never see the "
+    "pictures: you are given the tags that image taggers found in one picture, each with a confidence, and you turn "
+    "them into a short description. Treat every tag neutrally and factually, including nudity, sexual or violent "
+    "content, in plain language, without judging, warning or moralising. You never refuse: if the tags say little, "
+    "say little. Never invent details the tags do not support. Answer only with the JSON object that is asked for.")
 _REFUSAL = re.compile(r"^\s*(i['’]?m sorry|i am sorry|sorry[,.]|i can(?:'|’)?t|i cannot|i['’]?m (?:not able|unable)|"
                       r"i am (?:not able|unable)|i won['’]?t|as an ai|unable to (?:describe|assist|help))", re.I)
 
@@ -634,11 +668,14 @@ class VLMRejected(Exception):
     """The language model refused, or did not answer in the asked-for format."""
 
 
-def vlm_prompt(tags: list[dict], rating: dict, settings: dict, terms: list[str], count: int, kind: str) -> str:
+def vlm_prompt(tags: list[dict], rating: dict, settings: dict, terms: list[str], kind: str = "IMAGE") -> str:
+    """What the text-only describer is told: the final tags with their scores, the rating, and the owner's
+    instructions, preferred terms and language. There is no picture."""
     what = "video" if kind == "VIDEO" else "picture"
-    lines = [f"You see {count} image(s) from one {what}" + (" (frames in time order)." if count > 1 else ".")]
     shown = ", ".join(f"{t['tag']} {t['score']:.2f}" for t in tags[:60]) or "(none)"
-    lines.append(f"Tags found by two image taggers, with a 0-1 confidence: {shown}")
+    lines = [f"Tags found by two image taggers in one {what}"
+             + (" (several frames of it, combined)" if kind == "VIDEO" else "")
+             + f", with a 0-1 confidence: {shown}"]
     if rating:
         lines.append("Content rating estimate: " + ", ".join(f"{k} {v:.2f}" for k, v in sorted(rating.items())))
     if settings["instructions"].strip():
@@ -646,10 +683,12 @@ def vlm_prompt(tags: list[dict], rating: dict, settings: dict, terms: list[str],
     if terms:
         lines.append("Preferred terms (use these words when they fit): " + "; ".join(terms[:80]))
     lines.append(
-        f"Write the description in {settings['language']}: 1-2 sentences about what the picture shows. Also check the "
-        "tags: list in add_tags at most 8 clearly visible things that are missing (short lowercase English tags) and in "
-        "remove_tags at most 8 detected tags that are clearly wrong (spelled exactly as above). Answer with a JSON object "
-        '{"description": "...", "add_tags": [...], "remove_tags": [...]}.')
+        f"Write the description in {settings['language']}: 1-2 sentences saying what the {what} shows, as far as the "
+        "tags imply it, following the instructions. Use only what the tags support; never invent details. "
+        "add_tags and remove_tags may hold at most 8 entries each, and should normally stay empty: use them only when "
+        "the instructions or the tags themselves clearly call for it (for example beach and swimsuit suggest summer). "
+        "add_tags are short lowercase English tags; remove_tags are tags from the list above, spelled exactly the same. "
+        'Answer with a JSON object {"description": "...", "add_tags": [...], "remove_tags": [...]}.')
     return "\n".join(lines)
 
 
@@ -679,7 +718,7 @@ def parse_vlm_answer(content) -> dict:
 
 
 class VLM:
-    """HTTP client of the language model container (vLLM, OpenAI-compatible)."""
+    """HTTP client of the language model container (vLLM, OpenAI-compatible). It is sent text only, never a picture."""
 
     def __init__(self, url: str = VLM_URL, model: str = VLM_MODEL, timeout: float = 300):
         self.url, self.model, self.timeout = url.rstrip("/"), model, timeout
@@ -707,18 +746,14 @@ class VLM:
         except ValueError as exc:
             raise ServiceDown(f"the language model sent something unreadable: {exc}") from exc
 
-    def ask(self, images: list[bytes], prompt: str) -> str:
+    def ask(self, prompt: str) -> str:
         """One round trip; the answer's text. Raises ServiceDown / VLMRejected."""
-        from .media import shrink_image
-
-        content = [{"type": "text", "text": prompt}] + [
-            {"type": "image_url", "image_url": {"url": data_url(shrink_image(img, VLM_SIDE))}} for img in images]
         data = self._post({
             "model": self.model, "temperature": 0.2, "max_tokens": 400,
             "chat_template_kwargs": {"enable_thinking": False},
             "response_format": {"type": "json_schema",
                                 "json_schema": {"name": "tagger_answer", "strict": True, "schema": VLM_SCHEMA}},
-            "messages": [{"role": "system", "content": VLM_SYSTEM}, {"role": "user", "content": content}]})
+            "messages": [{"role": "system", "content": VLM_SYSTEM}, {"role": "user", "content": prompt}]})
         try:
             choice = data["choices"][0]
             message = choice.get("message") or {}
@@ -730,15 +765,15 @@ class VLM:
             raise VLMRejected("the answer was cut short")
         return message.get("content")
 
-    def describe(self, images: list[bytes], tags: list[dict], rating: dict, settings: dict,
-                 kind: str = "IMAGE", terms: list[str] | None = None) -> dict:
+    def describe(self, tags: list[dict], rating: dict, settings: dict, kind: str = "IMAGE",
+                 terms: list[str] | None = None) -> dict:
         """{"description", "add_tags", "remove_tags", "note"}. A refusal or a bad answer is tried once more, then
         stored as an empty description with a note - that is not the asset's failure."""
-        prompt = vlm_prompt(tags, rating, settings, terms or [], len(images), kind)
+        prompt = vlm_prompt(tags, rating, settings, terms or [], kind)
         problem = ""
         for _ in range(2):
             try:
-                answer = parse_vlm_answer(self.ask(images, prompt))
+                answer = parse_vlm_answer(self.ask(prompt))
             except VLMRejected as exc:
                 problem = str(exc)
                 continue
@@ -848,11 +883,11 @@ class Services:
         finally:
             self.touch()
 
-    def describe(self, images: list[bytes], tags: list[dict], rating: dict, settings: dict, kind: str = "IMAGE",
+    def describe(self, tags: list[dict], rating: dict, settings: dict, kind: str = "IMAGE",
                  terms: list[str] | None = None) -> dict:
         self.touch()
         try:
-            return self.vlm.describe(images, tags, rating, settings, kind, terms)
+            return self.vlm.describe(tags, rating, settings, kind, terms)
         finally:
             self.touch()
 
@@ -881,11 +916,10 @@ class Services:
         return info
 
     def env(self, settings: dict | None = None) -> dict:
-        """What the compose file needs, derived from ``vram_gb`` and ``vlm_parallel``."""
+        """What the compose file needs: ``vram_gb`` is the taggers' cap, the describer's share is the constant
+        ``VLM_UTIL`` (not derived from ``vram_gb``), and ``vlm_parallel`` is its number of concurrent requests."""
         settings = settings or self.settings_fn()
-        total = self.gpu()["totalGb"] or DEFAULT_GPU_GB
-        util = min(round((int(settings["vram_gb"]) - TAGGER_VRAM_GB) / total, 2), 0.95)
-        return {"AITAGGER_VRAM_GB": str(TAGGER_VRAM_GB), "AITAGGER_VLM_UTIL": str(util),
+        return {"AITAGGER_VRAM_GB": str(int(settings["vram_gb"])), "AITAGGER_VLM_UTIL": str(VLM_UTIL),
                 "AITAGGER_VLM_SEQS": str(int(settings["vlm_parallel"]))}
 
     # ---- starting and stopping
@@ -903,7 +937,8 @@ class Services:
             self._memory["env"] = _dumps(data)
 
     def load(self, need_tagger: bool = True, need_vlm: bool = True) -> list[str]:
-        """Start the containers that are not running (Search+ is stopped first: they share the card).
+        """Start the containers that are not running (Search+ is stopped first, while ``searchplus.AITAGGER_EXCLUSIVE``
+        says they may not share the card).
         Returns the names it started. A container whose derived env changed since its last start is recreated."""
         with self._lock:
             self.touch()
@@ -914,7 +949,7 @@ class Services:
             todo = [t for t in todo if t[2] != "running"]
             if not todo:
                 return []
-            if self.search_box.container_state(fresh=True) == "running":
+            if searchplus.AITAGGER_EXCLUSIVE and self.search_box.container_state(fresh=True) == "running":
                 try:
                     self.search_stop()
                 except Exception:  # noqa: BLE001 - not stopping Search+ must not hide the real problem
@@ -966,7 +1001,7 @@ class Services:
                     ("tagger", need_tagger, bool(health and health.get("status") == "ok")),
                     ("language model", need_vlm, bool(need_vlm and self.vlm.health()))) if needed and not ok]
                 progress("loading the " + " and the ".join(waiting) + " into the graphics card "
-                         "(the very first time the models are downloaded, ~25 GB)")
+                         "(the very first time, the models are downloaded first)")
             if self.clock() >= deadline:
                 raise ServiceDown("the AI Tagger models are still loading")
             if self.clock() - started > 30:
@@ -1034,6 +1069,7 @@ create table if not exists meta (key text primary key, value text);
 create table if not exists asset_tags (id text, tag text, primary key (id, tag)) without rowid;
 create index if not exists asset_tags_tag on asset_tags(tag);
 """
+RAW_FORMAT = "2"        # meta.raw_format; 1 (no entry) = stored tagger scores with RAM++, 2 = with PixAI
 _ITEM = "a.id, a.type, a.preview, a.original, a.duration_ms, a.taken, a.name"
 _ITEM_KEYS = ("id", "type", "preview", "original", "duration_ms", "taken", "name")
 _NOT_EXCLUDED = " and not exists (select 1 from excluded e where e.id=a.id)"
@@ -1057,6 +1093,17 @@ class Store:
         self._meta = dict(self.conn.execute("select key, value from meta").fetchall())
         self._changes = 0
         self._tags_cache: tuple[int, list] | None = None
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Stored scores made by the v1 service (RAM++, no PixAI entry) cannot give a v2 result. The first time a
+        store holding such scores is opened, ``settings_version`` goes up once, so every result made from them counts
+        as "outdated"; the Indexer redoes them as ``full`` whenever a reprocess (of any mode) reaches them."""
+        if self.meta("raw_format") == RAW_FORMAT:
+            return
+        if self.conn.execute("select 1 from raw where models not like '%pixai%' limit 1").fetchone():
+            self.bump_settings_version()
+        self.set_meta("raw_format", RAW_FORMAT)
 
     # ---- meta (kept in memory too: read from many threads, written rarely)
     def meta(self, key: str, default: str = "") -> str:
@@ -1351,26 +1398,34 @@ class Store:
 # ---------------------------------------------------------------- one asset, start to finish
 
 def synthetic_raw(captures: int) -> dict:
-    """Stand-in for tagger scores when neither tagger is used (the VLM may still describe)."""
-    return {"captures": captures, "scores": [{"wd": None, "ram": None}] * captures, "ratings": [None] * captures,
+    """Stand-in for tagger scores when neither tagger is used (then there are no tags, so nothing to describe either)."""
+    return {"captures": captures, "scores": [{"wd": None, "pixai": None}] * captures, "ratings": [None] * captures,
             "models": []}
 
 
 def raw_from_results(results: list, errors: list) -> dict | str:
-    """The tagger's answers for one asset's captures as a stored ``raw`` payload, or the error text."""
+    """The tagger's answers for one asset's captures as a stored ``raw`` payload, or the error text.
+
+    ``scores[i]`` holds capture i's calibrated tag scores per model (WD: general, character; PixAI: general,
+    character, copyright), ``ratings[i]`` its raw rating probabilities as ``{"wd": {...}, "pixai": {...}}``.
+    """
     good = [r for r in results if r]
     if not good:
         return next((e for e in errors if e), "the tagger could not read this picture")
     scores, ratings, models = [], [], set()
     for r in good:
-        wd, ram = r.get("wd"), r.get("ram")
+        wd, pixai = r.get("wd"), r.get("pixai")
         if wd is not None:
             models.add("wd")
-        if ram is not None:
-            models.add("ram")
-        scores.append({"wd": None if wd is None else {"general": wd.get("general") or {},
-                                                     "character": wd.get("character") or {}}, "ram": ram})
-        ratings.append(None if wd is None else wd.get("rating"))
+        if pixai is not None:
+            models.add("pixai")
+        scores.append({
+            "wd": None if wd is None else {"general": wd.get("general") or {}, "character": wd.get("character") or {}},
+            "pixai": None if pixai is None else {"general": pixai.get("general") or {},
+                                                 "character": pixai.get("character") or {},
+                                                 "copyright": pixai.get("copyright") or {}}})
+        rating = {"wd": (wd or {}).get("rating") or None, "pixai": (pixai or {}).get("rating") or None}
+        ratings.append(rating if any(rating.values()) else None)
     return {"captures": len(good), "scores": scores, "ratings": ratings, "models": sorted(models)}
 
 
@@ -1404,16 +1459,19 @@ class Pipeline:
             i += len(frames)
         return out
 
-    # ---- the VLM
-    def run_vlm(self, item: dict, frames: list[bytes], found: dict, settings: dict) -> dict:
+    # ---- the VLM (text only: it is given the tags, never a picture)
+    def run_vlm(self, item: dict, found: dict, settings: dict) -> dict:
         tags = sorted(({"tag": t, "score": round(v[0], 3)} for t, v in found["tags"].items()),
                       key=lambda t: (-t["score"], t["tag"]))
+        if not tags:                # nothing to describe from: a text model would only make something up
+            return {"description": "", "add_tags": [], "remove_tags": [],
+                    "note": "no description: the taggers found no tags to describe from"}
         rating = found["display"].get("rating") or {}
-        answer = self.services.describe(frames, tags, rating, settings, item["type"], found["terms"])
+        answer = self.services.describe(tags, rating, settings, item["type"], found["terms"])
         return {"description": answer.get("description", ""), "add_tags": list(answer.get("add_tags") or []),
                 "remove_tags": list(answer.get("remove_tags") or []), "note": answer.get("note", "")}
 
-    def decide(self, item: dict, mode: str, raw: dict, frames: list[bytes] | None, settings: dict,
+    def decide(self, item: dict, mode: str, raw: dict, settings: dict,
                stored_vlm: dict | None = None) -> tuple[dict, dict | None]:
         """(the decision, the VLM answer): the VLM runs unless ``mode`` is retag (then the stored answer is used)."""
         vlm = None
@@ -1421,7 +1479,7 @@ class Pipeline:
             if mode == "retag":
                 vlm = stored_vlm
             else:
-                vlm = self.run_vlm(item, frames or [], detect(raw, settings), settings)
+                vlm = self.run_vlm(item, detect(raw, settings), settings)
         return build(raw, vlm, settings), vlm
 
     # ---- Immich
@@ -1497,11 +1555,11 @@ class Pipeline:
         return written
 
     # ---- the whole thing for one asset (Indexer)
-    def process(self, item: dict, mode: str, raw: dict, frames: list[bytes] | None, settings: dict,
-                version: int, covers: str | None = None) -> dict:
+    def process(self, item: dict, mode: str, raw: dict, settings: dict, version: int,
+                covers: str | None = None) -> dict:
         """Do ``mode`` for one asset. ``covers`` is what the work counts as when taking it off the queue."""
         previous = self.store.result(item["id"])
-        decision, vlm = self.decide(item, mode, raw, frames, settings, (previous or {}).get("vlm"))
+        decision, vlm = self.decide(item, mode, raw, settings, (previous or {}).get("vlm"))
         written = self.commit(item, covers or mode, decision, vlm, version, settings)
         return {"decision": decision, "vlm": vlm, "write": written}
 
@@ -1518,8 +1576,8 @@ class Pipeline:
         """The Test card: run the whole pipeline on one asset; store and write only when ``write``."""
         item = self.lookup(asset_id, refresh)
         version, settings = self.snapshot()
-        tagger_used = settings["use_wd"] or settings["use_ram"]
-        self.services.ensure_ready(need_tagger=tagger_used, need_vlm=settings["describe"], wait=PREVIEW_WAIT)
+        tagger_used = settings["use_wd"] or settings["use_pixai"]
+        self.services.ensure_ready(need_tagger=tagger_used, need_vlm=needs_vlm(settings), wait=PREVIEW_WAIT)
         try:
             frames, _kind = self.frames(item, settings["video_frames"])
         except (OSError, ValueError) as exc:
@@ -1530,7 +1588,7 @@ class Pipeline:
                 raise ValueError(f"The tagger could not read this picture: {raw}")
         else:
             raw = synthetic_raw(len(frames))
-        decision, vlm = self.decide(item, "full", raw, frames, settings)
+        decision, vlm = self.decide(item, "full", raw, settings)
         current, _asset = self.current(asset_id)
         out = {"id": item["id"], "name": item["name"], "type": item["type"], "captures": len(frames),
                "frames": [data_url(_shrunk(f, PREVIEW_SIDE)) for f in frames],
@@ -1786,12 +1844,19 @@ class Indexer:
                     mode = "retag"              # nothing to ask the VLM: the stored scores are all there is
                 if mode in ("retag", "describe"):
                     raw = self.store.raw(item["id"])
-                    if raw is None:
-                        mode = "full"           # nothing stored to work from
+                    if raw is None or (settings["use_pixai"] and not has_pixai(raw)):
+                        mode = "full"           # nothing stored to work from, or only the v1 service's scores (no PixAI)
                 item["mode"], item["raw"] = mode, raw
-                (local if mode == "retag" else captured).append(item)
-            for item in local:                  # no pictures, no GPU: the stored scores and the stored answer
-                self._submit_finish(item, None, settings, version)
+                (captured if mode == "full" else local).append(item)
+            # No pictures are needed for these: the stored scores and, for "retag", the stored answer. A "describe"
+            # asks the (text-only) language model again, so only that one has to be up.
+            if needs_vlm(settings) and any(i["mode"] == "describe" for i in local):
+                self.state, self.detail = "starting", "waiting for the language model"
+                self.services.ensure_ready(need_tagger=False, need_vlm=True, wait=3600, stop=stop,
+                                           progress=lambda d: setattr(self, "detail", d))
+                self.state, self.detail = "running", "describing"
+            for item in local:
+                self._submit_finish(item, settings, version)
             if captured:
                 self._capture_and_tag(captured, settings, version, stop)
         finally:
@@ -1800,10 +1865,9 @@ class Indexer:
                     self._release(item["id"])
 
     def _capture_and_tag(self, items: list[dict], settings: dict, version: int, stop: threading.Event) -> None:
-        tagger_used = settings["use_wd"] or settings["use_ram"]
-        need_tagger = tagger_used and any(i["mode"] == "full" for i in items)
+        need_tagger = settings["use_wd"] or settings["use_pixai"]
         self.state, self.detail = "starting", "waiting for the models"
-        self.services.ensure_ready(need_tagger=need_tagger, need_vlm=settings["describe"], wait=3600, stop=stop,
+        self.services.ensure_ready(need_tagger=need_tagger, need_vlm=needs_vlm(settings), wait=3600, stop=stop,
                                    progress=lambda d: setattr(self, "detail", d))
         self.state, self.detail = "running", "tagging"
         futures = {self._prep.submit(self.pipe.frames, item, settings["video_frames"]): item for item in items}
@@ -1819,10 +1883,9 @@ class Indexer:
                 except Exception as exc:  # noqa: BLE001 - unreadable file: note it and go on
                     self._fail(item, exc)
                     continue
-                if item["mode"] != "full" or not need_tagger:
-                    if item["raw"] is None:
-                        item["raw"] = synthetic_raw(len(frames))
-                    self._submit_finish(item, frames, settings, version)
+                if not need_tagger:             # no tagger is on: the describer has no tags to go on
+                    item["raw"] = synthetic_raw(len(frames))
+                    self._submit_finish(item, settings, version)
                     continue
                 if batch and images + len(frames) > MAX_IMAGES_PER_REQUEST:
                     tag_futs = self._send(batch, tag_futs, settings, version)
@@ -1861,7 +1924,7 @@ class Indexer:
             for item, _ in batch:
                 self._release(item["id"])
             raise
-        for item, frames in batch:
+        for item, _frames in batch:
             res = results[item["id"]]
             if isinstance(res, str):
                 self.store.fail(item["id"], res)
@@ -1869,7 +1932,7 @@ class Indexer:
                 continue
             self.store.save_raw(item["id"], res)
             item["raw"] = res
-            self._submit_finish(item, frames, settings, version)
+            self._submit_finish(item, settings, version)
 
     def _tag_halving(self, batch: list) -> dict:
         """Tag a batch; when the card is out of memory, halve the batch size (for this session) and retry."""
@@ -1886,17 +1949,17 @@ class Indexer:
             return out
 
     # ---- the VLM / write-back stage
-    def _submit_finish(self, item: dict, frames, settings: dict, version: int) -> None:
+    def _submit_finish(self, item: dict, settings: dict, version: int) -> None:
         item["_handed"] = True
-        fut = self._vlmpool.submit(self._finish, item, frames, settings, version)
+        fut = self._vlmpool.submit(self._finish, item, settings, version)
         with self._flight_lock:
             self._pending.add(fut)
 
-    def _finish(self, item: dict, frames, settings: dict, version: int) -> None:
+    def _finish(self, item: dict, settings: dict, version: int) -> None:
         try:
             # "describe" with describe switched off was done as a retag: that is all there is to do, so it is done
             covers = item["asked"] if item["asked"] == "describe" and item["mode"] == "retag" else item["mode"]
-            self.pipe.process(item, item["mode"], item["raw"], frames, settings, version, covers)
+            self.pipe.process(item, item["mode"], item["raw"], settings, version, covers)
             self.done_times.append((self.clock(), 1))
             with self._flight_lock:
                 self._done += 1
