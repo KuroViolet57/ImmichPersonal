@@ -55,6 +55,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -149,6 +150,11 @@ fun VideoPage(
     var poke by remember { mutableIntStateOf(0) }
     var scrub by remember { mutableStateOf<Long?>(null) }       // press, hold, then slide: where it will seek to
     var scrubFrom by remember { mutableLongStateOf(0L) }
+    // The gesture handlers below are set up once per video (keyed on the player), so they must read the
+    // controls' visibility through these. Reading the `chrome` parameter directly froze the value from when
+    // the video opened, so a tap could only ever hide the controls (or, on the next video, only show them).
+    val chromeNow by rememberUpdatedState(chrome)
+    val setChromeNow by rememberUpdatedState(setChrome)
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
@@ -189,6 +195,7 @@ fun VideoPage(
         if (chrome && playing) {
             delay(3500)
             setChrome(false)
+            probe.ui("controls hidden after 3.5 s")
         }
     }
     LaunchedEffect(flashKey) {
@@ -223,18 +230,29 @@ fun VideoPage(
         Box(
             Modifier.fillMaxSize().pointerInput(player) {
                 detectTapGestures(
-                    onTap = { setChrome(!chrome); poke++ },
+                    onTap = {
+                        val show = !chromeNow
+                        setChromeNow(show)
+                        poke++
+                        probe.ui("tap → controls ${if (show) "shown" else "hidden"}")
+                    },
                     onDoubleTap = { o ->
                         val third = size.width / 3f
                         when {
-                            o.x < third -> seek(-10, -1)
-                            o.x > 2 * third -> seek(10, 1)
-                            else -> { if (player.isPlaying) player.pause() else player.play(); flash = (if (player.isPlaying) "▶" else "❚❚") to 0; flashKey++ }
+                            o.x < third -> { probe.ui("double-tap left → −10 s"); seek(-10, -1) }
+                            o.x > 2 * third -> { probe.ui("double-tap right → +10 s"); seek(10, 1) }
+                            else -> {
+                                val pause = player.playWhenReady
+                                if (pause) player.pause() else player.play()
+                                probe.ui("double-tap middle → ${if (pause) "pause" else "play"}")
+                                flash = (if (pause) "❚❚" else "▶") to 0; flashKey++
+                            }
                         }
                     },
                     onLongPress = {
                         holding = true
                         player.setPlaybackSpeed(2f)
+                        probe.ui("hold → 2×")
                     },
                     onPress = {
                         tryAwaitRelease()

@@ -108,6 +108,14 @@ class OrganizerHandler(BaseHTTPRequestHandler):
         if self.verbose:
             super().log_message(fmt, *args)
 
+    def handle_one_request(self) -> None:
+        # The phone often drops a kept-alive connection (Tailscale/Wi-Fi changes, the app closing a video).
+        # That is not an error worth a traceback in the journal; just stop serving this connection.
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+
     def _send(self, status: int, payload: bytes, content_type: str, *, cache: str = "no-store") -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)

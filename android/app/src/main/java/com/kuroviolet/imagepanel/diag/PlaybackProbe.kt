@@ -91,6 +91,9 @@ class PlaybackProbe(private val context: Context, private val asset: Asset) {
         Diag.i(tag, "▶ $id open “${asset.name}” (${asset.id}) · panel ${panelLine()} · ${networkLine(context)}")
     }
 
+    /** A user action on the player (tap, double-tap, hold), so gesture problems show up in the log too. */
+    fun ui(action: String) = Diag.i(tag, "$id $action")
+
     /** Call once a second from the player screen: writes a progress line every 5 s while playing or stalled. */
     fun tick() {
         val p = player ?: return
