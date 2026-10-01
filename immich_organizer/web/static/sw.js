@@ -1,7 +1,7 @@
 /* Caches the app shell so the UI opens instantly and survives a brief
    network blip. Data requests are never cached -- album contents and search
    results must always come from the live server. */
-const CACHE = "immich-organizer-v26";
+const CACHE = "immich-organizer-v27";
 const SHELL = ["/", "/static/styles.css", "/static/app.js", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
