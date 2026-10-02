@@ -1,8 +1,8 @@
 """AI Tagger: tags every photo and video, and writes the result into the asset's Immich description.
 
-Image taggers (WD EVA02, PixAI v1.0 and, once it is chosen, a third; all Danbooru-style or compatible: illustration /
-anime, people, clothing, characters, series) say what is in the picture. The registry ``TAGGERS`` lists them; everything
-that used to be hard-wired to two taggers loops over it. The result is only tags: a managed ``[AI Tagger]`` block inside
+Image taggers (WD EVA02 and PixAI v1.0, both Danbooru-style: illustration / anime, people, clothing, characters, series;
+and RAM++, plain-English photo tags) say what is in the picture. The registry ``TAGGERS`` lists them; everything that
+used to be hard-wired to two taggers loops over it. The result is only tags: a managed ``[AI Tagger]`` block inside
 the Immich description (``Tags: a, b, c``); the owner's own text is never changed. Contract: ``docs/AI-TAGGER.md`` (its
 v3 section is binding).
 
@@ -236,7 +236,7 @@ def configure_taggers(kinds=None) -> None:
     """Make ``kinds`` the registry (or, with None, just rebuild the tables from ``TAGGERS``) and generate from it:
     the ``use_<key>`` / ``<key>_strictness`` settings with ``DEFAULTS``, ``LIMITS``, ``CONTENT`` and ``REPROCESS``
     (``use_*`` need a ``full`` reprocess, ``*_strictness`` a ``retag``). The panel calls this once, at import; tests use
-    it to add a fake third tagger."""
+    it to add (and remove) a fake fourth tagger."""
     global CONTENT
     if kinds is not None:
         kinds = list(kinds)
@@ -425,6 +425,25 @@ def _mean_scores(series: list[dict]) -> dict[str, float]:
     return {name: sum(float(cap.get(name, 0.0)) for cap in series) / len(series) for name in names}
 
 
+def _by_category(kind: TaggerKind, data) -> dict:
+    """One capture's stored scores of ``kind`` as ``{category: {tag: score}}``. The v1 service stored RAM++ flat
+    (``{tag: score}``, no category level); a tagger with one category answered like that is read as that category,
+    so such a row can't be taken for "no tags" (or, with a tag called like a category, crash)."""
+    if not isinstance(data, dict):
+        return {}
+    if len(kind.categories) == 1 and any(isinstance(v, (int, float)) for v in data.values()):
+        return {kind.categories[0]: data}
+    return data
+
+
+def _rating_by_kind(entry: dict) -> dict:
+    """One capture's stored rating as ``{key: {rating: probability}}``. The v1 service stored WD's alone, flat
+    (``{rating: probability}``)."""
+    if any(isinstance(v, (int, float)) for v in entry.values()):
+        return {"wd": entry}
+    return entry
+
+
 def _merged(data: dict, categories: tuple[str, ...]) -> dict[str, float]:
     """One capture's scores for these categories as one dict (a tag in two categories keeps the higher score)."""
     out: dict[str, float] = {}
@@ -473,12 +492,13 @@ def detect(raw: dict, settings: dict) -> dict:
     for kind in enabled_kinds(settings):
         # `character_tags` gates what a tagger names as characters and series (its character categories)
         wanted = tuple(c for c in kind.categories if settings["character_tags"] or c not in kind.character_categories)
-        series = [_merged(cap[kind.key], wanted) for cap in caps if cap and cap.get(kind.key) is not None]
+        series = [_merged(_by_category(kind, cap[kind.key]), wanted)
+                  for cap in caps if cap and cap.get(kind.key) is not None]
         if series:
             show(kind.key, _per_tag(series), settings[kind.key + "_strictness"], kind.noise)
     # The rating: each tagger's probabilities averaged over the captures, then the mean of the enabled taggers that
     # report one (one alone if only one does), then the best. The tag's source is the tagger surest of the winner.
-    ratings = [r for r in raw.get("ratings") or [] if isinstance(r, dict)]
+    ratings = [_rating_by_kind(r) for r in raw.get("ratings") or [] if isinstance(r, dict)]
     parts: dict[str, dict[str, float]] = {}
     for kind in enabled_kinds(settings):
         if kind.has_rating:
@@ -1341,7 +1361,8 @@ def raw_from_results(results: list, errors: list) -> dict | str:
             data = r.get(kind.key)
             if data is not None:
                 models.add(kind.key)
-            entry[kind.key] = None if data is None else {c: data.get(c) or {} for c in kind.categories}
+            by_category = _by_category(kind, data)
+            entry[kind.key] = None if data is None else {c: by_category.get(c) or {} for c in kind.categories}
             rating[kind.key] = ((data or {}).get("rating") or None) if kind.has_rating else None
         scores.append(entry)
         ratings.append(rating if any(rating.values()) else None)

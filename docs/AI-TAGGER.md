@@ -77,8 +77,19 @@ What the panel should know about it:
   "both WD and PixAI found it", whether RAM++ is on or off. A third voter that did name such tags (JoyTag) was tested
   and was worse, see below.
 - **A little noise at 0.5.** Over 240 previews, 7 words make 4.3% of its output without describing anything:
-  `image`, `catch`, `peak`, `miss`, `take`, `wear`, `label`. Put them in `blocked` (or ship them as default blocked
-  words); `stand`, `sit` and `lay` are true but vague.
+  `image`, `catch`, `peak`, `miss`, `take`, `wear`, `label`. They are the registry entry's `noise`: the panel never
+  keeps one of them as a tag and never lists it on the Test card, whatever its score (it is compared after the name is
+  normalised; the same word from WD or PixAI is a tag like any other). The stored scores keep them, so the filter
+  applies when the tags are made, and a change to the list reaches stored results with a `retag`. `stand`, `sit` and
+  `lay` are true but vague, and are kept.
+- **Old rows.** The v1 service stored RAM++ flat (`"ram": {tag: score}`, no category level) and WD's rating flat
+  (`ratings[i]` = `{rating: probability}`, not under a tagger's key), and such rows may still be in the store. They have
+  no `pixai` entry, so with `use_pixai` on a `retag` of them runs as `full` (the v2 rule) and the row is replaced by one
+  in today's shape. With `use_pixai` off the stored scores are used, and they are read as `{"general": {...}}` and
+  `{"wd": {...}}` (before this was fixed they were read as "no RAM++ tags" and "no rating", which also switched the
+  explicit-tag check off; a RAM++ tag called `general` even crashed it). Nothing is rewritten in place. A v1 settings
+  file loads again with its `use_ram` / `ram_strictness`; a stored `vram_gb` outside 4-8 (v1: 18-21, v2: 3) falls back to
+  the default 5.
 - It is by far the fastest of the three, so it never becomes the bottleneck.
 
 Changes to the service that came with it:

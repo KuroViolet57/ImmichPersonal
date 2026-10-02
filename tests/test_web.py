@@ -1303,7 +1303,9 @@ class TestAiTagger(WebCase):
         self.assertEqual(data["settings"], self.at.DEFAULTS)
         self.assertEqual(data["limits"], {"video_frames": [1, 8], "batch_size": [1, 64],
                                           "vram_gb": list(self.at.VRAM_GB_LIMITS), "wd_strictness": [0.05, 0.95],
-                                          "pixai_strictness": [0.05, 0.95], "max_tags": [5, 100]})
+                                          "pixai_strictness": [0.05, 0.95], "ram_strictness": [0.05, 0.95],
+                                          "max_tags": [5, 100]})
+        self.assertEqual(data["limits"]["vram_gb"], [4, 8])                              # three taggers: 4-8 GB
         for gone in ("describe", "instructions", "language", "vlm_parallel"):       # the describer's settings are gone
             self.assertNotIn(gone, data["settings"])
             self.assertNotIn(gone, data["limits"])
@@ -1320,13 +1322,17 @@ class TestAiTagger(WebCase):
         self.assertIs(data["service"]["exclusive"], False)                      # shipped: they share the card
         with mock.patch.object(self.sp, "AITAGGER_EXCLUSIVE", False):
             self.assertIs(self.get("/api/aitagger")["service"]["exclusive"], False)
-        self.assertEqual(data["models"], {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0"})
-        self.assertEqual(list(data["models"]), ["wd", "pixai"])                         # in registry order
+        self.assertEqual(data["models"], {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0",
+                                          "ram": "RAM++ (swin-large)"})
+        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram"])                  # in registry order
+        self.assertEqual((data["settings"]["use_ram"], data["settings"]["ram_strictness"]), (True, 0.5))
         self.assertEqual(data["failures"], [])
         self.assertEqual(set(data["reprocessKeys"]), {"retag", "full"})
         self.assertIn("rules", data["reprocessKeys"]["retag"])
         self.assertIn("vocabulary", data["reprocessKeys"]["retag"])
-        self.assertEqual(sorted(data["reprocessKeys"]["full"]), ["use_pixai", "use_wd", "video_frames"])
+        self.assertEqual(sorted(data["reprocessKeys"]["full"]), ["use_pixai", "use_ram", "use_wd", "video_frames"])
+        self.assertEqual(sorted(k for k in data["reprocessKeys"]["retag"] if k.endswith("_strictness")),
+                         ["pixai_strictness", "ram_strictness", "wd_strictness"])
 
     def test_every_tagger_in_the_status_has_its_settings_and_limits(self):
         data = self.get("/api/aitagger")
@@ -1337,10 +1343,10 @@ class TestAiTagger(WebCase):
             self.assertIn(f"use_{key}", data["reprocessKeys"]["full"])
             self.assertIn(f"{key}_strictness", data["reprocessKeys"]["retag"])
 
-    def test_a_third_tagger_appears_in_the_status_and_works_through_the_routes(self):
+    def test_a_fourth_tagger_appears_in_the_status_and_works_through_the_routes(self):
         self.t.with_extra(self)
         data = self.get("/api/aitagger")
-        self.assertEqual(list(data["models"]), ["wd", "pixai", "extra"])
+        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram", "extra"])
         self.assertEqual(data["models"]["extra"], "extra-tagger-test")
         self.assertEqual((data["settings"]["use_extra"], data["settings"]["extra_strictness"]), (False, 0.5))
         self.assertEqual(data["limits"]["extra_strictness"], [0.05, 0.95])
@@ -1354,10 +1360,38 @@ class TestAiTagger(WebCase):
         self.assertEqual((data["changed"], data["suggest"]), (["extra_strictness"], "retag"))
         self.catalog[0]["preview"] = self.t.PHOTO + "|extra:lake=0.9,wave=0.3|erating:general=0.9"
         got = self.post("preview", {"id": self.ids[0]})
-        self.assertEqual(set(got["models"]), {"wd", "pixai", "extra", "rating"})
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "extra", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["extra"]}, {"lake": True, "wave": False})
-        self.assertEqual(self.services.tag_models, [["wd", "pixai", "extra"]])
+        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram", "extra"]])
         self.assertEqual({t["tag"]: t["source"] for t in got["tags"]}["lake"], "extra")
+
+    def test_the_fourth_tagger_is_gone_from_the_status_when_it_is_removed_again(self):
+        saved = list(self.at.TAGGERS)
+        self.addCleanup(self.at.configure_taggers, saved)
+        self.at.configure_taggers([*saved, self.t.EXTRA])
+        self.assertIn("extra", self.get("/api/aitagger")["models"])
+        self.at.configure_taggers(saved)
+        data = self.get("/api/aitagger")
+        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram"])
+        self.assertNotIn("use_extra", data["settings"])
+        self.refused(lambda: self.post("settings", {"changes": {"use_extra": True}}), 400)
+
+    def test_ram_works_through_the_routes_and_its_noise_stays_out(self):
+        self.catalog[0]["preview"] = self.t.RAM_PHOTO
+        got = self.post("preview", {"id": self.ids[0]})
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "rating"})
+        self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["ram"]},
+                         {"sea": True, "lake": True, "screenshot": True, "wave": False})        # no "image", no "catch"
+        sources = {t["tag"]: t["source"] for t in got["tags"]}
+        self.assertEqual((sources["lake"], sources["screenshot"], sources["sea"]), ("ram", "ram", "ram"))
+        self.assertNotIn("image", sources)
+        self.assertNotIn("catch", sources)
+        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram"]])
+        data = self.post("settings", {"changes": {"use_ram": False}})
+        self.assertEqual((data["changed"], data["suggest"]), (["use_ram"], "full"))
+        got = self.post("preview", {"id": self.ids[0]})
+        self.assertEqual((got["models"]["ram"], self.services.tag_models[-1]), ([], ["wd", "pixai"]))
+        self.assertNotIn("lake", {t["tag"] for t in got["tags"]})
 
     def test_tagging_everything_through_the_routes(self):
         self.build()
@@ -1382,7 +1416,8 @@ class TestAiTagger(WebCase):
         self.assertEqual((data["settingsVersion"], data["settings"]["indexing"], data["suggest"]), (2, False, "none"))
         self.assertEqual(self.get("/api/aitagger")["settings"]["max_tags"], 12)
         for changes in ({"max_tags": 3}, {"video_frames": "6"}, {"wd_strictness": 2}, {"nope": 1},
-                        {"use_ram": True}, {"ram_strictness": 0.5}, {"pixai_strictness": 2}, {"use_pixai": "yes"},
+                        {"use_ram": "yes"}, {"ram_strictness": 2}, {"ram_strictness": "0.5"}, {"pixai_strictness": 2},
+                        {"use_pixai": "yes"},
                         {"vram_gb": self.at.VRAM_GB_LIMITS[1] + 1},
                         {"rules": [{"if_all": ["a"]}]}, {"vocabulary": 5}):
             self.refused(lambda: self.post("settings", {"changes": changes}), 400)
@@ -1397,6 +1432,12 @@ class TestAiTagger(WebCase):
         data = self.post("settings", {"changes": {"use_pixai": False, "pixai_strictness": 0.7}})
         self.assertEqual((data["settings"]["use_pixai"], data["settings"]["pixai_strictness"]), (False, 0.7))
         self.assertEqual((sorted(data["changed"]), data["suggest"]), (["pixai_strictness", "use_pixai"], "full"))
+        # RAM++'s settings (a v1 app sent them, and they are valid again) are accepted and checked like the others
+        data = self.post("settings", {"changes": {"use_ram": False, "ram_strictness": 0.7}})
+        self.assertEqual((data["settings"]["use_ram"], data["settings"]["ram_strictness"]), (False, 0.7))
+        self.assertEqual((sorted(data["changed"]), data["suggest"]), (["ram_strictness", "use_ram"], "full"))
+        data = self.post("settings", {"changes": {"ram_strictness": 0.6}})
+        self.assertEqual((data["changed"], data["suggest"]), (["ram_strictness"], "retag"))
 
     def test_settings_can_reprocess_the_old_results(self):
         self.build(pause=True)
@@ -1458,8 +1499,9 @@ class TestAiTagger(WebCase):
                          (self.ids[0], "IMG_0000.jpg", "IMAGE", 1, False))
         self.assertEqual(set(data), {"id", "name", "type", "captures", "frames", "models", "rules", "tags",
                                      "block", "currentDescription", "newDescription", "written"})     # no describer section
-        self.assertEqual(set(data["models"]), {"wd", "pixai", "rating"})
+        self.assertEqual(set(data["models"]), {"wd", "pixai", "ram", "rating"})
         self.assertEqual({t["tag"] for t in data["models"]["pixai"]}, {"beach", "sea", "wave"})
+        self.assertEqual(data["models"]["ram"], [])                                          # PHOTO: nothing for RAM++
         self.assertEqual(data["block"], "[AI Tagger]\nTags: girl, beach, miku, solo, sea, rating: general\n[/AI Tagger]")
         self.assertEqual(data["tags"][0], {"tag": "girl", "score": 0.9, "source": "wd"})
         self.assertEqual(data["currentDescription"], "")
