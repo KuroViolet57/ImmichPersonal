@@ -5,29 +5,37 @@ indexes the library; everything else (settings, aggregation, the language model,
 the panel.
 
     GET  /health   -> {"status": "loading" | "ok" | "error", "error": null, "device": "cuda", "vramCapGb": 5,
-                       "batch": 16, "models": [{"name", "kind", "tags", "precision", "loadedIn"}, ...],
+                       "batch": 16, "effectiveBatch": {"wd": 8, "pixai": 16},
+                       "models": [{"name", "kind", "tags", "precision", "loadedIn"}, ...],
                        "idleExitMinutes": 20, "idleSeconds": 12, "busy": 0}
     POST /tag      {"images": [<base64 jpeg/png>, ...], "floor": 0.05}      (at most 64 images)
                    -> {"results": [{"wd": {"general": {tag: score}, "character": {tag: score},
                                            "rating": {"general": p, "sensitive": p, "questionable": p, "explicit": p}},
-                                    "ram": {tag: score}} | null, ...],
+                                    "pixai": {"general": {tag: score}, "character": {tag: score},
+                                              "copyright": {tag: score},
+                                              "rating": {"general": p, "sensitive": p, "questionable": p,
+                                                         "explicit": p}}} | null, ...],
                        "errors": [null | "why", ...], "tookMs": 412}
 
 The two models:
   * WD EVA02-Large Tagger v3 (SmilingWolf, Apache-2.0): 10,861 Danbooru tags, run with onnxruntime. Input is
     448x448, NHWC, BGR, float32 0-255, the picture padded to a white square (the layout of the reference
     implementation at huggingface.co/spaces/SmilingWolf/wd-tagger).
-  * RAM++ (Recognize Anything Plus, xinyu1205, Apache-2.0): 4,585 plain-English tags, run with PyTorch fp16.
-    The tagging code below is adapted from https://github.com/xinyu1205/recognize-anything (ram/models/ram_plus.py,
-    Apache-2.0, (c) the authors). Only the Swin-L backbone source is taken from that repository, at build time
-    (see deploy/aitagger/Dockerfile); the official package is not installed because its pins no longer resolve.
+  * PixAI Tagger v1.0 (pixai-labs, Apache-2.0): 30,877 Danbooru-style tags (general, character, copyright, style,
+    meta, rating), a ViTDet/SAM3 backbone with 486M parameters, run with PyTorch bf16 and SDPA attention. The model
+    code is the repository's own (transformers trust_remote_code, one pinned revision, downloaded to the cache on the
+    first start). Preprocessing is the repository's RescalePadProcessor, reproduced on the GPU: the RGB picture
+    (transparency flattened onto white) is scaled by r = min(1008/h, 1008/w) to (int(h*r), int(w*r)) with bilinear
+    interpolation and antialiasing (torchvision's tensor resize), centred on a black 1008x1008 canvas, and normalised
+    with mean 0.5 / std 0.5. `style` (artists) and `meta` tags are not returned.
 
 Scores are calibrated so that 0.5 is each model's own recommended threshold for that tag:
-s' = sigmoid(logit(s) - logit(t)), with t = 0.35 for WD general tags, 0.75 for WD character tags and RAM++'s
-shipped per-class threshold for RAM++ tags. Only tags with s' >= floor are returned. The WD rating is the model's
-raw probability for each rating. Tag names are model-native (WD keeps its underscores).
+s' = sigmoid(logit(s) - logit(t)), with t = 0.35 for WD general tags, 0.75 for WD character tags and, for PixAI, the
+model card's 0.17 (general), 0.27 (character) and 0.24 (copyright). Only tags with s' >= floor are returned. The
+`rating` of both models is the raw probability for each rating (PixAI's rating:g/s/q/e are named general, sensitive,
+questionable, explicit, like WD's, so the panel can average them). Tag names are model-native (underscores kept).
 
-Optional extra request field: "models": ["wd"] or ["ram"] runs only that model (default: both).
+Optional extra request field: "models": ["wd"] or ["pixai"] runs only that model (default: both).
 
 The server answers /health at once while the models load in the background (503 on /tag until they are ready).
 One GPU thread runs everything, fed by a queue, so concurrent requests never fight over the GPU. A picture that
@@ -36,9 +44,10 @@ and retries (and lowers the micro-batch for the rest of the session); a picture 
 as an error containing "out of memory".
 
 Environment: AITAGGER_VRAM_GB (memory cap for this process, default 5), AITAGGER_BATCH (GPU micro-batch,
-default 16), IDLE_EXIT_MINUTES (default 20; the server exits after that long without a request, never while one is
-in flight, which stops the container and frees the GPU), WD_MODEL / RAM_MODEL (Hugging Face repos or local
-directories), AITAGGER_CACHE (model files, default /cache), AITAGGER_DEVICE (default cuda; cpu is for tests).
+default 8), IDLE_EXIT_MINUTES (default 20; the server exits after that long without a request, never while one is
+in flight, which stops the container and frees the GPU), WD_MODEL / PIXAI_MODEL (Hugging Face repos or local
+directories), PIXAI_REVISION (the pinned commit of the PixAI repo), PIXAI_PRECISION (bf16 default, fp16 or fp32),
+AITAGGER_CACHE (model files, default /cache), AITAGGER_DEVICE (default cuda; cpu is for tests).
 """
 
 from __future__ import annotations
@@ -48,10 +57,8 @@ import binascii
 import csv
 import io
 import json
-import math
 import os
 import queue
-import re
 import signal
 import sys
 import threading
@@ -71,24 +78,29 @@ Image.MAX_IMAGE_PIXELS = None
 CACHE = Path(os.environ.get("AITAGGER_CACHE", "/cache"))
 DEVICE = os.environ.get("AITAGGER_DEVICE", "cuda")
 VRAM_GB = float(os.environ.get("AITAGGER_VRAM_GB", "5"))
-MAX_BATCH = max(1, int(os.environ.get("AITAGGER_BATCH", "16")))
+MAX_BATCH = max(1, int(os.environ.get("AITAGGER_BATCH", "8")))   # PixAI is compute-bound: more only costs memory
 IDLE_EXIT_MINUTES = float(os.environ.get("IDLE_EXIT_MINUTES", "20"))
 WD_MODEL = os.environ.get("WD_MODEL", "SmilingWolf/wd-eva02-large-tagger-v3")
-RAM_MODEL = os.environ.get("RAM_MODEL", "xinyu1205/recognize-anything-plus-model")
-RAM_FILE = os.environ.get("RAM_FILE", "ram_plus_swin_large_14m.pth")
-RAM_CODE = Path(os.environ.get("RAM_CODE", "/opt/ram"))      # swin_transformer.py + tag list, fetched at image build
+PIXAI_MODEL = os.environ.get("PIXAI_MODEL", "pixai-labs/pixai-tagger-v1.0")
+# One pinned commit of the PixAI repo: its weights AND the model code that trust_remote_code runs.
+PIXAI_REVISION = os.environ.get("PIXAI_REVISION", "9fe10addf9326e292da8a85a98ea74cd91b41771")
+PIXAI_PRECISION = os.environ.get("PIXAI_PRECISION", "fp16")  # fp16: as fast as bf16 and much closer to fp32 (measured)
 WD_PRECISION = os.environ.get("WD_PRECISION", "fp16")        # fp16: the ONNX model is converted once (cached)
 CONTEXT_GB = 0.5                 # CUDA context and library workspaces: not counted by either allocator
-ORT_SHARE = 0.5                  # share of the rest of the VRAM cap given to onnxruntime (WD); the rest is torch's
+WD_ARENA_GB = 1.6                # onnxruntime's arena for WD at a micro-batch of 8 (1.5 GB works, 1.2 GB fails; fp16)
+ORT_SHARE = 0.4                  # ... but never more than this share of the VRAM cap; the rest is PyTorch's (PixAI)
 WD_BATCH = 8                     # onnxruntime gains nothing from bigger WD batches (measured on an RTX 4090)
 
 MAX_IMAGES = 64
 MAX_BODY = 512 * 1024 * 1024
+MODEL_NAMES = ("wd", "pixai")
 WD_GENERAL_T, WD_CHARACTER_T = 0.35, 0.75    # the models' recommended thresholds (wd-tagger reference)
 WD_CATEGORY_GENERAL, WD_CATEGORY_CHARACTER, WD_CATEGORY_RATING = 0, 4, 9
-RAM_SIZE = 384
-RAM_CLASSES, RAM_DESCRIPTIONS, RAM_WIDTH = 4585, 51, 512
-RAM_MEAN, RAM_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+# PixAI Tagger v1.0 model card, "Recommended thresholds" (per-category macro-F1 settings). style / meta: not used.
+PIXAI_THRESHOLDS = {"general": 0.17, "character": 0.27, "copyright": 0.24}
+PIXAI_RATING_NAMES = {"rating:g": "general", "rating:s": "sensitive", "rating:q": "questionable",
+                      "rating:e": "explicit"}                # named like WD's ratings so the panel can average them
+PIXAI_FILES = ("config.json", "preprocessor_config.json", "tagger_pipeline.py", "model.safetensors")
 
 
 def _cuda() -> bool:
@@ -114,7 +126,7 @@ def _is_oom(exc: BaseException) -> bool:
                                     "memory allocation", "bad_alloc", "cuda failure 2"))
 
 
-def _fetch(source: str, filename: str) -> Path:
+def _fetch(source: str, filename: str, revision: str | None = None) -> Path:
     """A model file from a local directory, else from the Hugging Face cache under CACHE (downloaded once)."""
     local = Path(source)
     if local.is_dir():
@@ -122,10 +134,10 @@ def _fetch(source: str, filename: str) -> Path:
     from huggingface_hub import hf_hub_download
     cache_dir = str(CACHE / "hub")
     try:
-        return Path(hf_hub_download(source, filename, cache_dir=cache_dir, local_files_only=True))
+        return Path(hf_hub_download(source, filename, revision=revision, cache_dir=cache_dir, local_files_only=True))
     except Exception:  # noqa: BLE001 - not downloaded yet
         _log(f"downloading {source}/{filename} (first start only)")
-        return Path(hf_hub_download(source, filename, cache_dir=cache_dir))
+        return Path(hf_hub_download(source, filename, revision=revision, cache_dir=cache_dir))
 
 
 def _wd_file(fp32: Path):
@@ -154,121 +166,6 @@ def _wd_file(fp32: Path):
         return fp32, "fp32"
 
 
-# --------------------------------------------------------------------------- RAM++ (adapted from the official repo)
-_RAM_CLASS = None
-
-
-def _ram_class():
-    """The RAM++ inference network, built on first use (torch is imported lazily so this file imports without it)."""
-    global _RAM_CLASS
-    if _RAM_CLASS is not None:
-        return _RAM_CLASS
-    import importlib.util
-
-    import torch
-    import torch.nn.functional as F
-    from torch import nn
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")      # timm.models.layers is a deprecated alias in timm 1.x
-        spec = importlib.util.spec_from_file_location("ram_swin_transformer", RAM_CODE / "swin_transformer.py")
-        swin = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = swin
-        spec.loader.exec_module(swin)
-
-    class CrossLayer(nn.Module):
-        """One layer of RAM++'s tagging head: cross-attention (tags attend to the picture) + feed-forward.
-        The BERT self-attention is removed in the released model ("tagging" mode), so only these weights exist."""
-
-        def __init__(self, hidden=768, enc=RAM_WIDTH, heads=4, inner=3072):
-            super().__init__()
-            self.heads = heads
-            self.q, self.k, self.v = nn.Linear(hidden, hidden), nn.Linear(enc, hidden), nn.Linear(enc, hidden)
-            self.o, self.ln1 = nn.Linear(hidden, hidden), nn.LayerNorm(hidden, eps=1e-12)
-            self.fc1, self.fc2 = nn.Linear(hidden, inner), nn.Linear(inner, hidden)
-            self.ln2 = nn.LayerNorm(hidden, eps=1e-12)
-
-        def forward(self, x, picture):
-            b, n, _ = x.shape
-            m = picture.shape[1]
-            h = self.heads
-            q = self.q(x).view(b, n, h, -1).transpose(1, 2)
-            k = self.k(picture).view(b, m, h, -1).transpose(1, 2)
-            v = self.v(picture).view(b, m, h, -1).transpose(1, 2)
-            a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, n, -1)
-            x = self.ln1(self.o(a) + x)
-            return self.ln2(self.fc2(F.gelu(self.fc1(x))) + x)
-
-    class RamPlus(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.visual_encoder = swin.SwinTransformer(
-                img_size=RAM_SIZE, patch_size=4, in_chans=3, embed_dim=192, depths=[2, 2, 18, 2],
-                num_heads=[6, 12, 24, 48], window_size=12, mlp_ratio=4.0, qkv_bias=True, drop_rate=0.0,
-                drop_path_rate=0.0, ape=False, patch_norm=True, use_checkpoint=False)
-            self.image_proj = nn.Linear(1536, RAM_WIDTH)
-            self.label_embed = nn.Parameter(torch.zeros(RAM_CLASSES * RAM_DESCRIPTIONS, RAM_WIDTH))
-            self.reweight_scale = nn.Parameter(torch.ones(()) * math.log(1 / 0.07))   # not in the checkpoint
-            self.wordvec_proj = nn.Linear(RAM_WIDTH, 768)
-            self.layers = nn.ModuleList([CrossLayer(), CrossLayer()])
-            self.fc = nn.Linear(768, 1)
-
-        def forward(self, x):
-            """x: normalised (B, 3, 384, 384). Returns the raw tag logits (B, 4585) as float32."""
-            feats = self.image_proj(self.visual_encoder(x))                      # (B, 145, 512): class token + 144
-            cls = F.normalize(feats[:, 0, :].float(), dim=-1)
-            sim = (cls.to(self.label_embed.dtype) @ self.label_embed.t()).float() * self.reweight_scale.float().exp()
-            weights = F.softmax(sim.view(x.shape[0], RAM_CLASSES, RAM_DESCRIPTIONS), dim=2)
-            labels = self.label_embed.view(RAM_CLASSES, RAM_DESCRIPTIONS, RAM_WIDTH)
-            labels = torch.einsum("bcd,cdk->bck", weights.to(labels.dtype), labels)   # per-picture tag queries
-            h = F.relu(self.wordvec_proj(labels))
-            for layer in self.layers:
-                h = layer(h, feats)
-            return self.fc(h).squeeze(-1).float()
-
-    _RAM_CLASS = RamPlus
-    return RamPlus
-
-
-_QKV = {"query": "q", "key": "k", "value": "v"}
-_RAM_KEY_MAP = [
-    (re.compile(r"^tagging_head\.encoder\.layer\.(\d+)\.crossattention\.self\.(query|key|value)\.(weight|bias)$"),
-     lambda m: f"layers.{m[1]}.{_QKV[m[2]]}.{m[3]}"),
-    (re.compile(r"^tagging_head\.encoder\.layer\.(\d+)\.crossattention\.output\.dense\.(weight|bias)$"),
-     lambda m: f"layers.{m[1]}.o.{m[2]}"),
-    (re.compile(r"^tagging_head\.encoder\.layer\.(\d+)\.crossattention\.output\.LayerNorm\.(weight|bias)$"),
-     lambda m: f"layers.{m[1]}.ln1.{m[2]}"),
-    (re.compile(r"^tagging_head\.encoder\.layer\.(\d+)\.intermediate\.dense\.(weight|bias)$"),
-     lambda m: f"layers.{m[1]}.fc1.{m[2]}"),
-    (re.compile(r"^tagging_head\.encoder\.layer\.(\d+)\.output\.dense\.(weight|bias)$"),
-     lambda m: f"layers.{m[1]}.fc2.{m[2]}"),
-    (re.compile(r"^tagging_head\.encoder\.layer\.(\d+)\.output\.LayerNorm\.(weight|bias)$"),
-     lambda m: f"layers.{m[1]}.ln2.{m[2]}"),
-]
-
-
-def _ram_state(checkpoint: dict) -> dict:
-    """Map the official checkpoint's names onto RamPlus. Self-attention, embeddings and the Swin buffers that are
-    rebuilt at construction time (relative_position_index, attn_mask) are dropped, as the official loader does."""
-    state = checkpoint.get("model", checkpoint)
-    out = {}
-    for key, value in state.items():
-        key = key.replace("vision_multi", "tagging_head")
-        if "relative_position_index" in key or "attn_mask" in key:
-            continue
-        if key.startswith("tagging_head."):
-            for pattern, to in _RAM_KEY_MAP:
-                m = pattern.match(key)
-                if m:
-                    out[to(m)] = value
-                    break
-            continue                                    # tagging_head.embeddings / .attention are unused
-        if key.startswith(("visual_encoder.", "image_proj.", "wordvec_proj.", "fc.")) or key in ("label_embed",
-                                                                                                    "reweight_scale"):
-            out[key] = value
-    return out
-
-
 # --------------------------------------------------------------------------- the engine
 class Job:
     __slots__ = ("inputs", "errors", "models", "floor")
@@ -287,8 +184,8 @@ class Tagger:
         self.last_used = time.monotonic()
         self.busy = 0
         self._lock = threading.Lock()
-        self.batch = {"wd": min(MAX_BATCH, WD_BATCH), "ram": MAX_BATCH}     # lowered by CUDA out-of-memory answers
-        self.wd = self.ram = None
+        self.batch = {"wd": min(MAX_BATCH, WD_BATCH), "pixai": MAX_BATCH}   # lowered by CUDA out-of-memory answers
+        self.wd = self.pixai = None
         threading.Thread(target=self._load_then_serve, daemon=True).start()
 
     # ---- bookkeeping
@@ -307,11 +204,13 @@ class Tagger:
 
     # ---- loading
     def _vram_split(self):
-        """(onnxruntime arena bytes, torch fraction of the whole GPU) from the AITAGGER_VRAM_GB cap."""
+        """(onnxruntime arena bytes, torch fraction of the whole GPU) from the AITAGGER_VRAM_GB cap: WD gets the
+        arena it needs at a micro-batch of 8 (WD_ARENA_GB, or ORT_SHARE of the cap if that is smaller), PixAI the rest."""
         import torch
         total = torch.cuda.get_device_properties(0).total_memory
         usable = max(1.0, VRAM_GB - CONTEXT_GB) * 1024 ** 3
-        return int(usable * ORT_SHARE), min(1.0, usable * (1 - ORT_SHARE) / total)
+        ort = min(WD_ARENA_GB * 1024 ** 3, usable * ORT_SHARE)
+        return int(ort), min(1.0, (usable - ort) / total)
 
     def _load_wd(self, ort_limit: int) -> dict:
         started = time.monotonic()
@@ -358,43 +257,68 @@ class Tagger:
         return {"name": Path(WD_MODEL).name, "kind": "wd", "tags": len(names), "precision": precision,
                 "loadedIn": round(time.monotonic() - started, 1)}
 
-    def _load_ram(self, torch_fraction: float) -> dict:
+    def _load_pixai(self, torch_fraction: float) -> dict:
+        """PixAI Tagger v1.0 through its own model code (transformers trust_remote_code, pinned revision)."""
         import torch
 
         started = time.monotonic()
-        tags = (RAM_CODE / "ram_tag_list.txt").read_text(encoding="utf-8").splitlines()
-        thresholds = np.array([float(s) for s in (RAM_CODE / "ram_tag_list_threshold.txt").read_text().split()])
-        if not (len(tags) == len(thresholds) == RAM_CLASSES):
-            raise RuntimeError(f"RAM++ tag list has {len(tags)} tags and {len(thresholds)} thresholds, "
-                               f"expected {RAM_CLASSES}")
-        path = _fetch(RAM_MODEL, RAM_FILE)
-        try:
-            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        except Exception:  # noqa: BLE001 - an older pickle layout; the file is the official release
-            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        state = _ram_state(checkpoint)
-        del checkpoint
-        net = _ram_class()()
-        result = net.load_state_dict(state, strict=False)
-        missing = [k for k in result.missing_keys
-                   if k != "reweight_scale" and "relative_position_index" not in k and "attn_mask" not in k]
-        if missing or result.unexpected_keys:
-            raise RuntimeError(f"RAM++ checkpoint does not fit the network: missing {missing[:5]}, "
-                               f"unexpected {result.unexpected_keys[:5]}")
-        del state
-        net.eval()
+        files = {name: _fetch(PIXAI_MODEL, name, PIXAI_REVISION) for name in PIXAI_FILES}
+        root = files["config.json"].parent
+        cfg = json.loads(files["config.json"].read_text(encoding="utf-8"))
+        tags, split, size = cfg["tags"], cfg["tags_split"], int(cfg["img_size"])
+        if len(tags) != int(cfg["num_classes"]) or sum(int(n) for _, n in split) != len(tags):
+            raise RuntimeError(f"PixAI config is inconsistent: {len(tags)} tags, {cfg['num_classes']} classes, "
+                               f"split {split}")
+        index, pos = {}, 0
+        for category, count in split:                 # the tags are stored category after category (tags_split)
+            index[category] = np.arange(pos, pos + int(count))
+            pos += int(count)
+        for category in (*PIXAI_THRESHOLDS, "rating"):
+            if category not in index:
+                raise RuntimeError(f"PixAI config has no {category} category (found {list(index)})")
+        rating_tags = [tags[i] for i in index["rating"]]
+        if sorted(rating_tags) != sorted(PIXAI_RATING_NAMES):
+            raise RuntimeError(f"unexpected PixAI rating tags {rating_tags}")
+        thresholds = np.full(len(tags), 0.5)
+        for category, t in PIXAI_THRESHOLDS.items():
+            thresholds[index[category]] = t
+
         if _cuda():
-            net = net.half().to(DEVICE)
+            dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+            if PIXAI_PRECISION not in dtypes:
+                raise RuntimeError(f"PIXAI_PRECISION must be bf16, fp16 or fp32, not {PIXAI_PRECISION!r}")
+            dtype, precision = dtypes[PIXAI_PRECISION], PIXAI_PRECISION
             torch.cuda.set_per_process_memory_fraction(torch_fraction, 0)
-        self.ram = {
-            "net": net, "dtype": next(net.parameters()).dtype, "names": np.array(tags, dtype=object),
-            "logit_t": _logit(np.clip(thresholds, 1e-4, 1 - 1e-4)),      # a threshold of 1.0 means "never"
-            "mean": torch.tensor(RAM_MEAN, device=DEVICE).view(1, 3, 1, 1),
-            "std": torch.tensor(RAM_STD, device=DEVICE).view(1, 3, 1, 1),
+        else:
+            dtype, precision = torch.float32, "fp32"
+        from transformers import AutoModel
+        _log(f"loading {PIXAI_MODEL}@{PIXAI_REVISION[:8]} ({precision})")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            net = AutoModel.from_pretrained(str(root), trust_remote_code=True, dtype=dtype)
+        net = net.eval().to(DEVICE)               # moves only: .to(dtype) would also cast the complex RoPE tables
+        self.pixai = {
+            "net": net, "dtype": dtype, "size": size, "names": np.array(tags, dtype=object),
+            "keys": {c: index[c] for c in PIXAI_THRESHOLDS}, "rating": index["rating"],
+            "rating_names": [PIXAI_RATING_NAMES[tags[i]] for i in index["rating"]],
+            "logit_t": torch.tensor(_logit(thresholds), dtype=torch.float32, device=DEVICE),
         }
-        self._forward_ram([np.full((RAM_SIZE, RAM_SIZE, 3), 255, np.uint8)], 0.5)                # warm-up
-        return {"name": Path(RAM_FILE).stem, "kind": "ram", "tags": len(tags),
-                "precision": "fp16" if _cuda() else "fp32", "loadedIn": round(time.monotonic() - started, 1)}
+        if _cuda():     # warm-up at the full micro-batch: finds the largest batch that fits under the VRAM cap
+            while True:
+                n = self.batch["pixai"]
+                try:
+                    self._forward_pixai([np.full((size, size, 3), 255, np.uint8)] * n, 0.5)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_oom(exc) or n == 1:
+                        raise
+                    torch.cuda.empty_cache()
+                    self.batch["pixai"] = n // 2
+                    _log(f"pixai: out of memory at {n} pictures while warming up - micro-batch is now {n // 2}")
+        else:
+            self._forward_pixai([np.full((size, size, 3), 255, np.uint8)], 0.5)
+        return {"name": Path(PIXAI_MODEL).name, "kind": "pixai", "tags": len(tags), "precision": precision,
+                "loadedIn": round(time.monotonic() - started, 1)}
 
     def _load_then_serve(self):
         try:
@@ -404,7 +328,7 @@ class Tagger:
                 ort_limit, fraction = self._vram_split()
             self.models.append(self._load_wd(ort_limit))
             _log(f"ready: {self.models[-1]}")
-            self.models.append(self._load_ram(fraction))
+            self.models.append(self._load_pixai(fraction))
             _log(f"ready: {self.models[-1]}")
             self.status = "ok"
             _log(f"serving on {DEVICE}, cap {VRAM_GB:g} GB, micro-batch {MAX_BATCH}")
@@ -442,25 +366,48 @@ class Tagger:
             out.append(row)
         return out
 
-    def _forward_ram(self, arrays, floor):
+    def _forward_pixai(self, arrays, floor):
+        """arrays: RGB uint8 (H, W, 3) pictures of any size. The repository's RescalePadProcessor, on the GPU:
+        scale by r = min(S/h, S/w) to (int(h*r), int(w*r)) (bilinear, antialiased), pad to S x S with black
+        (0 before normalisation, so -1 after), normalise with mean 0.5 / std 0.5."""
         import torch
+        import torch.nn.functional as F
 
-        ram = self.ram
+        px = self.pixai
+        size = px["size"]
         with torch.inference_mode():
-            x = torch.from_numpy(np.stack(arrays)).to(DEVICE).permute(0, 3, 1, 2).float().div_(255.0)
-            x = ((x - ram["mean"]) / ram["std"]).to(ram["dtype"])
-            logits = ram["net"](x).cpu().numpy().astype(np.float64)
-        cal = _sigmoid(logits - ram["logit_t"])
-        out = []
+            x = torch.full((len(arrays), 3, size, size), -1.0, dtype=torch.float32, device=DEVICE)
+            for i, a in enumerate(arrays):
+                t = torch.from_numpy(a).to(DEVICE).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+                h, w = t.shape[-2:]
+                if h != size or w != size:
+                    r = min(size / h, size / w)
+                    new_h, new_w = int(h * r), int(w * r)
+                    t = F.interpolate(t, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True)
+                else:
+                    new_h, new_w = size, size
+                top, left = (size - new_h) // 2, (size - new_w) // 2
+                x[i, :, top:top + new_h, left:left + new_w] = (t[0] - 0.5) / 0.5
+            logits = px["net"](x.to(px["dtype"])).float()                 # the sigmoid is always float32
+            if not bool(torch.isfinite(logits).all()):                    # an fp16 overflow: fail (split) the batch
+                raise FloatingPointError("non-finite PixAI scores (set PIXAI_PRECISION=bf16 or fp32)")
+            cal = torch.sigmoid(logits - px["logit_t"]).cpu().numpy()    # = sigmoid(logit(p) - logit(t))
+            rating = torch.sigmoid(logits[:, px["rating"]]).cpu().numpy()
+        names, out = px["names"], []
         for b in range(len(arrays)):
-            keep = np.flatnonzero(cal[b] >= floor)
-            keep = keep[np.argsort(-cal[b, keep], kind="stable")]
-            out.append({str(ram["names"][i]): round(float(cal[b, i]), 4) for i in keep})
+            row = {}
+            for key, idx in px["keys"].items():
+                scores = cal[b, idx]
+                keep = np.flatnonzero(scores >= floor)
+                keep = keep[np.argsort(-scores[keep], kind="stable")]
+                row[key] = {str(names[idx[i]]): round(float(scores[i]), 4) for i in keep}
+            row["rating"] = {name: round(float(rating[b, j]), 4) for j, name in enumerate(px["rating_names"])}
+            out.append(row)
         return out
 
     def _attempt(self, name, job, chunk, out, errs):
         """Run one micro-batch; on any failure split it so that only the bad picture(s) fail."""
-        forward = self._forward_wd if name == "wd" else self._forward_ram
+        forward = self._forward_wd if name == "wd" else self._forward_pixai
         try:
             result = forward([job.inputs[k][name] for k in chunk], job.floor)
         except Exception as exc:  # noqa: BLE001
@@ -531,9 +478,10 @@ def _decode(data: bytes, wanted: int) -> Image.Image:
         return im.convert("RGB")
 
 
-def _prepare(b64: str, models, wd_size: int):
-    """One picture -> {"wd": uint8 (S, S, 3) white-padded square, "ram": uint8 (384, 384, 3)} (RGB)."""
-    im = _decode(base64.b64decode(b64, validate=False), max(wd_size, RAM_SIZE))
+def _prepare(b64: str, models, wd_size: int, pixai_size: int):
+    """One picture -> {"wd": uint8 (S, S, 3) white-padded square, "pixai": the RGB picture itself (uint8, H x W x 3;
+    the GPU thread scales and pads it, see _forward_pixai)}."""
+    im = _decode(base64.b64decode(b64, validate=False), max(wd_size, pixai_size))
     out = {}
     if "wd" in models:
         w, h = im.size
@@ -545,8 +493,9 @@ def _prepare(b64: str, models, wd_size: int):
         if side != wd_size:
             sq = sq.resize((wd_size, wd_size), Image.Resampling.BICUBIC)
         out["wd"] = np.asarray(sq, dtype=np.uint8)
-    if "ram" in models:
-        out["ram"] = np.asarray(im.resize((RAM_SIZE, RAM_SIZE), Image.Resampling.BILINEAR), dtype=np.uint8)
+    if "pixai" in models:
+        factor = max(im.size) // (2 * pixai_size)      # only for huge pictures: a cheap integer box shrink first
+        out["pixai"] = np.array(im.reduce(factor) if factor > 1 else im, dtype=np.uint8)   # a writable copy
     return out
 
 
@@ -608,14 +557,14 @@ class Handler(BaseHTTPRequestHandler):
                 floor = min(1.0, max(0.001, float(req.get("floor", 0.05))))
             except (TypeError, ValueError):
                 return self._json(400, {"error": "floor must be a number"})
-            wanted = req.get("models") or ["wd", "ram"]
-            if not isinstance(wanted, list) or not wanted or any(m not in ("wd", "ram") for m in wanted):
-                return self._json(400, {"error": 'models must be a list of "wd" and/or "ram"'})
-            models = [m for m in ("wd", "ram") if m in wanted]
+            wanted = req.get("models") or list(MODEL_NAMES)
+            if not isinstance(wanted, list) or not wanted or any(m not in MODEL_NAMES for m in wanted):
+                return self._json(400, {"error": 'models must be a list of "wd" and/or "pixai"'})
+            models = [m for m in MODEL_NAMES if m in wanted]
 
             def prep(item):
                 try:
-                    return _prepare(item, models, t.wd["size"]), None
+                    return _prepare(item, models, t.wd["size"], t.pixai["size"]), None
                 except binascii.Error:
                     return None, "invalid base64"
                 except Image.UnidentifiedImageError:
@@ -663,7 +612,7 @@ def main() -> int:
         signal.signal(sig, lambda *_: os._exit(0))
     server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler)
     server.daemon_threads = True
-    _log(f"listening; loading {WD_MODEL} and {RAM_MODEL}")
+    _log(f"listening; loading {WD_MODEL} and {PIXAI_MODEL}")
     server.serve_forever()
     return 0
 
