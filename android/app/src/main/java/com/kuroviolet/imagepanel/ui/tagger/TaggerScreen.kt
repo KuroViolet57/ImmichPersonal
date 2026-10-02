@@ -175,6 +175,27 @@ private fun RuleDraft.isUsable() =
  */
 private val RETAG_KEYS = setOf("rules", "blocked", "max_tags", "write_tags", "character_tags", "rating_tag", "vocabulary")
 
+/** The help for the "Renames and combinations" box (the same text as the web tab; docs/AI-TAGGER.md has the syntax). */
+private const val VOCABULARY_SYNTAX =
+    "One entry per line. What the photo has goes left of ->, what to do goes right. Use the tags as they are after the " +
+        "renames. A line starting with # is a note.\n" +
+        "• old -> new: renames a tag everywhere (one plain tag each side)\n" +
+        "• a + b -> c: if it has a AND b, add c\n" +
+        "• a | b -> c: if it has a OR b, add c\n" +
+        "• a + !b -> c: a and NOT b (! goes with +, not |)\n" +
+        "• a + b -> c, -d: several results; a bare tag or +tag adds, -tag removes\n" +
+        "• a -> +b: add b and keep a (without the + it is a rename)"
+private const val VOCABULARY_EXAMPLES =
+    "furry with non-furry -> human on anthro\n" +
+        "furry + human -> human on anthro\n" +
+        "anthro | furry -> furry art\n" +
+        "1girl + 1boy -> couple, -solo\n" +
+        "furry + !human -> furry only"
+private const val VOCABULARY_NOTE =
+    "Typed combinations are the same feature as “Combinations (form)” below: type them here or fill in the form. The " +
+        "form’s run first, then these lines in the order written; all of them repeat until nothing changes. Spaces around " +
+        "+ and | are needed. A line that can’t be read is refused when you save, with its line number."
+
 private fun modeOf(key: String, reprocessKeys: JsonObject): String? = when {
     key in reprocessKeys.a("full").strings() -> "full"
     key in reprocessKeys.a("retag").strings() -> "retag"
@@ -489,8 +510,13 @@ private fun PreviewResult(vm: TaggerVm, p: JsonObject) {
         Hint("Rating: " + r.entries.sortedByDescending { (it.value as? JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0 }
             .joinToString(" · ") { "${it.key} %.2f".format((it.value as? JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0) })
     }
+    // A form rule is numbered (0, 1, …); a typed combination names its line ("line 3"), and the saved line is shown.
+    val typed = vm.settings.str("vocabulary").replace("\r\n", "\n").replace('\r', '\n').split('\n')
     p.a("rules").objects().filter { it.a("added").isNotEmpty() || it.a("removed").isNotEmpty() }.forEach { r ->
-        Hint("Rule ${(r.i("rule") ?: 0) + 1}: +${r.a("added").strings().joinToString(", ")} −${r.a("removed").strings().joinToString(", ")}")
+        val line = Regex("^line (\\d+)$").find(r.str("rule"))?.groupValues?.get(1)?.toIntOrNull()
+        val name = if (line != null) "Line $line" + typed.getOrNull(line - 1)?.trim().orEmpty().let { if (it.isEmpty()) "" else " ($it)" }
+                   else "Rule ${(r.i("rule") ?: 0) + 1}"
+        Hint("$name: +${r.a("added").strings().joinToString(", ")} −${r.a("removed").strings().joinToString(", ")}")
     }
     TagChips("Final tags", p.a("tags").objects().map { "${it.str("tag")} (${it.str("source")})" to null })
     Text("Before", style = MaterialTheme.typography.titleSmall)
@@ -533,31 +559,19 @@ private fun SettingsCards(vm: TaggerVm) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionCard(title = "Tags") {
             OutlinedTextField(value = d.vocabulary, onValueChange = { vm.draft = d.copy(vocabulary = it) },
-                label = { Text("Vocabulary") }, minLines = 3, modifier = Modifier.fillMaxWidth())
-            Hint("One rename per line: “old -> new” renames a tag everywhere (e.g. “1girl -> woman”). Lines without an arrow are ignored.")
+                label = { Text("Renames and combinations") }, minLines = 6, modifier = Modifier.fillMaxWidth())
+            Hint(VOCABULARY_SYNTAX)
+            Hint("Examples:")
+            Text(VOCABULARY_EXAMPLES, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+            Hint(VOCABULARY_NOTE)
             OutlinedTextField(value = d.blocked, onValueChange = { vm.draft = d.copy(blocked = it) },
                 label = { Text("Never use these tags (comma separated)") }, modifier = Modifier.fillMaxWidth())
             CheckRow("Character names (anime/game)", d.characterTags) { vm.draft = d.copy(characterTags = it) }
             CheckRow("Content rating tag", d.ratingTag) { vm.draft = d.copy(ratingTag = it) }
             CheckRow("Also add real Immich tags (AI/…)", d.writeTags) { vm.draft = d.copy(writeTags = it) }
         }
-        SectionCard(title = "Taggers") {
-            taggers.keys.forEach { key ->
-                val on = d.use[key] ?: vm.settings.b("use_$key") ?: true
-                val strict = d.strictness[key] ?: (vm.settings.d("${key}_strictness") ?: 0.5).toFloat()
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(taggers.str(key), modifier = Modifier.weight(1f))
-                    Switch(checked = on, onCheckedChange = { vm.draft = d.copy(use = d.use + (key to it)) })
-                }
-                Text("Strictness %.2f".format(strict), style = MaterialTheme.typography.bodySmall)
-                Slider(value = strict, onValueChange = { vm.draft = d.copy(strictness = d.strictness + (key to it)) },
-                    valueRange = floatRange("${key}_strictness"))
-            }
-            Hint("0.50 is each tagger's own recommended cut-off. Higher keeps fewer, surer tags. On a picture rated general or sensitive, a sexual tag is kept only when at least two of the switched-on taggers found it.")
-            NumberField("Most tags per asset", d.maxTags, { vm.draft = d.copy(maxTags = it) }, Modifier.fillMaxWidth(), max = range("max_tags", 5, 100).last)
-        }
-        SectionCard(title = "Rules") {
-            Hint("When an asset has these tags, add or remove others. Tags separated by commas.")
+        SectionCard(title = "Combinations (form)") {
+            Hint("The same feature as the typed lines in “Renames and combinations” above (a + b -> c): fill in this form or type them there, whichever you like. The form’s run first. When an asset has these tags, add or remove others. Tags separated by commas.")
             d.rules.forEachIndexed { i, r ->
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -576,6 +590,21 @@ private fun SettingsCards(vm: TaggerVm) {
                 }
             }
             TextButton(onClick = { vm.draft = d.copy(rules = d.rules + RuleDraft()) }) { Text("Add a rule") }
+        }
+        SectionCard(title = "Taggers") {
+            taggers.keys.forEach { key ->
+                val on = d.use[key] ?: vm.settings.b("use_$key") ?: true
+                val strict = d.strictness[key] ?: (vm.settings.d("${key}_strictness") ?: 0.5).toFloat()
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(taggers.str(key), modifier = Modifier.weight(1f))
+                    Switch(checked = on, onCheckedChange = { vm.draft = d.copy(use = d.use + (key to it)) })
+                }
+                Text("Strictness %.2f".format(strict), style = MaterialTheme.typography.bodySmall)
+                Slider(value = strict, onValueChange = { vm.draft = d.copy(strictness = d.strictness + (key to it)) },
+                    valueRange = floatRange("${key}_strictness"))
+            }
+            Hint("0.50 is each tagger's own recommended cut-off. Higher keeps fewer, surer tags. On a picture rated general or sensitive, a sexual tag is kept only when at least two of the switched-on taggers found it.")
+            NumberField("Most tags per asset", d.maxTags, { vm.draft = d.copy(maxTags = it) }, Modifier.fillMaxWidth(), max = range("max_tags", 5, 100).last)
         }
         SectionCard(title = "Speed and memory") {
             Text("Captures per video")

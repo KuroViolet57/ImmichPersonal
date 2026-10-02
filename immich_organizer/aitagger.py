@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import collections
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -60,7 +61,7 @@ CAPTURE_SIDE = 1024           # captures are at most this big
 PREVIEW_SIDE = 256            # pictures in the Test card
 SEGMENTS = 8                  # a video is cut into this many equal parts; the first and last are skipped
 MAX_IMAGES_PER_REQUEST = 64   # what the tagger accepts in one /tag call
-MAX_RULE_PASSES = 5
+MAX_RULE_PASSES = 5           # the rules (the Rules card's and the Vocabulary's) repeat at most this many times
 # Sexual Danbooru tags (normalised). On a picture the combined rating calls general or sensitive, one of these is kept
 # only when at least two enabled taggers found it (with a single tagger on it is dropped): measured on the library, WD
 # alone tagged an everyday photo of a person by a door "oral, fellatio, loli, cunnilingus" while PixAI saw "indoors,
@@ -141,23 +142,132 @@ def norm_tag(text) -> str:
     return s[:60]
 
 
+# The Vocabulary text: one entry per line; blank lines and lines starting with "#" are ignored.
+#   old -> new               rename a tag (a single tag on both sides, no sign)
+#   a + b -> c               when the asset has a AND b, add c
+#   a | b -> c               when it has a OR b, add c
+#   a + !b -> c              a and NOT b (! on any tag of a + line; not with |)
+#   a + b -> c, -d           several targets, comma separated: "-tag" removes, "+tag" or a bare tag adds
+#   a -> +b                  add b and keep a (one condition with an explicit sign is a rule, not a rename)
+# A line with + or | (or with a sign / several targets) becomes a rule in the shape of the Rules card
+# ({if_all, if_any, unless, add, remove}). Those rules run after the card's, in the order written, in the same
+# repeat-until-stable engine (``apply_rules``).
+ARROWS = ("->", "→")
+_OPERATOR = re.compile(r"(\s+[+|]\s+)")                   # + and | are operators only with spaces around them ...
+_STRAY_OPERATOR = re.compile(r"(?:^|\s)[+|](?:\s|$)|\w\s*[+|]\s*\w")      # ... so "a+b" is caught; "c++" and "+_+" are tags
+MAX_PROBLEMS_SHOWN = 5
+
+
+def _unix(text) -> str:
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def parse_vocabulary_line(line: str):
+    """One entry of the vocabulary: ``("rename", (old, new))``, ``("rule", rule)`` or ``("skip", None)`` (a rename to
+    itself). Raises ValueError, without a line number, when the line can't be used."""
+    arrows = sum(line.count(a) for a in ARROWS)
+    if not arrows:
+        raise ValueError('write it as "tags -> result", for example a + b -> c')
+    if arrows > 1:
+        raise ValueError("only one -> per line")
+    arrow = next(a for a in ARROWS if a in line)
+    left, right = (part.strip() for part in line.split(arrow, 1))
+    if not left:
+        raise ValueError("there is nothing before ->")
+    pieces = _OPERATOR.split(left)
+    operators = {piece.strip() for piece in pieces[1::2]}
+    if len(operators) > 1:
+        raise ValueError("use + or |, not both")
+    operator = next(iter(operators), "")
+    required: list[str] = []
+    excluded: list[str] = []
+    for token in pieces[0::2]:
+        token = token.strip()
+        negated = token.startswith("!")
+        text = token[1:] if negated else token
+        if _STRAY_OPERATOR.search(text):
+            raise ValueError("put a tag on each side of + or |, with spaces around it (a + b)")
+        tag = norm_tag(text)
+        if not tag:
+            raise ValueError("a tag is missing before or after + / | / !")
+        group = excluded if negated else required
+        if tag not in group:
+            group.append(tag)
+    if operator == "|" and excluded:
+        raise ValueError("! can't be used with | (a + !b means 'a and not b')")
+    if not required:
+        raise ValueError("it needs at least one tag that must be present, not only !tags")
+    if set(required) & set(excluded):
+        raise ValueError("a tag can't be both required and excluded")
+    targets: list[tuple[str, str]] = []                   # (sign, tag); the sign is "" for a bare tag
+    for segment in right.split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        sign = segment[0] if segment[0] in "+-" else ""
+        text = segment[1:] if sign else segment
+        if not sign and text.startswith("!"):
+            raise ValueError("! only works on the left of -> (a + !b -> c)")
+        tag = norm_tag(text)
+        if not tag:
+            raise ValueError(f'"{sign}" needs a tag after it' if sign else "a tag is missing after ->")
+        targets.append((sign, tag))
+    if not targets:
+        raise ValueError("there is nothing after ->")
+    if not operator and len(required) == 1 and not excluded and len(targets) == 1 and not targets[0][0]:
+        old, new = required[0], targets[0][1]
+        return ("skip", None) if old == new else ("rename", (old, new))
+    add = list(dict.fromkeys(tag for sign, tag in targets if sign != "-"))
+    remove = list(dict.fromkeys(tag for sign, tag in targets if sign == "-"))
+    if set(add) & set(remove):
+        raise ValueError("a tag can't be both added and removed")
+    for where, tags in (("before", [*required, *excluded]), ("after", [*add, *remove])):
+        if len(tags) > MAX_RULE_TAGS:
+            raise ValueError(f"at most {MAX_RULE_TAGS} tags {where} ->")
+    return "rule", {"if_all": [] if operator == "|" else required, "if_any": required if operator == "|" else [],
+                    "unless": excluded, "add": add, "remove": remove}
+
+
 class Vocabulary:
-    """``old -> new`` lines rename a tag. Any other line is ignored (v2 passed it to the describer as a preferred term;
-    there is no describer any more)."""
+    """The Vocabulary setting. ``renames`` (old -> new) are applied to the tags before anything else sees them;
+    ``rules`` are the combination lines (``a + b -> c``) in the shape of the Rules card, each with a ``label``
+    (``"line 3"``) that the preview's trace shows; ``errors`` are ``(line number, message)`` for the lines that can't
+    be used. Reading is forgiving: such a line is skipped (the v2 vocabulary had preferred terms on lines without an
+    arrow). Saving is not: ``validate_setting`` refuses a vocabulary that has errors."""
 
     def __init__(self, text: str = ""):
         self.renames: dict[str, str] = {}
-        for line in (text or "").splitlines():
+        self.rules: list[dict] = []
+        self.errors: list[tuple[int, str]] = []
+        for number, line in enumerate(_unix(text).split("\n"), 1):
             line = line.strip()
-            arrow = "->" if "->" in line else ("→" if "→" in line else "")
-            if not arrow:
+            if not line or line.startswith("#"):
                 continue
-            old, new = (norm_tag(part) for part in line.split(arrow, 1))
-            if old and new and old != new:
-                self.renames[old] = new
+            try:
+                kind, value = parse_vocabulary_line(line)
+            except ValueError as exc:
+                self.errors.append((number, str(exc)))
+                continue
+            if kind == "rename":
+                self.renames[value[0]] = value[1]
+            elif kind == "rule":
+                self.rules.append({**value, "label": f"line {number}"})
 
     def rename(self, tag: str) -> str:
         return self.renames.get(tag, tag)
+
+    def problems(self) -> str:
+        """The errors as one message for the person who typed the text; "" when there are none."""
+        shown = [f"Line {n}: {message}" for n, message in self.errors[:MAX_PROBLEMS_SHOWN]]
+        if len(self.errors) > MAX_PROBLEMS_SHOWN:
+            shown.append(f"{len(self.errors) - MAX_PROBLEMS_SHOWN} more lines have problems")
+        return "; ".join(shown)
+
+
+@functools.lru_cache(maxsize=16)
+def _vocabulary(text: str) -> Vocabulary:
+    """The same parse for every asset of a run. Read-only: callers must not change it."""
+    return Vocabulary(text)
 
 
 # ---------------------------------------------------------------- the taggers (the registry)
@@ -218,7 +328,7 @@ FIXED_DEFAULTS = {
 }
 FIXED_LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vram_gb": VRAM_GB_LIMITS, "max_tags": (5, 100)}
 STRICTNESS = (0.05, 0.95)           # the limits of every ``<key>_strictness`` (calibrated: 0.5 = the model's own threshold)
-TEXT_LIMITS = {"vocabulary": 4000}
+TEXT_LIMITS = {"vocabulary": 20000}
 MAX_BLOCKED, MAX_RULES, MAX_RULE_TAGS = 500, 100, 50
 RULE_KEYS = ("if_all", "if_any", "unless", "add", "remove")
 
@@ -300,8 +410,10 @@ def clean_rule(rule, index: int) -> dict:
     return out
 
 
-def validate_setting(key: str, value):
-    """The canonical value of a setting, or ValueError. Types are checked explicitly (``"false"`` is not False)."""
+def validate_setting(key: str, value, strict: bool = True):
+    """The canonical value of a setting, or ValueError. Types are checked explicitly (``"false"`` is not False).
+    ``strict=False`` (reading the saved file) lets a vocabulary keep lines this version can't use: they are skipped
+    when the tags are made, and the next save names them."""
     if key not in DEFAULTS:
         raise ValueError(f"Unknown AI Tagger setting: {key}")
     default = DEFAULTS[key]
@@ -320,9 +432,13 @@ def validate_setting(key: str, value):
     if isinstance(default, str):
         if not isinstance(value, str):
             raise ValueError(f"{key} must be text")
-        value = value.replace("\r\n", "\n").replace("\r", "\n")
+        value = _unix(value)
         if len(value) > TEXT_LIMITS[key]:
             raise ValueError(f"{key} must be at most {TEXT_LIMITS[key]} characters")
+        if key == "vocabulary" and strict:
+            problems = Vocabulary(value).problems()
+            if problems:
+                raise ValueError(problems)
         return value
     lo, hi = LIMITS[key]
     if isinstance(default, int):
@@ -352,7 +468,7 @@ def load_settings() -> dict:
     for key, value in data.items():
         if key in DEFAULTS:
             try:
-                out[key] = validate_setting(key, value)
+                out[key] = validate_setting(key, value, strict=False)
             except ValueError:
                 pass                    # a hand-edited bad value: keep the default
     return out
@@ -467,7 +583,7 @@ def missing_kinds(raw: dict | None, settings: dict) -> list[str]:
 
 def detect(raw: dict, settings: dict) -> dict:
     """Steps 3-4: stored tagger scores -> tags with scores (before the rules)."""
-    vocab = Vocabulary(settings["vocabulary"])
+    vocab = _vocabulary(settings["vocabulary"])
     blocked = set(settings["blocked"])
     candidates: list[tuple[str, float, str]] = []
     display: dict = {kind.key: [] for kind in TAGGERS}
@@ -547,7 +663,9 @@ def rule_matches(have: set, rule: dict) -> bool:
 
 
 def apply_rules(tags: dict, rules: list[dict]) -> tuple[dict, list[dict]]:
-    """Run the rules in order, again and again until nothing changes (at most ``MAX_RULE_PASSES`` passes)."""
+    """Run the rules in order, again and again until nothing changes (at most ``MAX_RULE_PASSES`` passes). The trace
+    names a rule by its position in ``rules`` (the Rules card's), or by its ``label`` when it has one (the
+    Vocabulary's combination lines: ``"line 3"``)."""
     tags = dict(tags)
     fired: dict[int, dict] = {}
     for _ in range(MAX_RULE_PASSES):
@@ -555,7 +673,7 @@ def apply_rules(tags: dict, rules: list[dict]) -> tuple[dict, list[dict]]:
         for index, rule in enumerate(rules):
             if not rule_matches(set(tags), rule):
                 continue
-            note = fired.setdefault(index, {"rule": index, "added": [], "removed": []})
+            note = fired.setdefault(index, {"rule": rule.get("label", index), "added": [], "removed": []})
             for tag in rule["add"]:
                 if tag not in tags:
                     tags[tag] = (1.0, "rule")
@@ -574,10 +692,11 @@ def apply_rules(tags: dict, rules: list[dict]) -> tuple[dict, list[dict]]:
 
 
 def finalize(tags: dict, settings: dict) -> tuple[list[dict], list[dict]]:
-    """Step 5: the rules, ``blocked`` and the ``max_tags`` cap."""
+    """Step 5: the rules, ``blocked`` and the ``max_tags`` cap. The rules are the Rules card's, then the Vocabulary's
+    combination lines in the order written, all in one repeat-until-stable run."""
     blocked = set(settings["blocked"])
     tags = {t: v for t, v in tags.items() if t not in blocked}
-    tags, trace = apply_rules(tags, settings["rules"])
+    tags, trace = apply_rules(tags, [*settings["rules"], *_vocabulary(settings["vocabulary"]).rules])
     tags = {t: v for t, v in tags.items() if t not in blocked}
     rating = [t for t in tags if t.startswith(RATING_PREFIX)]
     others = sorted((t for t in tags if t not in rating), key=lambda t: (-tags[t][0], t))

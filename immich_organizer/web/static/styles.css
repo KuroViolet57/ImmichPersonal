@@ -365,6 +365,9 @@ body.viewer-open { overflow: hidden; }
 /* AI Tagger */
 #panel-tagger code { font-size: .92em; background: var(--bg); padding: 0 4px; border-radius: 4px; }
 #tg-service { white-space: pre-line; }
+.tg-cheat ul { margin: 0 0 10px; padding-left: 18px; font-size: .8125rem; color: var(--muted); }
+.tg-cheat li { margin-bottom: 4px; overflow-wrap: anywhere; }
+.tg-cheat li code { color: var(--fg); }
 #panel-tagger .card { scroll-margin-top: 76px; }
 .tg-h { font-size: .8125rem; margin: 16px 0 6px; color: var(--muted); font-weight: 600; overflow-wrap: anywhere; }
 .tg-h:first-child { margin-top: 12px; }

@@ -1802,8 +1802,8 @@
     vram_gb:        { id: "tg-vram", kind: "int" },
   };
   const TG_LABELS = {
-    vocabulary: "Vocabulary", blocked: "Blocked tags", character_tags: "Character names", rating_tag: "Rating tag",
-    write_tags: "Immich tags", max_tags: "Most tags per photo", rules: "Rules", video_frames: "Captures per video",
+    vocabulary: "Renames and combinations", blocked: "Blocked tags", character_tags: "Character names", rating_tag: "Rating tag",
+    write_tags: "Immich tags", max_tags: "Most tags per photo", rules: "Combinations (form)", video_frames: "Captures per video",
     batch_size: "Assets per round", vram_gb: "GPU memory",
   };
   // Which settings change what is written, and the lightest reprocess mode that applies them. The server says which
@@ -2404,14 +2404,22 @@
       }
     }
 
-    heading("Rules that fired");
+    // A card rule is numbered (0, 1, ...); a typed combination says its line ("line 3"), and the saved line is shown.
+    heading("Combinations that fired");
     const fired = p.rules || [];
     if (!fired.length) out.appendChild(tgEl("p", "hint", "None."));
+    const typed = String(cfg.vocabulary || "").replace(/\r\n?/g, "\n").split("\n");
     fired.forEach((r) => {
       const bits = [];
       if ((r.added || []).length) bits.push(`added ${r.added.join(", ")}`);
       if ((r.removed || []).length) bits.push(`removed ${r.removed.join(", ")}`);
-      out.appendChild(tgEl("p", "hint", `Rule ${Number(r.rule) + 1}: ${bits.join(" · ") || "no change"}`));
+      const line = /^line (\d+)$/.exec(String(r.rule));
+      let name = `Rule ${Number(r.rule) + 1}`;
+      if (line) {
+        const text = (typed[Number(line[1]) - 1] || "").trim();
+        name = `Line ${line[1]}${text ? ` (${text})` : ""}`;
+      }
+      out.appendChild(tgEl("p", "hint", `${name}: ${bits.join(" · ") || "no change"}`));
     });
 
     heading(`Final tags · ${(p.tags || []).length}`);
