@@ -1,5 +1,5 @@
-# AI Tagger model server: WD EVA02-Large Tagger v3 (ONNX Runtime, CUDA) + PixAI Tagger v1.0 and RAM++ (PyTorch, fp16),
-# running immich_organizer/tagger_service.py (mounted at /app).
+# AI Tagger model server: WD EVA02-Large Tagger v3 (ONNX Runtime, CUDA) + PixAI Tagger v1.0, RAM++ (PyTorch, fp16) and
+# Hydra 3.5, the e621 tagger (PyTorch, bf16), running immich_organizer/tagger_service.py (mounted at /app).
 FROM python:3.12-slim
 ENV PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1
 
@@ -52,6 +52,34 @@ assert not missing, f"missing from the RAM++ source archive: {missing}"
 (out / "COMMIT").write_text(commit + "\n")
 PY
 
-ENV RAM_CODE=/opt/ram HF_HUB_DISABLE_TELEMETRY=1
+# Hydra 3.5 (Project RedRocket, Apache-2.0; the licence is declared in the model card, the repository has no LICENSE
+# file): the e621 tagger. Its network (a SigLIP 2 NaFlex ViT plus a per-tag cross-attention head) is the repository's own
+# code; the repository's package also imports pyvips and a GUI, so the build keeps only the five modules the network
+# needs, from one pinned commit, each checked against its SHA-256. tagger_service.py builds the model from them (the
+# same arrangement as RAM++ above) and does its own picture preparation. einops is their only new dependency.
+RUN pip install einops==0.8.2
+ARG HYDRA_COMMIT=cfa9b0a1ffcf2b8df8553be7673210fd60fba23b
+RUN python - <<'PY'
+import hashlib, os, pathlib, urllib.request
+commit = os.environ["HYDRA_COMMIT"]
+want = {   # path in the repository -> sha256
+    "hydra/siglip2.py": "a5d25e61031fb5ee0b16cc4e22147b1a4ab648b158f1362a4cfd2f0d9ae83eaf",
+    "hydra/pool.py": "724da543c5e4dbebb1e97d11bcf459c89541ad060c2fb8c0a3ee3732166b6b35",
+    "hydra/head.py": "d0721aeaad132edb9a4d64761eef5713f3656ee9d3f64966f8f95194b7b60f00",
+    "hydra/glu.py": "5b592db60125130c25568d1110e183f38a808e5ffac75be3aedd2411e12ba2f7",
+    "hydra/cufork.py": "7403f932d4e84a85604fb1027bbe4c9a027a0e359a11f1143905cfdd752be76b",
+}
+out = pathlib.Path("/opt/hydra/hydra")
+out.mkdir(parents=True)
+for rel, digest in want.items():
+    url = f"https://huggingface.co/RedRocket/Hydra/resolve/{commit}/{rel}"
+    data = urllib.request.urlopen(url).read()
+    assert hashlib.sha256(data).hexdigest() == digest, f"{rel} at {commit} does not match its SHA-256"
+    (out / pathlib.Path(rel).name).write_bytes(data)
+(out / "__init__.py").write_text("")          # the repository's own __init__ imports pyvips
+(out.parent / "COMMIT").write_text(commit + "\n")
+PY
+
+ENV RAM_CODE=/opt/ram HYDRA_CODE=/opt/hydra HF_HUB_DISABLE_TELEMETRY=1
 WORKDIR /app
 ENTRYPOINT ["python", "/app/tagger_service.py"]
