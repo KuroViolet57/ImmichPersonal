@@ -34,7 +34,7 @@ description. v2 changes:
    - The rating is the mean of WD's and PixAI's rating probabilities, each first averaged over the captures, then the
      argmax.
    - `vram_gb` is now **the taggers' memory cap** (`AITAGGER_VRAM_GB = vram_gb`). Its default and limits come from
-     the measurements in the service section.
+     the measurements below ("Measured (v2)": default 5, limits 3-8; `AITAGGER_VLM_UTIL` 0.22).
    - The describer gets a fixed small share (`AITAGGER_VLM_UTIL`, a constant from the measurements) and no longer
      derives from `vram_gb`. `vlm_parallel` still sets `--max-num-seqs`.
    - Old settings files holding `use_ram` / `ram_strictness` are read without error (the unknown keys are ignored).
@@ -43,7 +43,140 @@ description. v2 changes:
    "Qwen3.5-2B (text)"}`. In the preview, `models.pixai` replaces `models.ram`. The preview still returns the capture
    thumbnails.
 6. **GPU sharing with Search+:** if the measurements show that taggers + describer + Immich ML + Search+ (PE-Core,
-   about 7 GB) fit in 22 GB, the mutual exclusion (`GpuBusy`) is dropped. Otherwise it stays.
+   about 7 GB) fit in 22 GB, the mutual exclusion (`GpuBusy`) is dropped. Otherwise it stays. **Measured: they fit** (17.3
+   GB with all four busy, Search+ itself 5.9 GB), see "Measured (v2)".
+
+### Measured (v2)
+
+Measured on 2026-10-02 on the owner's RTX 4090 (24 GB, WSL2, Docker 29) with Immich ML (2.2 GB) loaded. Software: torch
+2.14.1+cu130, transformers 4.57.6, onnxruntime-gpu 1.30.0, vLLM 0.30.0. Pictures are real library previews shrunk to 1024 px
+and sent as base64 JPEG through the HTTP API (decoding and transfer included), 8 pictures per request, 2 requests in flight,
+unless stated. "GB" is nvidia-smi's MiB / 1024, as everywhere in this file.
+
+**Taggers: pictures per second** (everything loaded, model-native thresholds)
+
+| | micro-batch 8 | micro-batch 16 |
+|---|---|---|
+| PixAI alone | 20.1 | 20.0 |
+| WD + PixAI together | 16.4 | 16.3 |
+| WD alone | 82.6 | (WD is held to 8) |
+
+PixAI is compute-bound: on its own (no HTTP) it does 20.4 pictures/s at batch 8 and 20.5 at 16, in bf16 and fp16 alike
+(batch 1: 20.8, batch 32: 20.6; fp32 about 5.5); matrix multiplies are 56% of the GPU time (about 170 TFLOPs, close to the
+card's limit), flash attention 12%. So the micro-batch buys nothing but memory: PixAI needs 0.9 GB for the weights plus 0.17 GB per picture in
+the batch (peak 1.1 / 1.6 / 2.3 / 3.6 / 6.2 GB at batch 1 / 4 / 8 / 16 / 32). Loading takes 1.2 s (WD) + 2.7 s (PixAI) with
+the files cached; the first start downloads the 1.9 GB PixAI weights.
+
+**Taggers: memory.** The whole process (CUDA context included), measured as the growth of the GPU's used memory, by cap:
+
+| `AITAGGER_VRAM_GB` | micro-batches it settles on (PixAI / WD) | process VRAM | WD + PixAI |
+|---|---|---|---|
+| 3 | 2 / 2 | 2.8 GB | 16.4 pictures/s |
+| 3.5 | 4 / 4 | 3.3 GB | 16.2 |
+| 4 | 4 / 8 | 3.8 GB | 16.3 |
+| **5** | 8 / 8 | 4.1 GB | 16.4 |
+| 6 | 16 / 8 | 5.5 GB | 16.3 |
+| 8 | 16 / 8 | 5.5 GB | 16.4 |
+
+The service fits itself to the cap (warm-up at load for PixAI, out-of-memory splitting at run time for WD), so a small cap
+costs no speed down to 3 GB (WD loses 10% at a micro-batch of 2); a cap of 2.5 or less was not tried. Asking for micro-batch 16
+under a cap of 5 settles on 8 and uses 4.5 GB. **Recommended: `AITAGGER_VRAM_GB` 5 (4.1 GB used, 0.9 GB of room) and
+`AITAGGER_BATCH` 8; limits for the panel's `vram_gb` 3-8** (above 5.5 GB nothing more is used).
+
+**Describer** (Qwen3.5-2B, text only, 4096 tokens, `--language-model-only`; prompts of about 520 tokens, answers of about
+180; panel-style request: JSON schema with `maxItems` 12, temperature 0.2, no thinking)
+
+| | FP8 (chosen) | bf16 |
+|---|---|---|
+| weights in VRAM | 2.4 GB | 3.6 GB |
+| smallest `AITAGGER_VLM_UTIL` that starts | 0.17 (0.18 tried with 8 and with 32 seqs) | 0.19 (0.17: "no memory for the cache") |
+| VRAM at 0.22 (nvidia-smi) | 4.9 GB | 4.8 GB |
+| KV cache at 0.22 with 32 seqs | 63,780 tokens | 14,336 tokens |
+| one request | 0.94 s (190 tokens/s) | 1.15 s (150 tokens/s) |
+| 8 requests in flight | **6.4 requests/s** (382/min) | 4.8 (290/min) |
+| 16 in flight (`--max-num-seqs 32`) | 10.8 requests/s | 4.9 (KV-starved at 0.22) |
+| 32 in flight (`--max-num-seqs 32`) | 13.6 requests/s (815/min), 2,450 tokens/s | 5.0 at 0.22; 13.7 at 0.30 (6.8 GB) |
+
+FP8 gives the same quality (same shape of answers, no invalid JSON in either) with a third less weight memory, 30% more
+speed at 8 in flight and a 4.5 times larger KV cache for the same share, so it is the default. Startup: 43 s with the weights
+and the compile cache present (3.5 s of it is loading); the first start ever, with the 4.3 GB download and the compile, took
+143 s; a new FP8 / `--max-num-seqs` combination compiles once more (about 115 s), then it is cached. **Recommended:
+`AITAGGER_VLM_UTIL` 0.22** (4.9 GB used, KV room for 32 requests in flight at about 3 times the typical length; 0.18 works
+and saves 0.4 GB). With `vlm_parallel` 8 the describer does 6.4 requests/s, so describing is the slower stage next to tagging
+(16.4 pictures/s); at 16 it is 10.8 and at 32 13.6, so a higher `vlm_parallel` pays for it.
+
+Quality of the answers (48 real tag lists, 30 tags each, merged from WD + PixAI; plus 18 explicit lists: 11 real library
+lists rated questionable/explicit and 7 Danbooru lists written for the test; each with two prompts):
+- Valid JSON every time, `finish_reason` always `stop`, no thinking text, **no refusals** (more than 2,500 answers in all,
+  36 of them on explicit lists; the descriptions of those were neutral and factual).
+- Descriptions are fluent and follow the tags but invent what the tags do not say (setting, light, mood, "three girls"
+  where the tags say two). Examples (panel prompt, tags shortened):
+  1. *hat, 1boy, male focus, facial hair, baseball cap, earphones, beard, outdoors, real life, tiktok, ...* ->
+     "A close-up portrait of a young man with brown hair and facial hair, wearing a grey baseball cap and a black shirt,
+     looking directly at the camera with a closed mouth. He is outdoors in daylight, and the image appears slightly blurry."
+     (faithful; "young" and "daylight" are guesses). Its `add_tags` were "sunglasses" eight times: made up.
+  2. *sunna (zenless zone zero), zenless zone zero, 2girls, umbrella, green hair, backpack, pink bag, striped socks, ...* ->
+     "A screenshot from the game Zenless Zone Zero showing two female characters with green hair and green eyes standing
+     outdoors in a park-like setting, holding umbrellas. One character wears a white shirt and striped socks, while the
+     other wears a pink bag and pink footwear; the scene appears to be a beach or park on a sunny day." (recognises the
+     game, garbles who wears what, invents the place)
+  3. *chess piece, chessboard, board game, computer, bishop (chess), laptop, keyboard (computer), monitor, ...* ->
+     "A close-up view of a chessboard with several pieces arranged on it, including a bishop and a knight, viewed from
+     above. The scene is lit by natural light, creating soft shadows and highlighting the texture of the wood and the
+     metallic finish of the chess pieces." (right subject, invented light and material)
+- Tag edits are weak. Over 48 answers with the panel prompt (FP8): 66% of `add_tags` are not among the prompt's tags
+  (generic words such as "depth", "texture", "background", or made up), 5 answers repeated entries inside a list, 7 named a
+  tag in both lists, and 29% of the tags in `remove_tags` (122 of 415) were scored >= 0.9 by the taggers (the panel's guards
+  block those). With `presence_penalty: 1.0` plus a stricter ask (use only the tags; `add_tags` only what the owner's
+  instructions or preferred terms call for; `remove_tags` only for a direct contradiction) the same 48 gave 0 repeats, 0
+  both-lists, empty `remove_tags` and `add_tags` that are 90% echoes of existing tags; 7.2 requests/s at 8 in flight. The
+  descriptions were no more accurate with the stricter prompt. **Treat the describer as "tags to prose" and its tag edits as
+  low-trust.**
+
+**Everything at once** (GPU memory in GB; "busy" = all four working at the same time)
+
+| | VRAM |
+|---|---|
+| Immich ML | 2.2 |
+| tagger (cap 5, micro-batch 8) | 4.1 |
+| describer (FP8, 0.22, 8 seqs; 5.1 after load) | 4.9 |
+| Search+ (PE-Core-bigG bf16, batches of 16 pictures; a second copy of its image, measured loaded and busy) | 5.9 |
+| **total, measured with all four busy** | **17.3 of 24** (peak 17,735 MiB) |
+
+**Does Search+ fit next to the taggers and the describer within 22 GB? Yes**: 17.3 GB with all four working at once, so 4.7 GB
+of the 22 GB budget (6.7 GB of the card) stay free, and Immich ML would need to grow to about 7 GB to break it. Memory is not a reason
+for `GpuBusy`. Compute is shared, though: with all four busy at the same time the taggers did 6.1 pictures/s (alone 16.4),
+the describer 5.5 requests/s (alone 6.4) and Search+ 8.3 pictures/s (alone 26), so running them together finishes the sum of
+the work in about the time it takes one after the other, not faster. The panel can therefore drop the mutual exclusion; whether
+to keep Search+ paused while the taggers index is a speed preference, not a memory one.
+
+**Tag quality** on real library previews (anime/illustration, real photos, screenshots, memes; 48 previews tagged and
+looked at, 240 for the counts). Calibrated scores >= 0.5, abbreviated:
+
+| picture | WD | PixAI |
+|---|---|---|
+| photo: man with a cap and beard (TikTok selfie) | 1boy, male focus, facial hair, solo, hat, earphones, baseball cap, beard | hat, 1boy, male focus, solo, facial hair, baseball cap, earphones, short hair, outdoors; real_life 0.77, tiktok 0.74 |
+| photo: white sneaker in a shop | photorealistic, shoes, no humans, sneakers, nike (company), **traditional media, colored pencil (medium)** | shoes, no humans, sneakers, white shoes, socks, black socks, shoelaces, nike (company) |
+| photo: chess set in the dark | no humans, **keyboard, monitor**, still life, screen | **chess piece, chessboard, chess, board game, bishop, rook**, computer, laptop |
+| photo: bus interior with passengers | sitting, male focus, **car interior**, photo background, motor vehicle | photo background, sitting, multiple boys, **airplane interior 0.84, train interior 0.83** |
+| screenshot: map app | fake screenshot, english text, map, balloon, chat log | map 1.00, no humans, fake screenshot, english text, fake phone screenshot, user interface |
+| screenshot of a social post with anime art | pointy ears, elf, 3girls, santa hat, bikini, ... (no character) | same kind of tags plus **character rory_mercury 0.94, series "gate - jieitai ka no chi nite..." 1.00**, twitter 0.93 |
+| game screenshot (two girls, umbrellas) | umbrella, 2girls, backpack, bag, ... (no character) | 2girls, umbrella, green hair, ...; **character sunna_(zenless_zone_zero) 1.00**, series zenless_zone_zero 1.00 |
+| anime meme (girl with a halo and a flower) | 1girl, halo, flower, hair ornament, black hair, ... (no character) | hair ornament, flower, halo, 1girl; **character hatsune_miku 0.99**, vocaloid 0.97 |
+| line-art swordsman, hat and scarf | 1boy, monochrome, greyscale, sword, weapon, rice hat, katana | weapon, greyscale, monochrome, hat, sword, 1boy; series one_piece 0.97 (unchecked) |
+| screenshot: man in a tie, app UI | english text, 1boy, fake screenshot, necktie, blue necktie, open mouth | necktie, fake screenshot, english text, collared shirt, open mouth; social_network 0.89, instagram 0.92, youtube 0.87 |
+
+Over 240 random previews PixAI names a character in 59 pictures (WD: 30) and a series/platform in 102, and it adds `3d`
+(46 pictures), `social_network`, `spanish_text`, `pixel_art`; WD adds `asian`, `black_footwear`, `blurry_foreground`, `pixiv_id`.
+On the 32 pictures PixAI marks `real_life` the two taggers return about the same number of general tags (27 each, 16 in
+common). **PixAI on real photos:** better than expected for an anime model. It names the objects (chess set, sneakers,
+laptop, map), clothing and people counts about as well as WD, marks photos with `real_life` (0.77-0.91) and reads app
+chrome (`twitter`, `instagram`, `tiktok`, `youtube`, `fake_phone_screenshot`). It has no photographic vocabulary (WD's
+`realistic`, `photorealistic`, `asian` have no counterpart), people are `1boy`/`male_focus`, and scenery can be wrong
+(a bus as `airplane_interior`; WD said `car_interior`). WD in turn adds art-medium tags to photos that are plainly wrong
+(`colored_pencil_(medium)`) and missed the chess set. Neither is a photo tagger; together they cover each other, and PixAI's big
+gain is characters and series. Heads-up for the panel: PixAI's `copyright` also returns `original` (47 of 240 previews),
+`real_life`, `twitter`, `instagram`, `tiktok` and `youtube`; with `character_tags` merging all of `copyright`, these become tags.
 
 ## Decisions (v1; see v2 above)
 
@@ -77,43 +210,67 @@ the HTTP server answers at once, the models load in a background thread, and eve
 only its own slot.
 
 Environment: `AITAGGER_VRAM_GB` (memory cap for this process, default 5), `AITAGGER_BATCH` (GPU micro-batch,
-default 16), `IDLE_EXIT_MINUTES` (default 20; **must not exit while a request is in flight**), `WD_MODEL`, `RAM_MODEL`,
-`WD_PRECISION` (default `fp16`: the ONNX model is converted once and cached; `fp32` keeps the original). Model files live
-under `/cache` (`/cache/hub` is a Hugging Face cache). Built and measured: WD fp16 + RAM++ fp16 loads in about 6 s and
-holds about 4 GB of VRAM under the 5 GB cap; about 40 pictures/s with both models (WD alone 70/s, RAM++ alone 85/s).
-WD is run in micro-batches of at most 8 (bigger gains nothing); a CUDA out-of-memory answer halves the micro-batch of
-that model for the rest of the process (`effectiveBatch` in `/health`).
+default 8), `IDLE_EXIT_MINUTES` (default 20; **must not exit while a request is in flight**), `WD_MODEL`, `PIXAI_MODEL`,
+`PIXAI_REVISION`, `WD_PRECISION` (default `fp16`: the ONNX model is converted once and cached; `fp32` keeps the original),
+`PIXAI_PRECISION` (default `fp16`; `bf16` and `fp32` work). Model files live under `/cache` (`/cache/hub` is a Hugging Face
+cache); after the first start everything loads from there, offline, in about 4 s. The cap is split between the two
+runtimes: onnxruntime (WD) gets an arena of 1.6 GB (at most 40% of the cap), PyTorch (PixAI) the rest after 0.5 GB for the
+CUDA context. WD runs in micro-batches of at most 8 (bigger gains nothing). After loading, PixAI is warmed up at the full
+micro-batch and the batch is halved until it fits under the cap. Later, a CUDA out-of-memory answer halves the micro-batch
+of that model for the rest of the process (`effectiveBatch` in `/health`).
 
-RAM++ is **not** the official `ram` package (its pins, `timm==0.4.12`/`fairscale`/an old `transformers`, no longer
-install). The image build fetches one pinned commit of `xinyu1205/recognize-anything` and keeps only the Swin-L backbone
-source, the tag list with per-class thresholds and the licence files (`/opt/ram`); `tagger_service.py` implements the small
-tagging head itself. Checked against the official code on real pictures: identical logits in fp32, one tag in 167 flips in fp16.
+**WD** (`SmilingWolf/wd-eva02-large-tagger-v3`, Apache-2.0): 10,861 Danbooru tags, onnxruntime, input 448×448 NHWC BGR
+float32 0-255, the picture padded to a white square.
+
+**PixAI Tagger v1.0** (`pixai-labs/pixai-tagger-v1.0`, Apache-2.0): 30,877 Danbooru-style tags, a 486M-parameter ViTDet
+(SAM3) backbone with a pooled attention head, run with PyTorch fp16 and SDPA (flash) attention. The model code is the
+repository's own (`tagger_pipeline.py`, loaded by transformers with `trust_remote_code=True`), so the image build pins
+`transformers==4.57.6` (the version it was exported with) and the service pins one repository commit,
+`9fe10addf9326e292da8a85a98ea74cd91b41771` (2026-09-22): `config.json`, `preprocessor_config.json`, `tagger_pipeline.py`
+and `model.safetensors` (F32, 1.9 GB) are downloaded to the cache at the first load.
+- Labels: `config.json` holds the tag names and `tags_split`, so the tags are stored category after category:
+  general 15,043, character 8,308, copyright 2,460, style 4,917, meta 145, rating 4 (`rating:s`, `rating:g`, `rating:q`,
+  `rating:e`). Returned: general, character, copyright and rating, the last as `general`/`sensitive`/`questionable`/`explicit`
+  (the same names as WD, so the panel can average them). `style` and `meta` are dropped. Names keep their underscores.
+- Preprocessing (the repository's `RescalePadProcessor`, reproduced on the GPU): the RGB picture (transparency flattened
+  onto white) becomes a 0-1 tensor, is scaled by `r = min(1008/h, 1008/w)` to `(int(h*r), int(w*r))` with bilinear
+  interpolation and antialiasing (torchvision's tensor `resize`), centred on a **black** 1008×1008 canvas (`left = pw // 2`,
+  `top = ph // 2`), and normalised with mean 0.5 / std 0.5. Pictures smaller than 1008 px are scaled up. The sigmoid is
+  taken in float32 from the logits.
+- Checked against the official `transformers.pipeline` on 24 real pictures: in fp32 the largest score difference is 0.0001
+  (no decision differs); fp16 vs fp32 over 246 pictures: 0.20% of the decisions at 0.5 differ (largest score difference
+  0.011), bf16: 1.4% (0.129). fp16 is as fast as bf16, so it is the default.
 
 ### `GET /health`
 ```json
-{"status": "loading|ok|error", "error": null, "device": "cuda", "vramCapGb": 5, "batch": 16,
- "models": [{"name": "wd-eva02-large-tagger-v3", "kind": "wd", "tags": 10861, "precision": "fp16", "loadedIn": 4.1},
-            {"name": "ram_plus_swin_large_14m", "kind": "ram", "tags": 4585, "precision": "fp16", "loadedIn": 9.8}],
+{"status": "loading|ok|error", "error": null, "device": "cuda", "vramCapGb": 5, "batch": 8,
+ "effectiveBatch": {"wd": 8, "pixai": 8},
+ "models": [{"name": "wd-eva02-large-tagger-v3", "kind": "wd", "tags": 10861, "precision": "fp16", "loadedIn": 1.2},
+            {"name": "pixai-tagger-v1.0", "kind": "pixai", "tags": 30877, "precision": "fp16", "loadedIn": 2.7}],
  "idleExitMinutes": 20, "idleSeconds": 12, "busy": 0}
 ```
 
 ### `POST /tag`
 Request: `{"images": ["<base64 jpeg/png>", ...], "floor": 0.05}` (maximum 64 images). Optional: `"models": ["wd"]` or
-`["ram"]` runs only that model (default both; the other key is then absent), so the panel can skip a disabled tagger.
-`/health` also reports `effectiveBatch: {wd, ram}`. Any failure of one picture on one model makes that slot an error
-(`results[i]` null, `errors[i]` says which model).
+`["pixai"]` runs only that model (default both; the other key is then absent), so the panel can skip a disabled tagger.
+Any other name is a 400. Any failure of one picture on one model makes that slot an error (`results[i]` null, `errors[i]`
+says which model).
 
 Response:
 ```json
 {"results": [{"wd": {"general": {"long_hair": 0.93}, "character": {"hatsune_miku": 0.81},
                      "rating": {"general": 0.02, "sensitive": 0.71, "questionable": 0.2, "explicit": 0.07}},
-              "ram": {"dog": 0.88, "beach": 0.64}}, null],
+              "pixai": {"general": {"long_hair": 0.97}, "character": {"hatsune_miku": 0.99}, "copyright": {"vocaloid": 0.97},
+                        "rating": {"general": 0.21, "sensitive": 0.82, "questionable": 0.01, "explicit": 0.0}}}, null],
  "errors": [null, "cannot identify image file"], "tookMs": 412}
 ```
 Scores are **calibrated**, so 0.5 is the model's own recommended threshold for that tag:
-`s' = sigmoid(logit(s) - logit(t))`. Here `t` is 0.35 for WD general tags, 0.75 for WD character tags, and RAM++'s
-shipped per-class threshold for RAM++ tags. Only tags with `s' >= floor` are returned. WD `rating` is the model's raw
-probability for each rating. Tag names are model-native (WD keeps its underscores); the panel normalises them.
+`s' = sigmoid(logit(s) - logit(t))`. Here `t` is 0.35 for WD general tags, 0.75 for WD character tags, and the PixAI model
+card's 0.17 (general), 0.27 (character) and 0.24 (copyright) for PixAI. Only tags with `s' >= floor` are returned. The
+`rating` of both models is the model's raw probability for each rating (independent sigmoids: they need not add up to 1).
+Tag names are model-native; the panel normalises them. PixAI's `copyright` category also holds
+platform and medium tags, not only series: `original`, `real_life`, `twitter`, `instagram`, `tiktok`, `youtube` (in a sample of
+240 library previews, scored >= 0.5: original 47, instagram 34, real_life 32, twitter 31, youtube 26, tiktok 11).
 
 **Errors.** 503 while loading (above). A bad picture fails only its own slot (`results[i]` is `null`, `errors[i]` says
 why). **Out of graphics memory** is reported as HTTP 500 `{"error": "... CUDA out of memory ..."}`, or as such a text in
@@ -121,45 +278,40 @@ a slot's `errors[i]`; the panel looks for the words `out of memory` (any case), 
 and sends the assets again in smaller requests. Any other 5xx counts as "the service fell over" (the assets stay
 untagged and are tried again); a 4xx is a bug in the request.
 
-## 2. VLM (`immich_aitagger_vlm`)
+## 2. Describer (`immich_aitagger_vlm`)
 
-`vllm/vllm-openai` serving `Qwen/Qwen3.5-9B` as model name `tagger-vlm`, on `127.0.0.1:11441` (container port 8000).
-Flags: `--quantization fp8`, `--gpu-memory-utilization ${AITAGGER_VLM_UTIL}`, `--max-model-len 8192`,
-`--max-num-seqs ${AITAGGER_VLM_SEQS}`, `--limit-mm-per-prompt {"image":8}`, plus (added when building it, see below)
-`--max-num-batched-tokens 8192`, `--mm-processor-kwargs {"max_pixels":589824}` and
-`--default-chat-template-kwargs {"enable_thinking":false}`. Image `vllm/vllm-openai:v0.30.0`. The HF cache is a volume under
-`~/vlm/models/aitagger/hf` (the torch.compile cache is another, `.../vllm`). Ready means `GET /health` answers 200
-(about 2 minutes after `up`, once the weights are cached).
-
-**Memory (measured, RTX 4090, vLLM 0.30.0).** The FP8 weights take 10.8 GiB (embeddings, lm_head and the vision tower stay
-bf16), plus about 1 GiB of activations, plus the KV cache. `--gpu-memory-utilization 0.45` (11 GiB) therefore **cannot
-start**: "No available memory for the cache blocks". 0.51 is the bare minimum, 0.58 (13.9 GiB, 38k tokens of KV cache)
-runs 8 concurrent requests with 6 pictures each; the real footprint is about 0.8 GiB more than the fraction (CUDA
-context): 14.6 GiB at 0.58. With the formula in section 3 this needs `vram_gb >= 19` (0.58); the settings default is
-therefore 20 (0.62) with limits 18–21. Measured with everything running: Immich ML 2.2 GB + tagger 4.0 GB +
-VLM 14.6 GB = 21 GB of 24. Speed: one request with 6 pictures (about 2k prompt tokens, 200 answer tokens) takes
-about 3 s; 8 in flight give about 1.7-2 requests/s (100-125 per minute); the worst case of 8 pictures of 768x768 px each
-(5k prompt tokens) about 1 request/s. Thinking text never appears. A prompt that does not limit the tag lists made 4 of
-16 answers run into `max_tokens` (cut-off, invalid JSON); with `"maxItems": 12` on `add_tags` and `remove_tags` in the
-schema, 0 of 16 (vLLM enforces it), so the panel should add `maxItems` to its schema and ask for "at most 8" tags.
-Restarting the stopped container takes about 70 s; first start downloads 18 GB.
+`vllm/vllm-openai:v0.30.0` serving `Qwen/Qwen3.5-2B` (text only) as model name `tagger-vlm`, on `127.0.0.1:11441`
+(container port 8000). Flags: `--language-model-only` (every multimodal limit is 0: the vision tower is neither loaded
+nor profiled; the same as `--limit-mm-per-prompt '{"image":0}'`), `--quantization fp8`, `--gpu-memory-utilization
+${AITAGGER_VLM_UTIL}` (default 0.22), `--max-model-len 4096`, `--max-num-batched-tokens 4096`, `--max-num-seqs
+${AITAGGER_VLM_SEQS}` (default 8) and `--default-chat-template-kwargs {"enable_thinking":false}`. The HF cache is a volume
+under `~/vlm/models/aitagger/hf` (the torch.compile cache is another, `.../vllm`). Ready means `GET /health` answers 200
+(about 45 s after `up` once the weights and the compile cache are there; the first start downloads 4.3 GB and compiles,
+about 2.5 minutes; a `--max-num-seqs` value not used before compiles once more, about 70 s).
 
 The panel calls `POST /v1/chat/completions` with:
 - `model: "tagger-vlm"`, `temperature: 0.2`, `max_tokens: 400`
 - `chat_template_kwargs: {"enable_thinking": false}`
 - `response_format: {"type": "json_schema", ...}` (the schema below)
 
-Content: one system message, then one user message with the text part followed by 1–8 images as
-`{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}`. Each image is at most 768 px on its long side.
-
-The answer must match `{"description": str, "add_tags": [str], "remove_tags": [str]}`.
+Content: one system message, then one user message with text only (no pictures). The answer must match
+`{"description": str, "add_tags": [str], "remove_tags": [str]}`; `maxItems` is 12 on both lists (vLLM enforces it).
 
 The system prompt says this is a private personal archive, that every picture is described neutrally and factually
-including adult content, and that the model never refuses. The user text lists the detected tags with scores, the
-rating, the user's `instructions` and `vocabulary`, and asks for 1–2 sentences in `language`.
+including adult content, and that the model never refuses. The user text lists the final tags with scores, the rating,
+the user's `instructions` and `vocabulary`, and asks for 1-2 sentences in `language`.
 
 A refusal or an invalid JSON answer is retried once, then stored as `description: ""` and noted in that asset's
-status. It is **not** an asset failure.
+status. It is **not** an asset failure. (Measured: none in more than 2,500 answers, 36 of them on explicit tag lists.)
+
+**What a text-only 2B model can do** (details under "Measured (v2)"): the descriptions are fluent and follow the tags, but
+details the tags do not give (setting, mood, counts) are partly invented. `add_tags` are mostly filler or echoes of existing
+tags (about two thirds are not in the prompt tags and many are generic words), and `remove_tags` are noise: about a third of
+the tags it removes are scored >= 0.9 by the taggers. With `presence_penalty: 1.0` the lists no longer repeat entries (5-8 of
+48 answers did, 0 with it), and a prompt that asks for `add_tags` only when the owner's instructions or preferred terms call
+for it and for `remove_tags` only on a direct contradiction leaves `remove_tags` empty and makes `add_tags` mostly echoes
+(10% new). The guards in section 3 stay, but the panel should treat the describer as "tags to prose" and trust its tag
+edits little.
 
 ## 3. Panel module (`aitagger.py`)
 
