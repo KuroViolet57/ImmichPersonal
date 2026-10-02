@@ -6,7 +6,34 @@ asset's Immich description. It runs in the background like Search+ and keeps new
 
 This file is the contract between the parts. Change it when an interface changes.
 
-## v2 (2026-10-02) — supersedes everything below where they differ
+## v3 (2026-10-02) — supersedes v2 and v1 where they differ
+
+The owner: the text describer "doesn't enhance or improve anything"; the description should hold **tags only**. Instead,
+add a **third tagger** that is good on both real photos and illustration, or is bigger / more accurate.
+
+1. **No describer.** The `vlm` service/container, the VLM client, the prompt and the guards that existed for it are
+   removed. The settings `describe`, `instructions`, `language` and `vlm_parallel` are removed (old settings files
+   holding them still load; sending them is refused like any unknown key). `vocabulary` keeps only its
+   `old -> new` renames; other lines are ignored. Reprocess modes are `retag` and `full` (a stored or requested
+   `describe` counts as `retag`).
+2. **Block format:** `[AI Tagger]\nTags: a, b, c\n[/AI Tagger]`, with no Description line. Results made with a
+   Description line become outdated (settings version bump), and a `retag` rewrites them without the line.
+3. **Taggers are a registry.** There is an ordered list of tagger kinds (`wd`, `pixai`, then the third, whose key
+   is chosen by the research). Each has `use_<key>` and `<key>_strictness` settings, a label, the categories it
+   contributes (general / character / copyright…), and whether it reports a rating. Everything that was hard-wired
+   to two taggers loops over the registry:
+   - detection and merging (highest score wins, `source` = that tagger's key)
+   - the rating (mean of the enabled taggers that report one)
+   - the status `models` labels, the preview's per-model lists, and the settings validation
+   - **the explicit-tag check:** on a general/sensitive rating, a tag in `EXPLICIT_TAGS` is kept only when **at
+     least two enabled taggers** found it. With a single tagger on, it is dropped.
+4. **The third tagger** runs in the same `tagger` container and `/tag` answer under its own key, with the same
+   calibration idea (0.5 = its recommended threshold) and `floor`. The research picks the model; its key, label,
+   categories and measured numbers are written here when it is integrated.
+5. **GPU:** only the `immich_aitagger` container. `vram_gb` stays the taggers' cap. Defaults and limits are
+   re-measured with three taggers.
+
+## v2 (2026-10-02) — superseded by v3 where they differ
 
 The owner found the 9B vision model too heavy for what it is needed for: stringing the tags into a short
 description. v2 changes:
