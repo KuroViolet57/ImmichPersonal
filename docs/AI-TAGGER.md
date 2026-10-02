@@ -16,6 +16,7 @@ This file is the contract between the parts. Change it when an interface changes
 | `vram_gb` | default **6**, limits **5–8** (four taggers: 5.77 GB at 6, ~11 pictures/s; under ~5 GB they don't load) |
 | Description block | `[AI Tagger]\nTags: …\n[/AI Tagger]` — no describer |
 | Vocabulary box | "Renames and combinations": `a -> b`, `a + b -> c`, `a \| b -> c`, `a + !b -> c`, `-tag` removes (see the section at the end of v3) |
+| Indexer | pipelined across rounds: ≤ 2 tagger requests in flight (`Indexer.TAG_REQUESTS`) while the next round's pictures are prepared, so the GPU is not idle at round boundaries (see "Indexer: pipelined across rounds" in v3, panel side) |
 
 ## v3 (2026-10-02) — supersedes v2 and v1 where they differ
 
@@ -502,6 +503,33 @@ exits by itself after `IDLE_EXIT_MINUTES` (`tagger_service.py`). Write-back para
 **GPU sharing with Search+.** `searchplus.AITAGGER_CONTAINER` (environment `AITAGGER_CONTAINER`, default
 `immich_aitagger`) replaces `AITAGGER_VLM_CONTAINER`; `GpuBusy` is raised for it, and only while `AITAGGER_EXCLUSIVE` is
 true. `AITAGGER_EXCLUSIVE` stays `False`.
+
+**Indexer: pipelined across rounds** (this replaces the "Indexer" description under "Implementation notes", which is the v1
+one). One round is `batch_size` assets: `Store.work(batch_size, skip=<claimed>)`, then the pictures are read / cut by
+`WORKERS` (6) threads and sent to the tagger in batches of at most `batch_size` assets and 64 pictures, the first as soon as
+it is full and the last, partial one as soon as the round's pictures are ready. A round **returns when its last batch is
+sent, not when it is answered**: the tagger requests in flight are state of the indexer (`_tag_futs`), not of the round, so
+the next round's pictures are read and cut (previews, ffmpeg) while the GPU is still busy with the earlier ones. Before
+this, each round ended by waiting for all its requests, the next round's preparation started only then, and the GPU was
+idle at every round boundary (measured: ~95 % busy with regular 0 % gaps, 244 assets/min at `batch_size` 32 with four
+taggers).
+- **The limit.** `TAG_REQUESTS` (2) requests are in flight at most; `_send` waits (`_reap_tags`) only while that many are
+  out. The pictures held in memory are therefore the ones of the requests in flight plus the round being prepared: at most
+  `TAG_REQUESTS + 1` batches. `store.work` does not fetch further ahead: the round in hand is the look-ahead, and the GPU
+  stays fed as long as one round's preparation (plus the wait for write-back, `_reap(WRITERS)`) takes less than
+  `TAG_REQUESTS` batches on the GPU.
+- **Claims.** An asset is claimed (`_inflight`, skipped by `Store.work`) from the start of its round until it is written,
+  failed or given back, so it is never tagged twice at once, however many rounds overlap. A request that fails (or a pause)
+  gives back the assets that did not get as far as the write-back stage.
+- **Failures.** A request's exception (`ServiceDown`, anything else) is raised by the next `_send`, by the start of the next
+  `_step`, or by the wait at the end of the work (`_step` ends the run only when no request is in flight and nothing is waiting
+  to be written), so it reaches `_run`'s handling as before: `ServiceDown` is waited out (3 in a row with nothing finished
+  end the run), other exceptions end it with an error. `_drain` waits for the requests in flight, then the write-back stage,
+  and looks at no outcome. While a request is on the GPU, a round does not ask the server for its health again.
+- **Pausing** stops sending (a batch waiting for a free slot goes back to the pool), then `_run` waits for the requests on the
+  GPU and their write-back (`_drain`): nothing stays claimed and nothing is lost; the rest is worked on at the next start.
+- **Out of memory** halves the batch as before; the cap is remembered together with the `batch_size` the batch was made under
+  (`_tag_halving(batch, models, want)`), since rounds with different settings can now overlap.
 
 **API and screens.** The status has no `vlm` under `service`, `models` is `{key: label}`, `limits` and `settings` have the
 generated keys, and `reprocessKeys` is `{retag: [...], full: [...]}`. The preview has `models.<key>` per registered tagger,
@@ -1102,7 +1130,8 @@ asset with no stored scores becomes `full`. Excluding an asset takes it off the 
 
 **Indexer.** Pipelined: pictures are prepared (6 threads), tagged (≤ 2 requests in flight, ≤ `batch_size` assets and ≤ 64
 pictures each), then described and written (`vlm_parallel` at a time) while the next assets are already being
-prepared. 3 servers going away in a row, with nothing finished in between, end the run with an error. A CUDA
+prepared. (v3: no describer, and the requests in flight carry over from one round to the next: see "Indexer: pipelined
+across rounds" in "v3, panel side: as built".) 3 servers going away in a row, with nothing finished in between, end the run with an error. A CUDA
 out-of-memory answer sets a session cap on the batch size (half of the failed batch) that is dropped when the owner
 changes `batch_size`; a single picture that does not fit fails that asset only.
 

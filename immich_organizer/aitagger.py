@@ -1695,6 +1695,13 @@ class Indexer:
     Work order: the queue (asked-for reprocessing) first, then the assets with no written result, newest first.
     Pictures are prepared by ``WORKERS`` threads, at most ``TAG_REQUESTS`` tagger requests are in flight, and
     ``WRITERS`` assets are in the write-back stage (Immich) at once.
+
+    The stages overlap *across rounds*: a round (``batch_size`` assets) hands its batches to the tagger and returns
+    without waiting for the answers, so the next round's pictures are read and cut while the GPU is still busy with the
+    earlier ones. The requests in flight are state of the indexer (``_tag_futs``), not of the round; a round only
+    waits when ``TAG_REQUESTS`` requests are already out. So the GPU has the next batch waiting at every round
+    boundary, and at most ``TAG_REQUESTS + 1`` batches of pictures are in memory (the ones on the GPU and the round
+    being prepared).
     """
 
     CATALOG_EVERY = 600         # re-read the library list this often (and look for new photos)
@@ -1715,13 +1722,13 @@ class Indexer:
         self.done_times: collections.deque = collections.deque(maxlen=2000)
         self.batch_cap: int | None = None       # halved by a CUDA out-of-memory answer, for this session
         self._cap_for = None
-        self._round_batch = DEFAULTS["batch_size"]
         self._lock = threading.Lock()
         self._sync_lock = threading.Lock()
         self._flight_lock = threading.Lock()
         self._wake = threading.Event()          # cuts the "up to date" wait short (Start, Try again, reprocess)
-        self._inflight: set[str] = set()
-        self._pending: set = set()
+        self._inflight: set[str] = set()        # claimed assets: being prepared, tagged or written
+        self._pending: set = set()              # write-back futures (a failure that matters is raised by _reap)
+        self._tag_futs: set = set()             # tagger requests in flight, across rounds (a failure is raised by _reap_tags)
         self._done = 0                          # assets finished in this process (progress, for the drop counter)
         self._prep = self._tagpool = self._writepool = None
 
@@ -1826,13 +1833,17 @@ class Indexer:
         """One look for work and one round of it: "over" when the run is finished, "idle" when there was nothing
         to do, else "busy"."""
         version, settings = self.pipe.snapshot()
+        self._reap_tags(self.TAG_REQUESTS)      # a request that failed since the last look: raise it before more is read
         if self.last_sync is None or self.clock() - self.last_sync >= self.CATALOG_EVERY:
             self.state, self.detail = "running", "reading the library list"
             self.refresh_catalog()
+        # One round is one batch: the pictures of ``TAG_REQUESTS`` requests are on the GPU side and this round's are
+        # being prepared, which is as far ahead as it pays to read (and as much memory as it is worth).
         items = self.store.work(self.batch_size(settings), skip=self._flying())
         if not items:
-            if self._pending:
-                self._reap(0, stop)             # earlier assets are still being written
+            if self._tag_futs or self._pending:
+                self._reap_tags(0, stop)        # earlier assets are still on the tagger ...
+                self._reap(0, stop)             # ... or being written
                 return "busy"
             if not settings["keep_updated"]:
                 self.state, self.detail = "done", "everything is tagged"
@@ -1867,7 +1878,6 @@ class Indexer:
 
     # ---- one round
     def _round(self, items: list[dict], settings: dict, version: int, stop: threading.Event) -> None:
-        self._round_batch = int(settings["batch_size"])
         for item in items:
             self._claim(item["id"])
         try:
@@ -1891,15 +1901,18 @@ class Indexer:
                     self._release(item["id"])
 
     def _capture_and_tag(self, items: list[dict], settings: dict, version: int, stop: threading.Event) -> None:
+        """Prepare the pictures of these assets and hand them to the tagger in batches. Returns when the last batch
+        is *sent*, not when it is answered: the requests go on (``_tag_futs``) while the next round is prepared."""
         wanted = [kind.key for kind in enabled_kinds(settings)]
         need_tagger = bool(wanted)
-        self.state, self.detail = "starting", "waiting for the models"
-        self.services.ensure_ready(need_tagger=need_tagger, wait=3600, stop=stop,
-                                   progress=lambda d: setattr(self, "detail", d))
+        if not self.tag_requests():             # a request on the GPU proves the server answers: no need to ask
+            self.state, self.detail = "starting", "waiting for the models"
+            self.services.ensure_ready(need_tagger=need_tagger, wait=3600, stop=stop,
+                                       progress=lambda d: setattr(self, "detail", d))
         self.state, self.detail = "running", "tagging"
         futures = {self._prep.submit(self.pipe.frames, item, settings["video_frames"]): item for item in items}
         batch: list[tuple[dict, list[bytes]]] = []
-        images, tag_futs = 0, set()
+        images = 0
         try:
             for fut in as_completed(futures):
                 if stop.is_set():
@@ -1915,64 +1928,92 @@ class Indexer:
                     self._submit_finish(item, settings, version)
                     continue
                 if batch and images + len(frames) > MAX_IMAGES_PER_REQUEST:
-                    tag_futs = self._send(batch, tag_futs, settings, version)
+                    if not self._send(batch, settings, version, stop):
+                        break
                     batch, images = [], 0
                 batch.append((item, frames))
                 images += len(frames)
                 item["_handed"] = True
                 if len(batch) >= self.batch_size(settings):
-                    tag_futs = self._send(batch, tag_futs, settings, version)
+                    if not self._send(batch, settings, version, stop):
+                        break
                     batch, images = [], 0
-            if batch and not stop.is_set():
-                tag_futs = self._send(batch, tag_futs, settings, version)
-                batch = []
-            for fut in list(tag_futs):
-                fut.result()                    # re-raises ServiceDown
+            if batch and not stop.is_set():     # the round's last, partial batch: out now, it waits for nothing
+                if self._send(batch, settings, version, stop):
+                    batch = []
         finally:
             for fut in futures:
                 fut.cancel()
-            for item, _ in batch:               # a batch never sent (stopped): back to the pool of work
+            for item, _ in batch:               # a batch never sent (stopped, or a request failed): back to the pool
                 self._release(item["id"])
-            wait(list(tag_futs))
 
-    def _send(self, batch: list, tag_futs: set, settings: dict, version: int) -> set:
-        while len(tag_futs) >= self.TAG_REQUESTS:       # one on the GPU, one being prepared
-            done, tag_futs = wait(tag_futs, return_when=FIRST_COMPLETED)
+    def tag_requests(self) -> int:
+        """Tagger requests in flight: sent and not answered yet."""
+        with self._flight_lock:
+            return sum(1 for fut in self._tag_futs if not fut.done())
+
+    def _send(self, batch: list, settings: dict, version: int, stop: threading.Event) -> bool:
+        """Hand a batch to the tagger and return at once. It waits only while ``TAG_REQUESTS`` requests are already in
+        flight (that bounds the pictures held), and raises the failure of a request that finished meanwhile
+        (``ServiceDown`` ...); the batch is then not sent and the caller gives its assets back. False: paused while
+        waiting, nothing was sent."""
+        self._reap_tags(self.TAG_REQUESTS - 1, stop)
+        if stop.is_set():
+            return False
+        with self._flight_lock:                 # (submitted and registered as one step: a request never runs unseen)
+            self._tag_futs.add(self._tagpool.submit(self._tag_stage, batch, settings, version))
+        return True
+
+    def _reap_tags(self, limit: int, stop: threading.Event | None = None) -> None:
+        """Wait until at most ``limit`` tagger requests are in flight; re-raise the first failure among the requests
+        that have finished (their assets are already back in the pool of work)."""
+        while True:
+            with self._flight_lock:
+                done = {f for f in self._tag_futs if f.done()}
+                self._tag_futs -= done
+                waiting = set(self._tag_futs)
             for fut in done:
-                fut.result()
-        tag_futs = set(tag_futs)
-        tag_futs.add(self._tagpool.submit(self._tag_stage, batch, settings, version))
-        return tag_futs
+                fut.result()                    # re-raises ServiceDown
+            if len(waiting) <= limit or (stop is not None and stop.is_set()):
+                return
+            wait(waiting, timeout=0.5, return_when=FIRST_COMPLETED)
 
     def _tag_stage(self, batch: list, settings: dict, version: int) -> None:
+        """One tagger request (runs on a tag thread): tag the batch, store the scores, hand each asset to the
+        write-back stage. Whatever goes wrong, the assets that did not get that far are released."""
+        settled: set[str] = set()               # failed (and noted) or handed to the write-back stage: not ours any more
         try:
-            results = self._tag_halving(batch, [kind.key for kind in enabled_kinds(settings)])
+            models = [kind.key for kind in enabled_kinds(settings)]
+            results = self._tag_halving(batch, models, int(settings["batch_size"]))
+            for item, _frames in batch:
+                res = results[item["id"]]
+                if isinstance(res, str):
+                    self.store.fail(item["id"], res)
+                    self._release(item["id"])
+                else:
+                    self.store.save_raw(item["id"], res)
+                    item["raw"] = res
+                    self._submit_finish(item, settings, version)
+                settled.add(item["id"])
         except BaseException:
             for item, _ in batch:
-                self._release(item["id"])
+                if item["id"] not in settled:
+                    self._release(item["id"])
             raise
-        for item, _frames in batch:
-            res = results[item["id"]]
-            if isinstance(res, str):
-                self.store.fail(item["id"], res)
-                self._release(item["id"])
-                continue
-            self.store.save_raw(item["id"], res)
-            item["raw"] = res
-            self._submit_finish(item, settings, version)
 
-    def _tag_halving(self, batch: list, models: list[str]) -> dict:
-        """Tag a batch; when the card is out of memory, halve the batch size (for this session) and retry."""
+    def _tag_halving(self, batch: list, models: list[str], want: int) -> dict:
+        """Tag a batch; when the card is out of memory, halve the batch size (for this session) and retry. ``want`` is
+        the ``batch_size`` setting the batch was made under: the cap holds only while the owner keeps that value."""
         try:
             return self.pipe.tag_batch(batch, models)
         except GpuOOM as exc:
             half = max(1, len(batch) // 2)
-            self.batch_cap, self._cap_for = half if len(batch) > 1 else 1, self._round_batch
+            self.batch_cap, self._cap_for = half if len(batch) > 1 else 1, want
             if len(batch) == 1:
                 return {batch[0][0]["id"]: f"out of graphics memory, even for this one picture ({exc})"[:300]}
             self.detail = f"the graphics card is full: now {half} assets at a time"
-            out = self._tag_halving(batch[:half], models)
-            out.update(self._tag_halving(batch[half:], models))
+            out = self._tag_halving(batch[:half], models, want)
+            out.update(self._tag_halving(batch[half:], models, want))
             return out
 
     # ---- the write-back stage
@@ -2010,8 +2051,15 @@ class Indexer:
             wait(waiting, timeout=1, return_when=FIRST_COMPLETED)
 
     def _drain(self) -> None:
-        """Wait for everything in the write-back stage to finish (their outcome is already recorded or doesn't matter)."""
+        """Wait for everything in flight: the tagger requests (each hands its assets to the write-back stage as it
+        ends), then the write-back stage. Their outcome is already recorded or doesn't matter: a request that failed
+        has given its assets back, and the next round looks at them again."""
         with self._flight_lock:
+            tagging = list(self._tag_futs)
+        if tagging:
+            wait(tagging)
+        with self._flight_lock:
+            self._tag_futs -= {f for f in self._tag_futs if f.done()}
             pending = list(self._pending)
         if pending:
             wait(pending)
