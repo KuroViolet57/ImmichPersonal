@@ -208,7 +208,7 @@ class TestSettings(Base):
         s = at.load_settings()
         self.assertEqual(s, at.DEFAULTS)
         self.assertEqual((s["video_frames"], s["batch_size"], s["vlm_parallel"], s["vram_gb"]),
-                         (6, 8, 8, at.VRAM_GB_DEFAULT))
+                         (6, 8, 16, at.VRAM_GB_DEFAULT))
         self.assertEqual((s["use_wd"], s["use_pixai"], s["wd_strictness"], s["pixai_strictness"]), (True, True, 0.5, 0.5))
         self.assertNotIn("use_ram", s)
         self.assertNotIn("ram_strictness", s)
@@ -975,7 +975,7 @@ class TestVlmClient(unittest.TestCase):
         text = at.vlm_prompt([{"tag": "dog", "score": 0.91}, {"tag": "grass", "score": 0.7}], {"general": 0.9, "explicit": 0.02},
                              S(instructions="  Be brief.  ", language="Dutch"), ["puppy", "garden"], "VIDEO")
         for needle in ("in one video", "dog 0.91, grass 0.70", "explicit 0.02, general 0.90", "Be brief.",
-                       "puppy; garden", "in Dutch", "1-2 sentences", "at most 8", "never invent", "suggest summer"):
+                       "puppy; garden", "in Dutch", "1-2 sentences", "at most 8", "do not add a place", "instructions ask for it"):
             self.assertIn(needle, text)
         self.assertNotIn("image(s)", text)               # there is no picture to refer to
         bare = at.vlm_prompt([], {}, S(), [], "IMAGE")
@@ -2038,7 +2038,7 @@ class TestServices(Base):
                                sleep=self.clock.sleep, search_stop=lambda: self.stopped_search.append(len(self.runner.calls)), **kw)
 
     def test_vram_gb_is_the_taggers_cap_and_the_describers_share_is_a_constant(self):
-        default = {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT), "AITAGGER_VLM_UTIL": str(at.VLM_UTIL), "AITAGGER_VLM_SEQS": "8"}
+        default = {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT), "AITAGGER_VLM_UTIL": str(at.VLM_UTIL), "AITAGGER_VLM_SEQS": "16"}
         self.assertEqual(self.svc.env(), default)
         lo, hi = at.VRAM_GB_LIMITS
         for gb in (lo, hi):                                                 # AITAGGER_VRAM_GB = vram_gb, nothing else moves
@@ -2066,7 +2066,7 @@ class TestServices(Base):
         self.assertEqual(cmds[1], ["docker", "compose", "-p", "immich-aitagger", "-f", compose, "up", "-d", "vlm"])
         for _, env in [c for c in self.runner.calls if c[0][:2] == ["docker", "compose"]]:
             self.assertEqual(env, {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT), "AITAGGER_VLM_UTIL": str(at.VLM_UTIL),
-                                   "AITAGGER_VLM_SEQS": "8"})
+                                   "AITAGGER_VLM_SEQS": "16"})
         self.assertEqual(self.svc.load(), [])                               # already running: nothing to do
         self.assertEqual(len(self.runner.ups()), 2)
 
@@ -2079,7 +2079,7 @@ class TestServices(Base):
         self.svc.load()
         self.assertFalse(any("--force-recreate" in c for c in self.runner.ups()))
         self.assertEqual(json.loads(self.store.meta("services_env"))["immich_aitagger_vlm"],
-                         {"AITAGGER_VLM_UTIL": str(at.VLM_UTIL), "AITAGGER_VLM_SEQS": "8"})
+                         {"AITAGGER_VLM_UTIL": str(at.VLM_UTIL), "AITAGGER_VLM_SEQS": "16"})
         self.svc.unload()
         self.runner.calls.clear()
         self.svc.load()                                                     # same settings: a plain start
@@ -2091,7 +2091,7 @@ class TestServices(Base):
         recreated = [c[-1] for c in self.runner.ups() if "--force-recreate" in c]
         self.assertEqual(recreated, ["vlm"])                               # the tagger's env did not change
         self.svc.unload()
-        self.set(vram_gb=at.VRAM_GB_LIMITS[0] + 2)                          # the taggers' cap: only the tagger is recreated
+        self.set(vram_gb=at.VRAM_GB_LIMITS[1])                              # the taggers' cap: only the tagger is recreated
         self.runner.calls.clear()
         self.svc.load()
         self.assertEqual([c[-1] for c in self.runner.ups() if "--force-recreate" in c], ["tagger"])
@@ -2114,6 +2114,7 @@ class TestServices(Base):
         self.svc.load()
         self.assertEqual([c[-1] for c in self.runner.ups() if "--force-recreate" in c], ["vlm"])
 
+    @mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True)
     def test_search_plus_is_stopped_before_anything_starts(self):
         self.runner.state["immich_searchplus"] = "running"
         self.svc.load()
@@ -2127,7 +2128,7 @@ class TestServices(Base):
         self.assertEqual(self.stopped_search, [])
 
     def test_the_exclusive_switch_decides_whether_search_plus_is_stopped(self):
-        self.assertTrue(sp.AITAGGER_EXCLUSIVE)                              # the shipped value: they take turns
+        self.assertFalse(sp.AITAGGER_EXCLUSIVE)     # shipped: they share the card (measured 17.3 GB with everything)
         for exclusive in (True, False):
             with self.subTest(exclusive=exclusive), mock.patch.object(sp, "AITAGGER_EXCLUSIVE", exclusive):
                 self.runner.state = {"immich_searchplus": "running"}

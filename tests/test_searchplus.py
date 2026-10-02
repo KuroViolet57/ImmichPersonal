@@ -356,7 +356,7 @@ class TestGpuBusy(Base):
     def test_gpu_busy_is_a_service_down_with_the_contract_message(self):
         self.assertTrue(issubclass(sp.GpuBusy, sp.ServiceDown))
         self.assertEqual(sp.AITAGGER_VLM_CONTAINER, "immich_aitagger_vlm")
-        with self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):
+        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):
             with self.assertRaises(sp.GpuBusy) as ctx:
                 sp.Service().start()
         self.assertEqual(str(ctx.exception), "The GPU is in use by the AI Tagger — pause it to use Search+")
@@ -364,12 +364,13 @@ class TestGpuBusy(Base):
 
     def test_ready_raises_it_too_so_searches_get_a_clear_answer(self):
         service = sp.Service()
-        with self.docker({"immich_aitagger_vlm": True}), mock.patch.object(service, "health", return_value=None):
+        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_aitagger_vlm": True}), \
+                mock.patch.object(service, "health", return_value=None):
             with self.assertRaises(sp.GpuBusy):
                 service.ready(wait=1)
 
     def test_the_exclusive_switch_is_the_one_place_that_decides(self):
-        self.assertTrue(sp.AITAGGER_EXCLUSIVE)                                  # the shipped value: they take turns
+        self.assertFalse(sp.AITAGGER_EXCLUSIVE)     # shipped: they share the card (measured 17.3 GB with everything)
         with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):
             with self.assertRaises(sp.GpuBusy):
                 sp.Service().start()

@@ -51,9 +51,9 @@ VLM_MODEL = "tagger-vlm"
 MODEL_LABELS = {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0", "vlm": "Qwen3.5-2B (text)"}
 
 # ---- graphics memory. PROVISIONAL: these come from measurements that are still being made; change them here only.
-VRAM_GB_DEFAULT = 8           # setting `vram_gb`, its default: the memory cap of the two taggers (AITAGGER_VRAM_GB)
-VRAM_GB_LIMITS = (4, 16)      # what `vram_gb` may be set to
-VLM_UTIL = 0.14               # the describer's share of the whole card (AITAGGER_VLM_UTIL); ~3 GB on a 24 GB card
+VRAM_GB_DEFAULT = 5           # setting `vram_gb`, its default: the memory cap of the two taggers (AITAGGER_VRAM_GB)
+VRAM_GB_LIMITS = (3, 8)       # what `vram_gb` may be set to
+VLM_UTIL = 0.22               # the describer's share of the whole card (AITAGGER_VLM_UTIL); measured 5.1 GB on 24 GB
 # ----
 
 DEFAULT_GPU_GB = 24           # when nvidia-smi can't say
@@ -157,7 +157,7 @@ class Vocabulary:
 # ---------------------------------------------------------------- settings
 
 DEFAULTS = {
-    "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vlm_parallel": 8,
+    "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vlm_parallel": 16,
     "vram_gb": VRAM_GB_DEFAULT,
     "describe": True, "use_wd": True, "use_pixai": True, "wd_strictness": 0.5, "pixai_strictness": 0.5,
     "character_tags": True, "rating_tag": True, "max_tags": 30, "instructions": "", "vocabulary": "",
@@ -684,9 +684,10 @@ def vlm_prompt(tags: list[dict], rating: dict, settings: dict, terms: list[str],
         lines.append("Preferred terms (use these words when they fit): " + "; ".join(terms[:80]))
     lines.append(
         f"Write the description in {settings['language']}: 1-2 sentences saying what the {what} shows, as far as the "
-        "tags imply it, following the instructions. Use only what the tags support; never invent details. "
-        "add_tags and remove_tags may hold at most 8 entries each, and should normally stay empty: use them only when "
-        "the instructions or the tags themselves clearly call for it (for example beach and swimsuit suggest summer). "
+        "tags imply it, following the instructions. Use only what the tags say: do not add a place, setting, "
+        "lighting, time of day, weather, mood or story unless a tag names it. "
+        "add_tags and remove_tags may hold at most 8 entries each and normally stay empty: add a tag only when the "
+        "owner's instructions ask for it, and remove one only when it directly contradicts other tags. "
         "add_tags are short lowercase English tags; remove_tags are tags from the list above, spelled exactly the same. "
         'Answer with a JSON object {"description": "...", "add_tags": [...], "remove_tags": [...]}.')
     return "\n".join(lines)
@@ -749,7 +750,7 @@ class VLM:
     def ask(self, prompt: str) -> str:
         """One round trip; the answer's text. Raises ServiceDown / VLMRejected."""
         data = self._post({
-            "model": self.model, "temperature": 0.2, "max_tokens": 400,
+            "model": self.model, "temperature": 0.2, "max_tokens": 400, "presence_penalty": 1.0,
             "chat_template_kwargs": {"enable_thinking": False},
             "response_format": {"type": "json_schema",
                                 "json_schema": {"name": "tagger_answer", "strict": True, "schema": VLM_SCHEMA}},

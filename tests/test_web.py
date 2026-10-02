@@ -1313,7 +1313,7 @@ class TestAiTagger(WebCase):
         self.assertEqual(data["service"]["tagger"]["status"], "down")
         self.assertEqual(data["service"]["gpu"], {"totalGb": 24, "usedGb": 1.0})
         self.assertFalse(data["service"]["searchplusRunning"])
-        self.assertIs(data["service"]["exclusive"], True)                       # Search+ and the tagger take turns on the GPU
+        self.assertIs(data["service"]["exclusive"], False)                      # shipped: they share the card
         with mock.patch.object(self.sp, "AITAGGER_EXCLUSIVE", False):
             self.assertIs(self.get("/api/aitagger")["service"]["exclusive"], False)
         self.assertEqual(data["models"], {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0",

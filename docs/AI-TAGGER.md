@@ -183,13 +183,13 @@ gain is characters and series. Heads-up for the panel: PixAI's `copyright` also 
 The panel code (`aitagger.py`, `searchplus.py`, the web tab) follows the list above. Where it adds to it or chose
 something the list leaves open:
 
-- **Memory constants** sit together at the top of `aitagger.py`, marked provisional: `VRAM_GB_DEFAULT = 8`,
-  `VRAM_GB_LIMITS = (4, 16)` and `VLM_UTIL = 0.14` (the describer's share of the whole card, about 3 GB on 24 GB).
-  `vram_gb` is passed as `AITAGGER_VRAM_GB`; `AITAGGER_VLM_UTIL` is `VLM_UTIL`, whatever the card or `vram_gb`. The
-  nvidia-smi reading is now only shown in the status. A container is still recreated when its remembered env differs,
-  so changing a constant in the code takes effect at the next start. An old `settings.json` with `vram_gb` 18-21 is out
-  of range now, so that one value falls back to the default.
-- **Exclusivity** is one module-level switch, `searchplus.AITAGGER_EXCLUSIVE` (default `True`). `False`: Search+ starts
+- **Memory constants** sit together at the top of `aitagger.py`, set from the measurements: `VRAM_GB_DEFAULT = 5`,
+  `VRAM_GB_LIMITS = (3, 8)` and `VLM_UTIL = 0.22` (the describer's share of the whole card, 5.1 GB measured);
+  `vlm_parallel` defaults to 16 (describing is the slower stage); `searchplus.AITAGGER_EXCLUSIVE = False`
+  (everything fits together in 17.3 GB). The describer is sent `presence_penalty: 1.0` and a stricter prompt
+  (no invented place, setting, light, time, weather, mood or story; tag edits only when the owner's instructions
+  ask, removals only on a direct contradiction), because the measurements showed it inventing setting and mood.
+- **Exclusivity** is one module-level switch, `searchplus.AITAGGER_EXCLUSIVE` (shipped `False` since v2 measurements). `False`: Search+ starts
   while the describer container runs (no `GpuBusy`), and the AI Tagger no longer stops a running Search+ before it
   starts its containers. The status `service` has `exclusive` (the switch), so the tab hides its "Search+ is paused"
   notes when it is `False`.
@@ -367,7 +367,7 @@ Storage lives in `state_dir()/aitagger/`: `settings.json` and `tagger.sqlite` (W
 | keep_updated | true | bool | |
 | video_frames | 6 | int 1–8 (UI offers 2 / 6) | yes |
 | batch_size | 8 | int 1–64 (assets per round) | |
-| vlm_parallel | 8 | int 1–32 (concurrent VLM requests, also `--max-num-seqs`) | |
+| vlm_parallel | 16 (v2) | int 1–32 (concurrent VLM requests, also `--max-num-seqs`) | |
 | vram_gb | 20 | int 18–21 (taggers + VLM together; below 18 the VLM cannot start, above 21 the card runs out next to Immich ML) | |
 | describe | true | bool | yes |
 | use_wd, use_ram | true | bool | yes |

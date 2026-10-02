@@ -42,7 +42,7 @@ AITAGGER_VLM_CONTAINER = os.environ.get("AITAGGER_VLM_CONTAINER", "immich_aitagg
 # Whether Search+ and the AI Tagger take turns on the graphics card. True: Search+ will not start while the tagger's
 # language model runs (GpuBusy), and the AI Tagger stops a running Search+ before it starts its own containers.
 # False: they may run at the same time (set it when the card has room for both); nothing is stopped or refused.
-AITAGGER_EXCLUSIVE = True
+AITAGGER_EXCLUSIVE = False
 DEFAULTS = {"indexing": False, "keep_updated": True, "video_frames": 4}
 LIMITS = {"video_frames": (1, 8)}
 FRAME_SIDE = 640              # frames are sent at most this big; the model looks at 448 x 448
