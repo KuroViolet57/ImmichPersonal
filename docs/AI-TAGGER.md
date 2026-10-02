@@ -19,7 +19,7 @@ add a **third tagger** that is good on both real photos and illustration, or is 
 2. **Block format:** `[AI Tagger]\nTags: a, b, c\n[/AI Tagger]`, with no Description line. Results made with a
    Description line become outdated (settings version bump), and a `retag` rewrites them without the line.
 3. **Taggers are a registry.** There is an ordered list of tagger kinds (`wd`, `pixai`, `ram`: the third is RAM++,
-   item 4). Each has `use_<key>` and `<key>_strictness` settings, a label, the categories it
+   item 4; `e621`: the fourth, item 6). Each has `use_<key>` and `<key>_strictness` settings, a label, the categories it
    contributes (general / character / copyright…), and whether it reports a rating. Everything that was hard-wired
    to two taggers loops over the registry:
    - detection and merging (highest score wins, `source` = that tagger's key)
@@ -39,6 +39,10 @@ add a **third tagger** that is good on both real photos and illustration, or is 
 5. **GPU:** only the `immich_aitagger` container. `vram_gb` stays the taggers' cap (`AITAGGER_VRAM_GB`). Re-measured
    with three taggers: **default 5, limits 4-8** (it was 3-8: with three models a cap of 3 no longer loads, 3.5
    does). The process uses 4.2 GB at a cap of 5 and 15 pictures/s. See "Measured (v3)".
+6. **A fourth tagger: Hydra 3.5, key `e621`** (2026-10-02, after the owner's furry / anthro art): an e621-vocabulary tagger
+   (`anthro`, `feral`, `human on anthro`, species...), in the same container and `/tag` answer with `general`, `species`,
+   `character`, `copyright`. With four taggers the **`vram_gb` default is 6, limits 5-8** (5.8 GB used, 11 pictures/s); the
+   three-tagger numbers above are superseded. See "4th tagger: Hydra 3.5".
 
 ### Third tagger: RAM++ as built
 
@@ -225,6 +229,204 @@ warm-ups). Down to a cap of 4 no speed is lost (a small cap only shrinks the mic
 compute-bound); at 3.5 it is 3% lower, because WD then runs at a micro-batch of 4. **Recommended: `vram_gb` default 5
 (4.2 GB used, PixAI settles on 4) and `AITAGGER_BATCH` 8; limits 4-8** (6 and above use 4.8 GB; 3.5 loads but has no
 room to spare; 3 does not load).
+
+### 4th tagger: Hydra 3.5, the e621 tagger (key `e621`)
+
+The owner's library has a lot of furry / anthro art. WD, PixAI (Danbooru vocabulary) and RAM++ (plain English) only say
+`furry`, `furry male`, `furry female`, `furry with non-furry`, `animal ears`, `wolf`; the furry boards' own vocabulary
+(e621) has `anthro`, `feral`, `human on anthro`, `anthro on anthro`, `duo`, species (`canid`, `wolf`, `lagomorph`...),
+colours and body parts. So a fourth tagger, trained on e621. Every claim below was checked on the model cards, the
+repositories or the Hugging Face API on 2026-10-02.
+
+#### As built
+
+| | |
+|---|---|
+| Key / label | `e621` / "Hydra 3.5 (e621)"; `/health` `models[].name`: `hydra-3.5` |
+| Model | Hydra 3.5 by Project RedRocket (model file dated 2026-06-23): a SigLIP 2 So400m patch-16 NaFlex ViT (aspect ratio kept, at most 1,024 patches of 16 x 16 pixels, about 512 x 512) followed by a per-tag cross-attention head with one learned query per tag, about 0.5B parameters; trained on e621 images only |
+| Hugging Face | `RedRocket/Hydra`, revision `cfa9b0a1ffcf2b8df8553be7673210fd60fba23b` (2026-08-23, the newest of the repository), file `models/hydra-3.5.safetensors` (1,064,526,448 bytes, bf16, sha256 `5e9337c21019c51f2bb5b33d053ea3e2c0412e5ca972b5ea3c4c21e6987452ca`), cached under `/cache/hub` like the others (`E621_REVISION` overrides). https://huggingface.co/RedRocket/Hydra |
+| Source files | the repository's package imports pyvips and a Qt GUI, so it is not installed. The image build fetches five modules of the network (`siglip2.py`, `pool.py`, `head.py`, `glu.py`, `cufork.py`) from that one commit into `/opt/hydra`, each checked against its SHA-256 (the same arrangement as RAM++); `tagger_service.py` builds the model from them and does its own picture preparation. New dependency: `einops==0.8.2` |
+| Licence | Apache-2.0: stated in the model card's front matter and in the model file's metadata (`modelspec.license`); the repository has no LICENSE file. Base model `google/siglip2-so400m-patch16-naflex`: Apache-2.0. Free for personal self-hosted use |
+| Vocabulary | 8,886 e621 tags: general 6,262, species 1,426, character 1,036, meta 120 (art media, layout, `english_text`, the ratings `safe` / `questionable` / `explicit`), copyright 36, lore 6. Includes the combination tags (`anthro_on_anthro`, `human_on_anthro`, `male_feral`, `duo`, `female_anthro`...) and colours. The answer has `general`, `species`, `character`, `copyright`; meta, lore and ratings are not returned (artists are not in the model) |
+| Names | model-native, underscores kept (`male_anthro`, `pokemon_(species)`); the panel normalises them to spaces |
+| Calibration | per-tag threshold = the best F1 on the validation counts stored in the model file (99 thresholds x tp / fp / tn / fn per tag) among thresholds with at least 10% precision, rounded to bf16 in logit space: the repository's default calibration (`f1.0@0.1`). The thresholds are 0.36-0.92 (median 0.62); 77 of the 8,886 tags never reach 10% precision and are never returned. `s' = sigmoid(logit(s) - logit(t))`, so **0.5 = its threshold**, as for the others |
+| Implications | the repository's default `inherit` mode: a tag scores at least as high as every tag that implies it, directly or through others (14,558 implied pairs in the model file), so a `wolf` brings `canis`, `canine`, `canid`, `mammal`; a tag is kept whenever one that implies it is |
+| `floor` | `max(floor, 0.2)`. Its probabilities are squashed (the median tag of a picture sits at 0.2, thresholds are around 0.6), so after calibration 5,000-6,500 of the 8,886 tags of a picture are above 0.05, about 520 on average above 0.2, 15-50 above 0.5. At the panel's floor of 0.05 one answer would hold about 6,300 tags (130 KB of JSON); at 0.2 it holds about 520 (11 KB). 0.2 is also the panel's `DISPLAY_FLOOR`; an `e621_strictness` below 0.2 therefore acts as 0.2 |
+| Input | RGB, transparency on white, resized to `get_image_size_for_seq` (ported; same result as the repository's on 3,018 sizes) with the **Magic Kernel Sharp 2013 in linear light** (the model file says `classifier.resize = mks2013-linear`) on the GPU as two matrix products (`_mks_matrix`), patches padded to the longest picture of the micro-batch and masked |
+| Precision | bf16 as trained (`E621_PRECISION`; fp16 and fp32 work: fp16 changes 0.57% of the tag decisions) |
+| Memory | 1.0 GB of weights; the head asks one query per tag of every picture (180 MB a picture in the widest layer), so it runs on 1,024 tags at a time (`E621_TAG_CHUNK`, same numbers up to one bf16 step): 0.54 GB extra at a micro-batch of 8 instead of 3.7 GB |
+| Speed | 21-22 ms a picture alone (46 pictures/s at a micro-batch of 8; the tag head is 11 of the 22 ms, resize and backbone the other 11) |
+| Typical output | 29 tags >= 0.5 per picture over the 239 test pictures: 58 on the 49 furry ones, 21 on everyday photos (see below) |
+
+`POST /tag` answers one more key per picture, with no `rating`:
+```json
+{"results": [{"wd": {...}, "pixai": {...}, "ram": {...},
+              "e621": {"general": {"anthro": 0.99, "female_anthro": 0.97, "fur": 0.95},
+                       "species": {"canid": 0.98, "wolf": 0.91, "mammal": 0.98},
+                       "character": {}, "copyright": {"christmas": 0.62}}}, null],
+ "errors": [null, "cannot identify image file"], "tookMs": 760}
+```
+`"models"` accepts `"wd"`, `"pixai"`, `"ram"`, `"e621"` in any mix; `/health` has `effectiveBatch: {"wd": 8, "pixai": 8,
+"ram": 8, "e621": 8}` and a fourth entry in `models` (`{"name": "hydra-3.5", "kind": "e621", "tags": 8886, "precision":
+"bf16", "loadedIn": 1.9}`). Environment: `E621_MODEL`, `E621_REVISION`, `E621_PRECISION`, `E621_TAG_CHUNK`, `HYDRA_CODE`
+(default `/opt/hydra`).
+
+#### Research: the e621 taggers
+
+| Candidate | Vocabulary | Licence (as stated) | Verdict |
+|---|---|---|---|
+| **Hydra 3.5** (RedRocket): https://huggingface.co/RedRocket/Hydra | 8,886 e621 tags with categories (species, character, copyright, general), combination tags, per-tag thresholds from validation counts; SigLIP 2 NaFlex 0.5B; 1.06 GB. The successor of JTP-3 Hydra (2025-11-10, 7,504 tags, in the same repository: `RedRocket/JTP-3` was renamed to `RedRocket/Hydra`). Tools built around it: https://github.com/Fenrir784/e621tagger (Hydra 3.5), https://github.com/renfald/tail-tagger (recommends JTP-3 Hydra) | Apache-2.0 | **Chosen** |
+| JTP-1.1 PILOT2 (RedRocket): https://huggingface.co/RedRocket/JointTaggerProject (`JTP_PILOT2/`) | 9,083 e621 tags, no categories, no thresholds shipped (the card: 0.2 recommended); `vit_so400m_patch14_siglip_384` with a gated head, 2024-07 | Apache-2.0 | Tested: 51 tags a picture on furry art, fast (175 pictures/s, 1.0 GB), says `anthro` on pictures where Hydra says `humanoid` / `feral` / `human`; 32 of the 190 non-furry pictures got a sexual-vocabulary tag (Hydra 21). Older, no categories, no per-tag calibration |
+| `eva02_large_E621_FULL_V1` (nzs234, mirror xdcx): https://huggingface.co/nzs234/eva02_large_E621_FULL_V1 | 8,783 tags (general 7,180, species 1,106, character 494, rating 3), EVA02-L 448 px, WD-style ONNX (1.25 GB fp32), per-category thresholds (0.60 / 0.65 / 0.60), 2026-02 | MIT on the card ("follow the upstream dataset and base-model licences"; the dataset `animetimm/e621-wdtagger-v1-w640-ws-full` is `other`, gated) | Tested: 35 tags a picture on furry art (Hydra 58), 39 pictures/s with onnxruntime's default arena (it grew to 4 GB), 21 sexual-vocabulary pictures like Hydra, no colour or combination tags, no `human_on_anthro`. A fair second choice |
+| `Thouph/eva02-vit-large-448-8046`: https://huggingface.co/Thouph/eva02-vit-large-448-8046 | 8,041 tags + rating, EVA02-L 448 px, ONNX fp16 (0.64 GB), no recommended threshold (the author's example uses 0.3), 2023-12 | CC-BY-NC-4.0 (non-commercial: fine for personal use) | Tested: 34 tags a picture, `explicit` / `penis` on a photographed manga page, the rating pseudo-tags (`safe`...) mixed into the tag list; old |
+| `toynya/Z3D-E621-Convnext` (and copies): https://huggingface.co/toynya/Z3D-E621-Convnext | ConvNeXt, Keras / ONNX, 2023-09 | `other`; the card says only that the source was the Z3D Discord channel | Not tested: no licence terms |
+| `lodestones/taggerine`: https://huggingface.co/lodestones/taggerine | 74,625 e621 + Danbooru tags, DINOv3 ViT-H/16+ (~1.1B parameters), 5.3 GB file, no thresholds, "proto", 2026-04 | Apache-2.0 on the card; its DINOv3 backbone has its own gated licence | Not tested: 5.3 GB of weights does not fit next to the others |
+| `animetimm/swinv2_base_window8_256.e621v1-full`: https://huggingface.co/animetimm/swinv2_base_window8_256.e621v1-full | e621, SwinV2-B 256 px, 2025-06 | GPL-3.0 | Not tested: older and smaller than the EVA02 version, GPL |
+
+Searches: the Hugging Face model API for e621, furry, anthro, jtp, taggerine, hydra, eva02 e621, e621 classifier /
+siglip / vit and the author RedRocket; GitHub's e621 topic; the web. Nothing newer than Hydra 3.5 turned up
+(RedRocket's own successor chain: PILOT 2024-06, PILOT2 2024-07, JTP-3 Hydra 2025-11, Hydra 3.5 2026-06).
+
+#### How it was tested
+
+239 library previews (read-only copies in a temporary folder, deleted afterwards), through the service's own code for WD,
+PixAI, RAM++ and Hydra and through standalone loaders for the other three (PILOT2: timm, fp16, the card's preprocessing;
+the two EVA02: onnxruntime, the card's preprocessing), each at its operating point (Hydra 0.5 calibrated, PILOT2 0.2,
+EVA02 e621 0.6 / 0.65, Thouph 0.3, WD and PixAI 0.5 calibrated):
+- **49 furry pictures** from Immich's own smart search ("anthro furry character", "furry art", "anthropomorphic wolf",
+  "two furry characters", "human and furry"; the most frequent hits plus the top 12 of the last query). They are not all
+  anthro: there are fursuit photographs, kemonomimi / humanoid art, a feral wolf sketch and a face-swapped photograph.
+- **20 everyday photographs** (family, food, street, document, landscape, selfie, phone screenshot, dog), **10 non-furry
+  anime / manga / cartoon pictures**, and a stress set of **160 more everyday photographs** (beach, shirtless, swimsuit,
+  baby, party, wedding, gym and mirror selfies, couples, bedroom, bathroom, pool, statues, paintings; 8 per search) for
+  false sexual tags. This set also holds real adult pictures, where such tags are right; the doubtful cases were looked at.
+
+| per picture, mean | WD | PixAI | RAM++ | **Hydra** | PILOT2 | EVA02 e621 | Thouph |
+|---|---|---|---|---|---|---|---|
+| tags on the 49 furry pictures | 48.8 | 41.2 | 5.7 | **58.4** | 51.1 | 35.4 | 33.7 |
+| tags on everyday photos (180) | 28.6 | 30.0 | 10.8 | 21.3 | 28.2 | 16.4 | 18.0 |
+| furry pictures with `anthro` (of 49) | 0 | 0 | 0 | 38 | 43 | 41 | 41 |
+| furry pictures with `furry` | 39 | 39 | 0 | 0 | 0 | 0 | 0 |
+| non-furry pictures (190) with a sexual-vocabulary tag (`EXPLICIT_TAGS`) / tags | 32 / 64 | 38 / 69 | 0 / 0 | **21 / 28** | 32 / 60 | 21 / 31 | 20 / 30 |
+
+What the four say on the same pictures (>= their operating point, abbreviated):
+
+| picture | WD / PixAI | RAM++ | Hydra (`e621`) |
+|---|---|---|---|
+| a fox in a red sweater, painted portrait | `furry`, `furry female`, `fox girl`, `fox ears`, `animal ears`, `snout`, `body fur`, `1girl`, `animal nose` | `fox`, `sweater`, `animal` | `anthro`, `female_anthro`, `canid`, `canine`, `fox`, `true_fox`, `red_fox`, `mammal`, `fur`, `tuft`, `cheek_tuft`, `inner_ear_fluff`, `sweater`, `topwear`, `black_nose`, `smiling_at_viewer` |
+| a comic panel: a grey wolf in a white shirt on a chair | `wolf boy`, `furry`, `furry male`, `wolf ears`, `wolf tail`, `1boy`, `comic`, `speech bubble` | `person`, `wolf`, `chair` | `anthro`, `male_anthro`, `canid`, `canine`, `canis`, `wolf`, `grey_fur`, `text`, `dialogue`, `speech_bubble`, `sitting`, `on_chair`, `clothed_anthro`, `fully_clothed` |
+| a photograph of fursuiters and a cosplayer | `1girl`, `cosplay`, `bikini armor`, `purple hair`, `crowd`, `realistic` | `costume`, `mascot`, `cosplay` | `fursuit`, `costume`, `cosplay`, `real`, `human`, `group`, `pokemon_(species)`, `mammal` (no `anthro`: they are people) |
+| a girl, a werewolf and a bed, comic | `furry`, `furry female`, `multiple girls`, `1boy`, `werewolf`, `interspecies` | `person`, `cartoon`, `screenshot` | `anthro`, `human`, `canid`, `wolf`, `werewolf`, `werecanid`, `mythological_canine`, `trio`, `group`, `caught_in_the_act`, `nude_anthro`; `human_on_anthro` at 0.36 |
+
+Where Hydra and the other e621 taggers disagree about `anthro` (5 of 49 pictures) Hydra is the one that separates the
+kinds: a photograph of people in fursuits (`human`), a girl with animal ears next to a photograph of a maned wolf
+(`humanoid`, `animal_humanoid`, `feral`), a nude figure with a feral wolf (`feral` 0.88), a face-swapped photograph
+(`human`; PILOT2 says `anthro`), a pencil sketch of a cat-eared girl (`humanoid`). `human_on_anthro` is a rare tag: at 0.5
+it fired on none of the 49, at 0.3 on exactly the three pictures with a human and an anthro together. The
+species and the extra detail are what the owner asked for: species 12 `wolf`, 6 `fox`, 6 `domestic_cat`, 4 `rabbit`,
+`lagomorph`, `scalie`, `pantherine`, `domestic_dog`...; characters 5 (`pulchra_fellini`, `loona_(helluva_boss)`,
+`von_lycaon`...); copyright `christmas`, `vtuber`, `animal_crossing`.
+
+**What it does wrong.** On the two near-black frames of the set it invents: `penis`, `erection`, `sex` on a dark close-up of
+a shoulder (PILOT2, EVA02 e621 and Thouph also say `penis` there; PixAI says `nude`), `nude`, `anthro`, `rodent` on a
+dark blurred bottle photo. On everyday photographs it adds `mammal` to every human (87% of the non-furry pictures) and
+`human`, `not_furry`, `human_only`, `real`; that is correct and mostly redundant next to `1boy` / `man` (the registry
+entry below lists `mammal` as noise). `loli` on a chibi child drawing (it is in `EXPLICIT_TAGS`; one voter on a general
+picture is dropped by the panel).
+
+**Would it have caught false sexual tags / is it a trustworthy voter?** Of the 190 non-furry pictures it raised a sexual
+tag on 21, WD on 32 and PixAI on 38 (the three have real adult pictures in common). Everyday pictures I checked by eye
+where it did *not* say what the others said: a beach selfie (PILOT2 `penis`, `erection`, `nude`; WD `nude`), a bedroom with
+people sleeping (WD `hetero`, `nude`), two shirtless boys sitting outdoors (WD, PixAI, PILOT2, EVA02 e621 and Thouph all
+`nude`), a shirtless selfie (PixAI `nude`), an empty bed (WD `nude`; PILOT2 `bdsm`). The panel's rule (a sexual tag on a
+general / sensitive picture needs two taggers) can only get weaker when a voter is added: of the 204 pictures WD and PixAI
+rate general or sensitive, 17 sexual tags are kept today (both found them) and Hydra as a third voter would
+keep **1 more** (`nipples` on a muscular shirtless anthro: true); PILOT2 would keep 3 (one false), Thouph 2 (one false: `nude` on
+a rabbit pencil sketch), EVA02 e621 1. So **yes, it should vote**: the one tag it would add is right, it said nothing sexual on the everyday
+pictures above, and it knows the furry sexual vocabulary that WD and PixAI under-use. (Its weak spot is near-black frames, where all four
+e621 taggers hallucinate; on a general / sensitive picture the panel's rule keeps a lone hallucination out unless another tagger says the same.)
+
+**Fidelity.** Checked against the repository's own pipeline (pyvips + its code) on 79 pictures: 3,669 tag decisions at the
+thresholds, 46 differ (1.25%, 0.6 a picture), which is the size of the noise from the batch composition (0.63%) or bf16
+against fp16 (0.57%). The first version resized with torch's antialiased bicubic and differed on 6.3% (bilinear: 10.4%), which
+is why the Magic Kernel Sharp is built here (the decoder is not the cause: official pipeline from the file vs from a
+PIL-decoded array differ on 0.22%).
+
+#### Changes to the service that came with it
+
+- `MODEL_NAMES = ("wd", "pixai", "ram", "e621")`, in that order; `Tagger.batch` / `effectiveBatch` have `e621`; torch warm-up
+  after all weights are loaded for pixai, ram, e621 (the e621 warm-up is the worst case: a full 1,024-patch picture).
+- **Do not use the repository's `CuFork`.** It runs the position-embedding adds of each picture size on a side CUDA stream.
+  With `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (the compose file's setting) requests hung for good after a few
+  calls inside torch 2.14.1's allocator (one thread at 90% CPU in the position embedding's `interpolate`; it happened in 4
+  of the 5 request sequences tried, with the service and with the repository's own code, and in none of the 3 with the
+  default allocator). The service replaces it with a stand-in that does nothing (everything on one stream, nothing
+  slower: these are tiny kernels). No hang since, in 5 sequences and all the benchmarks.
+- A picture with a one-pixel side failed (`Failed to find C compiler`: torch 2.14 sends a matrix product with an inner size
+  of 1 to a compiler the image does not have); such a side is doubled first. 15 x 40, 16 x 4000, 6000 x 4000 JPEG, grey,
+  RGBA and palette pictures were tried.
+- The answer is capped at scores of 0.2 (see `floor` above).
+- The image must be rebuilt (`docker compose -p immich-aitagger -f deploy/aitagger/docker-compose.yml build tagger`: einops and the
+  Hydra source files are new); the model file (1.06 GB) is in the cache from the tests, otherwise the first start downloads it.
+- `bench.py` knows `e621`. The Dockerfile adds einops and the five source files. Compose and the service default
+  `AITAGGER_VRAM_GB` is now **6** (see below).
+- Tests: `tests/test_tagger_service.py` has 30 tests (10 new, 6 changed) that need no GPU: the picture sizes against the
+  repository's function, bf16 rounding, the metadata parser, the thresholds from hand-computed counts, implications (transitive,
+  cycles, unknown tags), the answer rows and the minimum score, the resize kernel (if torch is installed), the `e621` key
+  in the request checks, the answer keys, the per-picture errors and the out-of-memory splitting.
+
+**RAM++ has the same problem at the floor of 0.05, which the panel uses.** Its answer holds on average 4,395 of its 4,585
+tags per picture (86 KB of JSON; at a floor of 0.2: 572 tags and 10 KB; at 0.5: 9), and
+`aitagger.raw_from_results` stores every returned score of every capture. A minimum score for RAM++ like Hydra's
+(`RAM_MIN_SCORE = 0.2` in the service, nothing else changes: the Test card lists scores from 0.2 up) would cut the
+stored data of that tagger by a factor of eight. Not done here (outside this task); the service side is a one-line change.
+
+#### For the panel: the registry entry
+
+```python
+TaggerKind("e621", "Hydra 3.5 (e621)", ("general", "species", "character", "copyright"), ("character", "copyright"),
+           has_rating=False, noise=frozenset({"mammal"}))
+```
+- `character_categories` are `character` and `copyright` (e621 copyright is franchises and events: `christmas`,
+  `animal_crossing`, `vtuber`); species stay when `character_tags` is off.
+- **It should vote in the explicit-tag check** (no change needed: the check counts the taggers that kept the tag, and its
+  names are the same words: `penis`, `nipples`, `nude`, `sex`, `oral`, `anus`, `cum`...). It has no rating (`has_rating=False`):
+  e621's `safe` / `questionable` / `explicit` are not the Danbooru ones and it was never trained on photographs.
+- `noise`: `mammal` is optional (the owner can drop it from the list: on furry art it is true and redundant with `canid`
+  etc.). Anything else the owner dislikes goes into `blocked` / `vocabulary` (`human_only -> ...`).
+- `default_on`: True. At the default strictness of 0.5 (its own F1-optimal point per tag) it adds about 29 tags per picture;
+  lower the strictness to 0.3 for combination tags such as `human on anthro`.
+
+#### Measured (four taggers)
+
+Same method as "Measured (v3)": 2026-10-02, RTX 4090, torch 2.14.1+cu130, Immich ML and Search+ (loaded, idle) on the GPU
+(runs where another process changed the GPU's memory during the run were discarded and repeated), 720 pictures (239
+library previews shrunk to 1024 px, three times over, cut at 720) as base64 JPEG through the HTTP API with
+`deploy/aitagger/bench.py`, 8 per request, 2 in flight (16 for micro-batch 16). "Process VRAM" is the growth of the GPU's used
+memory from before the container started to the peak.
+
+| cap (`AITAGGER_VRAM_GB`), micro-batch 8 | settles on (PixAI / RAM++ / e621 / WD) | process VRAM | WD + PixAI + RAM++ + Hydra |
+|---|---|---|---|
+| 4, 4.5 | does not load (`... too small for the four models: raise it`) | - | - |
+| 5 | 1 / 2 / 4 / 8 | 4.94 GB | 10.6 pictures/s |
+| 5.5 | 4 / 8 / 8 / 8 | 5.11 GB | 10.9 |
+| **6** | 8 / 8 / 8 / 8 | **5.77 GB** | **11.1** |
+| 8 | 8 / 8 / 8 / 8 | 5.75 GB | 11.0 |
+| 8, micro-batch 16 | 16 / 16 / 16 / 8 | 7.09 GB | 11.2 |
+
+| (cap 6) | pictures/s |
+|---|---|
+| Hydra alone (`models: ["e621"]`) | 42.9 |
+| WD + PixAI + RAM++ (Hydra loaded, not asked) | 14.8 (v3 container with three models: 15.2) |
+| all four | 11.1 |
+
+Hydra costs 22 ms a picture on top of the other three (68 -> 90 ms: +33%), 1.0 GB of weights and 0.5 GB while working at a
+micro-batch of 8. Loaded and idle the process holds 3.8 GB (2.8 GB with three). PixAI is still the largest share (50 of the 90
+ms). Start-up with the files cached: 10.5 s until `status: ok` (Hydra loads in 1.9 s); the first start downloads 1.06 GB.
+
+**Recommended: `vram_gb` default 6, limits 5-8** (5.8 GB used, every micro-batch at 8; 5 loads and works, with PixAI at a
+micro-batch of 1 and 4% slower; 4.5 and below do not load: PixAI + RAM++ + Hydra need 2.7 GB of weights under PyTorch's share of the
+cap). With the three-tagger default of 5 the GPU would still not run out, but one of the four would sit at a micro-batch of 1-2.
 
 ### v3, panel side: as built (design details and where it differs from the list above)
 

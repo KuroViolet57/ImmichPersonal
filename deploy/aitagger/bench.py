@@ -3,7 +3,7 @@
 included), the way the panel uses it.
 
     python deploy/aitagger/bench.py --dir /path/to/previews [--url http://127.0.0.1:11440] [--count 240]
-        [--per-request 8] [--inflight 2] [--models wd,pixai,ram] [--shrink 1024]
+        [--per-request 8] [--inflight 2] [--models wd,pixai,ram,e621] [--shrink 1024]
 
 It shrinks the pictures (JPEG files of any size; Immich's preview JPEGs are fine) to --shrink pixels on the long side
 like the panel's captures, waits for the service to be ready, sends --count pictures (the folder repeated if it holds
@@ -49,7 +49,7 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=240)
     ap.add_argument("--per-request", type=int, default=8)
     ap.add_argument("--inflight", type=int, default=2)
-    ap.add_argument("--models", default="", help="comma separated subset of wd,pixai,ram (default: all)")
+    ap.add_argument("--models", default="", help="comma separated subset of wd,pixai,ram,e621 (default: all)")
     ap.add_argument("--shrink", type=int, default=1024)
     ap.add_argument("--wait", type=int, default=300, help="seconds to wait for the service to be ready")
     args = ap.parse_args()
@@ -119,7 +119,7 @@ def main() -> int:
     stop.set()
     state = health(args.url)
     result = {"pictures": len(pictures), "perRequest": args.per_request, "inflight": args.inflight,
-              "models": models or ["wd", "pixai", "ram"], "seconds": round(elapsed, 1),
+              "models": models or ["wd", "pixai", "ram", "e621"], "seconds": round(elapsed, 1),
               "picturesPerSecond": round(len(pictures) / elapsed, 1), "failedPictures": failed,
               "vramCapGb": state["vramCapGb"], "effectiveBatch": state["effectiveBatch"]}
     if baseline is not None:

@@ -1,10 +1,10 @@
-"""AI Tagger model server: tags pictures with three image taggers on the GPU.
+"""AI Tagger model server: tags pictures with four image taggers on the GPU.
 
 Runs inside its own GPU container (see deploy/aitagger). The panel sends it pictures (and video frames) while it
 indexes the library; everything else (settings, aggregation, writing descriptions) happens in the panel.
 
-    GET  /health   -> {"status": "loading" | "ok" | "error", "error": null, "device": "cuda", "vramCapGb": 5,
-                       "batch": 8, "effectiveBatch": {"wd": 8, "pixai": 8, "ram": 8},
+    GET  /health   -> {"status": "loading" | "ok" | "error", "error": null, "device": "cuda", "vramCapGb": 6,
+                       "batch": 8, "effectiveBatch": {"wd": 8, "pixai": 8, "ram": 8, "e621": 8},
                        "models": [{"name", "kind", "tags", "precision", "loadedIn"}, ...],
                        "idleExitMinutes": 20, "idleSeconds": 12, "busy": 0}
     POST /tag      {"images": [<base64 jpeg/png>, ...], "floor": 0.05}      (at most 64 images)
@@ -14,10 +14,12 @@ indexes the library; everything else (settings, aggregation, writing description
                                               "copyright": {tag: score},
                                               "rating": {"general": p, "sensitive": p, "questionable": p,
                                                          "explicit": p}},
-                                    "ram": {"general": {tag: score}}} | null, ...],
+                                    "ram": {"general": {tag: score}},
+                                    "e621": {"general": {tag: score}, "species": {tag: score},
+                                             "character": {tag: score}, "copyright": {tag: score}}} | null, ...],
                        "errors": [null | "why", ...], "tookMs": 412}
 
-The three models:
+The four models:
   * WD EVA02-Large Tagger v3 (SmilingWolf, Apache-2.0): 10,861 Danbooru tags, run with onnxruntime. Input is
     448x448, NHWC, BGR, float32 0-255, the picture padded to a white square (the layout of the reference
     implementation at huggingface.co/spaces/SmilingWolf/wd-tagger).
@@ -35,16 +37,33 @@ The three models:
     is rebuilt here from the pinned source files in RAM_CODE (swin_transformer.py, the tag list and the per-tag
     thresholds) and was checked against the official code. Preprocessing: RGB picture resized to 384x384 (bilinear, aspect ratio not kept) and
     normalised with the ImageNet mean/std. It has no categories (everything is "general") and no rating.
+  * Hydra 3.5 (Project RedRocket, Apache-2.0), key `e621`: 8,886 e621 tags (the furry / anthro booru's vocabulary:
+    `anthro`, `feral`, `human_on_anthro`, `duo`, species such as `wolf` and `canid`, colours, clothing...; categories
+    general, species, character, copyright are returned, artist / meta / lore are not), a SigLIP 2 So400m NaFlex ViT
+    plus a per-tag cross-attention head (about 0.5B parameters), run with PyTorch bf16 as trained. The network is the
+    repository's own code (five source files fetched at the image build from one pinned commit into HYDRA_CODE; its
+    package also imports pyvips and a GUI, which are not needed); the model file is one pinned revision of the Hugging
+    Face repository. Preprocessing is the repository's: transparency on white, the picture resized (aspect ratio kept,
+    never enlarged) to at most 1,024 patches of 16x16 pixels with the Magic Kernel Sharp 2013 in linear light (the
+    model file says `classifier.resize = mks2013-linear`; done on the GPU as two matrix products, see _mks_matrix),
+    patches padded to the longest of the micro-batch and masked. Its probabilities are squashed (the median tag of a
+    picture is at 0.2, its thresholds around 0.6), so only scores of at least 0.2 are ever returned (`floor` can raise
+    this, not lower it), and the tag head runs on 1,024 tags at a time to bound the memory.
 
 Scores are calibrated so that 0.5 is each model's own recommended threshold for that tag:
 s' = sigmoid(logit(s) - logit(t)), with t = 0.35 for WD general tags, 0.75 for WD character tags, the PixAI model
-card's 0.17 (general), 0.27 (character) and 0.24 (copyright), and RAM++'s shipped per-tag threshold (0.45-1.0; a
-threshold of 1.0 means the tag is never returned). Only tags with s' >= floor are returned. The `rating` of WD and
-PixAI is the raw probability for each rating (PixAI's rating:g/s/q/e are named general, sensitive, questionable,
-explicit, like WD's, so the panel can average them); RAM++ has none. Tag names are model-native (underscores kept).
+card's 0.17 (general), 0.27 (character) and 0.24 (copyright), RAM++'s shipped per-tag threshold (0.45-1.0; a
+threshold of 1.0 means the tag is never returned) and Hydra's per-tag threshold (the best F1 on the validation counts
+stored in its model file, among thresholds with at least 10% precision: the repository's default calibration,
+0.36-0.92; 77 of the 8,886 tags never reach that precision and are never returned). Hydra's implications are applied
+as the repository's default "inherit" mode does: a tag scores at least as high as every tag that implies it, so a
+`wolf` brings its `canis`, `canine`, `canid` and `mammal`. Only tags with s' >= floor are returned. The `rating` of WD
+and PixAI is the raw probability for each rating (PixAI's rating:g/s/q/e are named general, sensitive, questionable,
+explicit, like WD's, so the panel can average them); RAM++ and Hydra have none (Hydra has e621's safe / questionable /
+explicit, which are not returned). Tag names are model-native (underscores kept).
 
-Optional extra request field: "models": ["wd"], ["pixai"], ["ram"] or any mix runs only those (default: all three;
-the keys of the others are then absent).
+Optional extra request field: "models": ["wd"], ["pixai"], ["ram"], ["e621"] or any mix runs only those (default: all
+four; the keys of the others are then absent).
 
 The server answers /health at once while the models load in the background (503 on /tag until they are ready).
 One GPU thread runs everything, fed by a queue, so concurrent requests never fight over the GPU. A picture that
@@ -52,13 +71,14 @@ cannot be read, or that fails on the GPU, fails only its own slot. A CUDA out-of
 and retries (and lowers the micro-batch of that model for the rest of the session); a picture that still does not fit
 comes back as an error containing "out of memory".
 
-Environment: AITAGGER_VRAM_GB (memory cap for this process, default 5), AITAGGER_BATCH (GPU micro-batch,
+Environment: AITAGGER_VRAM_GB (memory cap for this process, default 6), AITAGGER_BATCH (GPU micro-batch,
 default 8), IDLE_EXIT_MINUTES (default 20; the server exits after that long without a request, never while one is
-in flight, which stops the container and frees the GPU), WD_MODEL / PIXAI_MODEL / RAM_MODEL (Hugging Face repos or
-local directories), PIXAI_REVISION / RAM_REVISION (the pinned commits of those repos), WD_PRECISION (fp16 default),
-PIXAI_PRECISION and RAM_PRECISION (fp16 default, bf16 or fp32), RAM_CODE (the pinned RAM++ source files, default
-/opt/ram, put there by the image build), AITAGGER_CACHE (model files, default /cache), AITAGGER_DEVICE (default
-cuda; cpu is for tests).
+in flight, which stops the container and frees the GPU), WD_MODEL / PIXAI_MODEL / RAM_MODEL / E621_MODEL (Hugging
+Face repos or local directories), PIXAI_REVISION / RAM_REVISION / E621_REVISION (the pinned commits of those repos),
+WD_PRECISION (fp16 default), PIXAI_PRECISION and RAM_PRECISION (fp16 default, bf16 or fp32), E621_PRECISION (bf16
+default, fp16 or fp32), E621_TAG_CHUNK (tags the Hydra head scores at a time, default 1024; memory only), RAM_CODE
+and HYDRA_CODE (the pinned RAM++ and Hydra source files, default /opt/ram and /opt/hydra, put there by the image
+build), AITAGGER_CACHE (model files, default /cache), AITAGGER_DEVICE (default cuda; cpu is for tests).
 """
 
 from __future__ import annotations
@@ -90,7 +110,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 CACHE = Path(os.environ.get("AITAGGER_CACHE", "/cache"))
 DEVICE = os.environ.get("AITAGGER_DEVICE", "cuda")
-VRAM_GB = float(os.environ.get("AITAGGER_VRAM_GB", "5"))
+VRAM_GB = float(os.environ.get("AITAGGER_VRAM_GB", "6"))
 MAX_BATCH = max(1, int(os.environ.get("AITAGGER_BATCH", "8")))   # PixAI is compute-bound: more only costs memory
 IDLE_EXIT_MINUTES = float(os.environ.get("IDLE_EXIT_MINUTES", "20"))
 WD_MODEL = os.environ.get("WD_MODEL", "SmilingWolf/wd-eva02-large-tagger-v3")
@@ -106,12 +126,12 @@ RAM_CODE = Path(os.environ.get("RAM_CODE", "/opt/ram"))       # swin_transformer
 WD_PRECISION = os.environ.get("WD_PRECISION", "fp16")        # fp16: the ONNX model is converted once (cached)
 CONTEXT_GB = 0.5                 # CUDA context and library workspaces: not counted by either allocator
 WD_ARENA_GB = 1.6                # onnxruntime's arena for WD at a micro-batch of 8 (1.5 GB works, 1.2 GB fails; fp16)
-ORT_SHARE = 0.4                  # ... but never more than this share of the VRAM cap; the rest is PyTorch's (PixAI, RAM++)
+ORT_SHARE = 0.4                  # ... but never more than this share of the VRAM cap; the rest is PyTorch's (PixAI, RAM++, Hydra)
 WD_BATCH = 8                     # onnxruntime gains nothing from bigger WD batches (measured on an RTX 4090)
 
 MAX_IMAGES = 64
 MAX_BODY = 512 * 1024 * 1024
-MODEL_NAMES = ("wd", "pixai", "ram")
+MODEL_NAMES = ("wd", "pixai", "ram", "e621")
 WD_GENERAL_T, WD_CHARACTER_T = 0.35, 0.75    # the models' recommended thresholds (wd-tagger reference)
 WD_CATEGORY_GENERAL, WD_CATEGORY_CHARACTER, WD_CATEGORY_RATING = 0, 4, 9
 # PixAI Tagger v1.0 model card, "Recommended thresholds" (per-category macro-F1 settings). style / meta: not used.
@@ -122,6 +142,17 @@ PIXAI_FILES = ("config.json", "preprocessor_config.json", "tagger_pipeline.py", 
 RAM_SIZE = 384
 RAM_CLASSES, RAM_DESCRIPTIONS, RAM_WIDTH = 4585, 51, 512
 RAM_MEAN, RAM_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+E621_MODEL = os.environ.get("E621_MODEL", "RedRocket/Hydra")
+E621_REVISION = os.environ.get("E621_REVISION", "cfa9b0a1ffcf2b8df8553be7673210fd60fba23b")   # 2026-08-23
+E621_FILE = "models/hydra-3.5.safetensors"                        # 1.06 GB, bf16, with the tag list and the validation counts
+E621_PRECISION = os.environ.get("E621_PRECISION", "bf16")         # bf16 as trained; fp16 / fp32 work too
+E621_CODE = Path(os.environ.get("HYDRA_CODE", "/opt/hydra"))      # the repository's network source, fetched at image build
+E621_CATEGORIES = ("general", "species", "character", "copyright")   # returned; artist, meta (ratings...), lore are not
+E621_PATCH, E621_SEQ = 16, 1024          # NaFlex: a picture is resized to at most 1024 patches of 16 x 16 pixels (~512 x 512)
+E621_TAG_CHUNK = int(os.environ.get("E621_TAG_CHUNK", "1024"))   # tags the head scores at a time (memory, not numbers)
+E621_MIN_PRECISION = 0.1                # the model's default calibration: best F1 per tag, but at least 10% precision
+E621_MIN_SCORE = 0.2                     # never return less: its scores are squashed (see _forward_e621), at the usual
+                                         # floor of 0.05 about 6,000 of its 8,886 tags per picture would come back
 
 
 def _cuda() -> bool:
@@ -159,6 +190,40 @@ def _fetch(source: str, filename: str, revision: str | None = None) -> Path:
     except Exception:  # noqa: BLE001 - not downloaded yet
         _log(f"downloading {source}/{filename} (first start only)")
         return Path(hf_hub_download(source, filename, revision=revision, cache_dir=cache_dir))
+
+
+def _srgb_to_linear(x):
+    import torch
+    return torch.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def _linear_to_srgb(x):
+    import torch
+    return torch.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1.0 / 2.4) - 0.055)
+
+
+def _mks_matrix(n_in: int, n_out: int):
+    """(n_out, n_in) float32 matrix on the GPU that shrinks one axis from n_in to n_out pixels with the Magic Kernel
+    Sharp 2013 (support 2.5, stretched by the shrink factor; weights normalised, picture edges replicated). This is the
+    kernel Hydra was trained with (its model file says `classifier.resize = mks2013-linear`; the repository resizes with
+    pyvips' MKS2013). torch has no such kernel, so the resize is two matrix products."""
+    import torch
+
+    scale = n_in / n_out
+    stretch = max(scale, 1.0)
+    taps = int(math.ceil(5.0 * stretch)) + 2
+    centre = (torch.arange(n_out, device=DEVICE, dtype=torch.float64) + 0.5) * scale - 0.5
+    first = torch.floor(centre - 2.5 * stretch)
+    at = first[:, None] + torch.arange(taps, device=DEVICE, dtype=torch.float64)[None, :]
+    x = ((at - centre[:, None]) / stretch).abs()
+    w = torch.where(x >= 2.5, torch.zeros_like(x),
+                    torch.where(x >= 1.5, -0.125 * (x - 2.5) ** 2,
+                                torch.where(x >= 0.5, 0.25 * (4.0 * x * x - 11.0 * x + 7.0),
+                                            17.0 / 16.0 - 7.0 / 4.0 * x * x)))
+    w = w / w.sum(dim=1, keepdim=True)
+    out = torch.zeros((n_out, n_in), dtype=torch.float32, device=DEVICE)
+    out.scatter_add_(1, at.clamp(0, n_in - 1).long(), w.float())
+    return out
 
 
 def _wd_file(fp32: Path):
@@ -304,6 +369,172 @@ def _ram_state(checkpoint: dict) -> dict:
     return out
 
 
+# --------------------------------------------------------------------------- Hydra 3.5, the e621 tagger
+def _hydra_size(h: int, w: int, patch: int = E621_PATCH, max_seq: int = E621_SEQ) -> tuple[int, int]:
+    """(height, width) a picture of h x w pixels is resized to: multiples of the patch size, the aspect ratio kept as
+    well as the grid allows, at most max_seq patches, never larger than the picture. This is the repository's
+    get_image_size_for_seq (hydra/model.py) with its defaults, ported as it is."""
+    max_ratio, eps = 1.0, 1e-5
+    max_py, max_px = max(h // patch, 1), max(w // patch, 1)
+    if max_py * max_px <= max_seq:
+        return max_py * patch, max_px * patch
+
+    def grid(ratio):
+        return min(int(math.ceil(h * ratio / patch)), max_py), min(int(math.ceil(w * ratio / patch)), max_px)
+
+    py, px = grid(eps)
+    if py * px > max_seq:
+        raise ValueError(f"picture of {w}x{h} is too large")
+    ratio = eps
+    while max_ratio - ratio >= eps:
+        mid = (ratio + max_ratio) / 2.0
+        mpy, mpx = grid(mid)
+        if mpy * mpx > max_seq:
+            max_ratio = mid
+            continue
+        ratio, py, px = mid, mpy, mpx
+        if mpy * mpx == max_seq:
+            break
+    return py * patch, px * patch
+
+
+def _round_bf16(x):
+    """Round float32 values to the nearest bfloat16 (ties to even) and back, with numpy only."""
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+    rounded = (u.astype(np.uint64) + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
+    return rounded.astype(np.uint32).view(np.float32)
+
+
+def _hydra_labels(metadata: dict) -> list[tuple[str, str, list[str]]]:
+    """[(tag, category, implied tags)] from the model file's `classifier.labels` metadata, one tag per line:
+    "tag category implied1 implied2 ..."."""
+    rows = []
+    for line in metadata["classifier.labels"].split("\n"):
+        fields = line.split(" ")
+        if len(fields) < 2 or not fields[0]:
+            raise ValueError(f"bad Hydra label line {line!r}")
+        rows.append((fields[0], fields[1], fields[2:]))
+    return rows
+
+
+def _hydra_thresholds(validation) -> np.ndarray:
+    """Per-tag decision threshold as a logit, from the validation counts in the model file (tag x threshold x
+    [tp, fp, tn, fn], the thresholds being 1/(n+1) ... n/(n+1)): the threshold with the best F1, among those that
+    reach 10% precision (the repository's default calibration, "f1.0@0.1"), rounded to bfloat16 in logit space as the
+    repository does. A tag that never reaches 10% precision gets a threshold nothing reaches."""
+    tp, fp, fn = (np.asarray(validation[..., i], dtype=np.float64) for i in (0, 1, 3))
+    with np.errstate(all="ignore"):
+        precision = tp / (tp + fp)
+        f1 = np.nan_to_num(2.0 * tp / (2.0 * tp + fp + fn), nan=0.0)
+    f1 = np.where(precision >= E621_MIN_PRECISION, f1, -np.inf)       # a NaN precision (no positives) fails the test
+    best = f1.argmax(axis=1)
+    usable = np.isfinite(f1.max(axis=1))
+    t = (best + 1.0) / (validation.shape[1] + 1.0)
+    logit_t = _round_bf16(_logit(t).astype(np.float32)).astype(np.float64)
+    return np.where(usable, logit_t, 1e3)
+
+
+def _implication_edges(rows) -> tuple[np.ndarray, np.ndarray]:
+    """(antecedent, consequent) index arrays for every tag and every tag it implies, directly or through others
+    (a tag the model has no output for ends the chain, as in the repository)."""
+    index = {name: i for i, (name, _category, _implies) in enumerate(rows)}
+    direct = [[index[x] for x in implies if x in index] for _name, _category, implies in rows]
+    src, dst = [], []
+    for start in range(len(rows)):
+        seen, stack = set(), list(direct[start])
+        while stack:
+            k = stack.pop()
+            if k in seen or k == start:
+                continue
+            seen.add(k)
+            stack.extend(direct[k])
+        src.extend([start] * len(seen))
+        dst.extend(seen)
+    return np.array(src, dtype=np.int64), np.array(dst, dtype=np.int64)
+
+
+def _inherit(scores: np.ndarray, src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """In place: every tag scores at least as high as each tag that implies it (the repository's "inherit"
+    implication mode, which is also what it uses by default: a "wolf" brings its "canine" and its "mammal"). With the
+    scores calibrated to 0.5 = threshold this means: an implied tag is kept whenever one that implies it is."""
+    if len(src):
+        rows = np.arange(scores.shape[0])[:, None]
+        np.maximum.at(scores, (rows, dst[None, :]), scores[:, src])
+    return scores
+
+
+def _hydra_rows(cal: np.ndarray, names, keys: dict, floor: float) -> list[dict]:
+    """Calibrated scores (pictures x tags) -> one {category: {tag: score}} per picture, best first, from
+    max(floor, E621_MIN_SCORE) up. `keys` maps each returned category to the indices of its tags."""
+    floor = max(floor, E621_MIN_SCORE)
+    out = []
+    for b in range(len(cal)):
+        row = {}
+        for key, idx in keys.items():
+            scores = cal[b, idx]
+            keep = np.flatnonzero(scores >= floor)
+            keep = keep[np.argsort(-scores[keep], kind="stable")]
+            row[key] = {str(names[idx[i]]): round(float(scores[i]), 4) for i in keep}
+        out.append(row)
+    return out
+
+
+_HYDRA_CLASS = None
+
+
+def _hydra_class():
+    """The Hydra network: the repository's NaFlex ViT (SigLIP 2 So400m, patch 16) with its per-tag cross-attention
+    pool and linear head, from the pinned source files in HYDRA_CODE. Built on first use (torch is imported lazily)."""
+    global _HYDRA_CLASS
+    if _HYDRA_CLASS is not None:
+        return _HYDRA_CLASS
+    import importlib
+    import importlib.util
+
+    package = E621_CODE / "hydra"
+    spec = importlib.util.spec_from_file_location("hydra_e621", package / "__init__.py",
+                                                  submodule_search_locations=[str(package)])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    siglip2 = importlib.import_module("hydra_e621.siglip2")
+    pool = importlib.import_module("hydra_e621.pool")
+    head = importlib.import_module("hydra_e621.head")
+
+    class OneStream:
+        """Stands in for the repository's CuFork, which runs the per-picture-size position-embedding adds on extra CUDA
+        streams. With PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (what the container uses) allocating on those
+        side streams hung inside torch's allocator after a few requests (measured, torch 2.14.1); on one stream nothing
+        hangs and nothing is slower (these are tiny kernels)."""
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def fork(self, *_args, **_kwargs):
+            pass
+
+    siglip2.CuFork = OneStream
+
+    class Hydra(siglip2.NaFlexVit):
+        """naflexvit_so400m_patch16_siglip+rr_hydra2, as hydra/model.py's load_model builds it (logits out)."""
+
+        def __init__(self, n_classes: int, dtype):
+            super().__init__(device="cpu", dtype=dtype)
+            self.attn_pool = pool.HydraPool(n_classes, 2048, 64, input_dim=1152, mid_blocks=1, ff_dim=5120,
+                                            ff_dropout=0.0, device="cpu", dtype=dtype)
+            self.head = head.LinearHead(n_classes, 2048, logit=True, device="cpu", dtype=dtype)
+            self.emb_head = head.ExtremumPool()
+
+    _HYDRA_CLASS = Hydra
+    return Hydra
+
+
 # --------------------------------------------------------------------------- the engine
 class Job:
     __slots__ = ("inputs", "errors", "models", "floor")
@@ -313,7 +544,7 @@ class Job:
 
 
 class Tagger:
-    """The three models, loaded in the background; every GPU call runs on one thread."""
+    """The four models, loaded in the background; every GPU call runs on one thread."""
 
     def __init__(self):
         self.status, self.error = "loading", ""
@@ -323,8 +554,8 @@ class Tagger:
         self.busy = 0
         self._lock = threading.Lock()
         # micro-batch per model; lowered by CUDA out-of-memory answers
-        self.batch = {"wd": min(MAX_BATCH, WD_BATCH), "pixai": MAX_BATCH, "ram": MAX_BATCH}
-        self.wd = self.pixai = self.ram = None
+        self.batch = {"wd": min(MAX_BATCH, WD_BATCH), "pixai": MAX_BATCH, "ram": MAX_BATCH, "e621": MAX_BATCH}
+        self.wd = self.pixai = self.ram = self.e621 = None
         threading.Thread(target=self._load_then_serve, daemon=True).start()
 
     # ---- bookkeeping
@@ -345,7 +576,7 @@ class Tagger:
     def _vram_split(self):
         """(onnxruntime arena bytes, torch fraction of the whole GPU) from the AITAGGER_VRAM_GB cap: WD gets the
         arena it needs at a micro-batch of 8 (WD_ARENA_GB, or ORT_SHARE of the cap if that is smaller); PyTorch gets the
-        rest, and PixAI and RAM++ share its allocator."""
+        rest, and PixAI, RAM++ and Hydra share its allocator."""
         import torch
         total = torch.cuda.get_device_properties(0).total_memory
         usable = max(1.0, VRAM_GB - CONTEXT_GB) * 1024 ** 3
@@ -506,6 +737,52 @@ class Tagger:
         return {"name": Path(RAM_FILE).stem, "kind": "ram", "tags": len(tags), "precision": precision,
                 "loadedIn": round(time.monotonic() - started, 1)}
 
+    def _load_e621(self) -> dict:
+        """Hydra 3.5 (the e621 tagger) from the pinned Hugging Face revision and the pinned network source in
+        HYDRA_CODE. It shares PyTorch's memory cap with PixAI and RAM++."""
+        import torch
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+
+        started = time.monotonic()
+        path = _fetch(E621_MODEL, E621_FILE, E621_REVISION)
+        with safe_open(str(path), framework="np") as fh:              # only the (float32) validation counts are read here
+            meta, validation = fh.metadata(), fh.get_tensor("validation")
+        if meta.get("modelspec.architecture") != "naflexvit_so400m_patch16_siglip+rr_hydra2":
+            raise RuntimeError(f"unexpected Hydra architecture {meta.get('modelspec.architecture')!r}")
+        rows = _hydra_labels(meta)
+        if len(rows) != validation.shape[0]:
+            raise RuntimeError(f"Hydra file has {len(rows)} tags and validation counts for {validation.shape[0]}")
+        dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+        if E621_PRECISION not in dtypes:
+            raise RuntimeError(f"E621_PRECISION must be bf16, fp16 or fp32, not {E621_PRECISION!r}")
+        dtype, precision = (dtypes[E621_PRECISION], E621_PRECISION) if _cuda() else (torch.float32, "fp32")
+        _log(f"loading {E621_MODEL}@{E621_REVISION[:8]} ({precision})")
+        state = load_file(str(path), device="cpu")
+        state.pop("validation")
+        net = _hydra_class()(len(rows), torch.bfloat16)               # the file holds bf16: load exactly, then convert
+        net.load_state_dict(state, strict=True)
+        del state
+        net = net.eval().requires_grad_(False).to(dtype).to(DEVICE)
+        n = len(rows)
+        step = max(1, E621_TAG_CHUNK)
+        q_chunks = [net.attn_pool.q.data[:, a:a + step].contiguous() for a in range(0, n, step)]     # (heads, tags, 64)
+        w_chunks = [net.head.weight.data[a:a + step].contiguous() for a in range(0, n, step)]        # (tags, 2048)
+        net.attn_pool.q.data, net.head.weight.data = q_chunks[0], w_chunks[0]                        # the full copies go
+        names = np.array([r[0] for r in rows], dtype=object)
+        cats = np.array([r[1] for r in rows])
+        src, dst = _implication_edges(rows)
+        self.e621 = {
+            "net": net, "dtype": dtype, "names": names, "implied": (src, dst),
+            "q_chunks": q_chunks, "w_chunks": w_chunks,
+            "keys": {c: np.flatnonzero(cats == c) for c in E621_CATEGORIES},
+            "logit_t": torch.tensor(_hydra_thresholds(validation), dtype=torch.float32, device=DEVICE),
+        }
+        if not all(len(i) for i in self.e621["keys"].values()):
+            raise RuntimeError(f"Hydra file lacks one of the categories {E621_CATEGORIES}: {sorted(set(cats))}")
+        return {"name": Path(E621_FILE).stem, "kind": "e621", "tags": len(rows), "precision": precision,
+                "loadedIn": round(time.monotonic() - started, 1)}
+
     def _load_then_serve(self):
         try:
             CACHE.mkdir(parents=True, exist_ok=True)
@@ -518,8 +795,11 @@ class Tagger:
             _log(f"ready: {self.models[-1]}")
             self.models.append(self._load_ram())
             _log(f"ready: {self.models[-1]}")
+            self.models.append(self._load_e621())
+            _log(f"ready: {self.models[-1]}")
             self._warm_up("pixai", self._forward_pixai, self.pixai["size"])
             self._warm_up("ram", self._forward_ram, RAM_SIZE)
+            self._warm_up("e621", self._forward_e621, int(E621_SEQ ** 0.5) * E621_PATCH)   # 512 x 512: all 1024 patches
             _log(f"micro-batches: {self.batch}")
             self.status = "ok"
             _log(f"serving on {DEVICE}, cap {VRAM_GB:g} GB, micro-batch {MAX_BATCH}")
@@ -527,7 +807,7 @@ class Tagger:
             traceback.print_exc()
             self.status, self.error = "error", f"{type(exc).__name__}: {exc}"
             if _is_oom(exc):
-                self.error += f" (AITAGGER_VRAM_GB={VRAM_GB:g} is too small for the three models: raise it)"
+                self.error += f" (AITAGGER_VRAM_GB={VRAM_GB:g} is too small for the four models: raise it)"
             return
         self.touch()
         while True:
@@ -617,9 +897,74 @@ class Tagger:
             out.append({"general": {str(ram["names"][i]): round(float(cal[b, i]), 4) for i in keep}})
         return out
 
+    def _e621_logits(self, arrays):
+        """arrays: RGB uint8 (H, W, 3) pictures of any size. Each is resized to Hydra's NaFlex grid (_hydra_size: at
+        most 1024 patches of 16 x 16, aspect ratio kept) in linear light, cut into patches and padded to the longest
+        sequence of the batch (the padding is masked). The resize is the repository's: Magic Kernel Sharp 2013 in
+        linear light, rounded to 8 bits (see _mks_matrix; measured against the repository's pyvips pipeline on 79
+        pictures it changes 1.25% of the tag decisions, torch's antialiased bicubic would change 6.3%). Returns the raw
+        tag logits as a float32 (B, tags) tensor on the GPU."""
+        import torch
+
+        net = self.e621["net"]
+        with torch.inference_mode():
+            pictures, grids = [], []
+            for a in arrays:
+                t = torch.from_numpy(a).to(DEVICE).permute(2, 0, 1).float().div_(255.0)      # (3, H, W)
+                h, w = t.shape[-2:]
+                new_h, new_w = _hydra_size(h, w)
+                if (new_h, new_w) != (h, w):
+                    if h == 1 or w == 1:       # torch 2.14 sends a matrix product with an inner size of 1 to a compiler
+                        t = t.expand(-1, max(h, 2), max(w, 2)).contiguous()      # that the image does not have: use 2
+                        h, w = t.shape[-2:]
+                    t = _srgb_to_linear(t)
+                    if new_h != h:
+                        t = torch.matmul(_mks_matrix(h, new_h), t)
+                    if new_w != w:
+                        t = torch.matmul(t, _mks_matrix(w, new_w).T)
+                    t = _linear_to_srgb(t.clamp_(0.0, 1.0))
+                pictures.append(t.mul_(255.0).round_().clamp_(0, 255).to(torch.uint8).permute(1, 2, 0))
+                grids.append((new_h // E621_PATCH, new_w // E621_PATCH))
+            seq = max(gy * gx for gy, gx in grids)
+            patches = torch.zeros((len(arrays), seq, E621_PATCH * E621_PATCH * 3), dtype=torch.uint8, device=DEVICE)
+            for b, (pic, (gy, gx)) in enumerate(zip(pictures, grids)):
+                patches[b, :gy * gx] = (pic.reshape(gy, E621_PATCH, gx, E621_PATCH, 3).permute(0, 2, 1, 3, 4)
+                                        .reshape(gy * gx, -1))
+            out = net.forward_features(net.from_srgb(patches), torch.tensor(grids, dtype=torch.int32))
+            features, valid = out["features"], out["valid"]
+            # The tag head asks one query per tag (8,886 of them) of every picture, and a feed-forward layer widens each
+            # to 10,240: 180 MB per picture. The tags do not depend on each other, so the head runs on E621_TAG_CHUNK
+            # of them at a time (the same numbers, a fraction of the memory).
+            pool, head, parts = net.attn_pool, net.head, []
+            try:
+                for q, w in zip(self.e621["q_chunks"], self.e621["w_chunks"]):
+                    pool.q.data, head.weight.data = q, w
+                    parts.append(net.forward_head(features, valid).float())
+            finally:
+                pool.q.data, head.weight.data = self.e621["q_chunks"][0], self.e621["w_chunks"][0]
+            logits = torch.cat(parts, dim=1)
+            if not bool(torch.isfinite(logits).all()):                    # an fp16 overflow: fail (split) the batch
+                raise FloatingPointError("non-finite e621 scores (set E621_PRECISION=bf16 or fp32)")
+        return logits
+
+    def _forward_e621(self, arrays, floor):
+        """arrays: RGB uint8 (H, W, 3) pictures of any size.
+        Returns [{"general": {tag: score}, "species": ..., "character": ..., "copyright": ...}], the tags scoring at
+        least max(floor, E621_MIN_SCORE): Hydra's probabilities are compressed (the median tag of a picture sits at
+        0.2 against thresholds around 0.6), so after calibration about 5,000-6,500 of the 8,886 tags of a picture are
+        above 0.05, about 520 above 0.2 and 15-50 above 0.5."""
+        import torch
+
+        hy = self.e621
+        with torch.inference_mode():
+            cal = torch.sigmoid(self._e621_logits(arrays) - hy["logit_t"]).cpu().numpy()   # = sigmoid(logit(p) - logit(t))
+        _inherit(cal, *hy["implied"])
+        return _hydra_rows(cal, hy["names"], hy["keys"], floor)
+
     def _attempt(self, name, job, chunk, out, errs):
         """Run one micro-batch; on any failure split it so that only the bad picture(s) fail."""
-        forward = {"wd": self._forward_wd, "pixai": self._forward_pixai, "ram": self._forward_ram}[name]
+        forward = {"wd": self._forward_wd, "pixai": self._forward_pixai, "ram": self._forward_ram,
+                   "e621": self._forward_e621}[name]
         try:
             result = forward([job.inputs[k][name] for k in chunk], job.floor)
         except Exception as exc:  # noqa: BLE001
@@ -695,7 +1040,8 @@ def _decode(data: bytes, wanted: int) -> Image.Image:
 def _prepare(b64: str, models, wd_size: int, pixai_size: int):
     """One picture -> {"wd": uint8 (S, S, 3) white-padded square, "pixai": the RGB picture itself (uint8, H x W x 3;
     the GPU thread scales and pads it, see _forward_pixai), "ram": uint8 (384, 384, 3), resized without keeping the
-    aspect ratio (what the official RAM++ transform does)}."""
+    aspect ratio (what the official RAM++ transform does), "e621": the RGB picture (uint8, H x W x 3, only shrunk if
+    huge; the GPU thread resizes it to Hydra's patch grid, see _forward_e621)}."""
     im = _decode(base64.b64decode(b64, validate=False), max(wd_size, pixai_size))
     out = {}
     if "wd" in models:
@@ -713,6 +1059,9 @@ def _prepare(b64: str, models, wd_size: int, pixai_size: int):
         out["pixai"] = np.array(im.reduce(factor) if factor > 1 else im, dtype=np.uint8)   # a writable copy
     if "ram" in models:
         out["ram"] = np.asarray(im.resize((RAM_SIZE, RAM_SIZE), Image.Resampling.BILINEAR), dtype=np.uint8)
+    if "e621" in models:
+        factor = max(im.size) // (2 * int(E621_SEQ ** 0.5) * E621_PATCH)   # the GPU resizes to ~512 px; shrink huge ones first
+        out["e621"] = np.array(im.reduce(factor) if factor > 1 else im, dtype=np.uint8)
     return out
 
 
@@ -776,7 +1125,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "floor must be a number"})
             wanted = req.get("models") or list(MODEL_NAMES)
             if not isinstance(wanted, list) or not wanted or any(m not in MODEL_NAMES for m in wanted):
-                return self._json(400, {"error": 'models must be a list of "wd", "pixai" and/or "ram"'})
+                return self._json(400, {"error": 'models must be a list of "wd", "pixai", "ram" and/or "e621"'})
             models = [m for m in MODEL_NAMES if m in wanted]
 
             def prep(item):
@@ -829,7 +1178,7 @@ def main() -> int:
         signal.signal(sig, lambda *_: os._exit(0))
     server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler)
     server.daemon_threads = True
-    _log(f"listening; loading {WD_MODEL}, {PIXAI_MODEL} and {RAM_MODEL}")
+    _log(f"listening; loading {WD_MODEL}, {PIXAI_MODEL}, {RAM_MODEL} and {E621_MODEL}")
     server.serve_forever()
     return 0
 
