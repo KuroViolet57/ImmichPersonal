@@ -1516,6 +1516,39 @@
   }
   const fmtMinutes = (m) => (m < 90 ? `${Math.max(1, Math.round(m))} min` : `${(m / 60).toFixed(1)} h`);
 
+  // When a model lets go of the graphics card: the status' `unload` ({loaded, idleSeconds, unloadInSeconds, rule, busy}).
+  // "Models loaded · unloads in ~1 min 40 s if nothing new" / "Not loaded · GPU memory free". The countdown ticks
+  // every second between two status polls (`elapsed` is the time since the poll).
+  function fmtCountdown(seconds) {
+    const s = Math.max(0, Math.round(seconds / 10) * 10);      // to the nearest ten seconds: "~1 min 40 s"
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    if (h) return m ? `${h} h ${m} min` : `${h} h`;
+    if (m) return r ? `${m} min ${r} s` : `${m} min`;
+    return `${r} s`;
+  }
+  function unloadText(u, noun, elapsed = 0) {
+    if (!u || !u.loaded) return "Not loaded · GPU memory free";
+    if (u.idleSeconds == null && !u.busy) return `${noun} loading…`;
+    if (u.busy) return `${noun} loaded · working`;
+    if (u.unloadInSeconds == null) return `${noun} loaded`;
+    const left = Math.max(0, u.unloadInSeconds - elapsed);
+    const when = left < 5 ? "any moment now" : `in ~${fmtCountdown(left)}`;
+    if (u.rule === "after-work") return `${noun} loaded · unloads ${when} if nothing new`;
+    if (u.rule === "interactive") return `${noun} loaded · kept for your last use · unloads ${when} if unused`;
+    return `${noun} loaded · unloads by itself ${when} if unused`;
+  }
+  const unloadLines = {};
+  function showUnload(key, el, u, noun) {
+    unloadLines[key] = { el, u, noun, at: Date.now() };
+    el.textContent = unloadText(u, noun);
+  }
+  setInterval(() => {
+    if (document.hidden) return;
+    Object.values(unloadLines).forEach((l) => {
+      if (l.el.isConnected && l.u && l.u.loaded && !l.u.busy) l.el.textContent = unloadText(l.u, l.noun, (Date.now() - l.at) / 1000);
+    });
+  }, 1000);
+
   function renderSearchPlus(data) {
     spState.data = data;
     const c = data.counts, ix = data.indexer, sv = data.service, cfg = data.settings;
@@ -1529,13 +1562,9 @@
     stateEl.className = `d-state ${cls}`;
     stateEl.textContent = text;
     const sub = document.createElement("small");
-    if (sv.status === "ok") {
-      const left = sv.idleExitMinutes ? Math.max(0, sv.idleExitMinutes - (sv.idleSeconds || 0) / 60) : null;
-      sub.textContent = "Model loaded on the GPU" + (left != null && (sv.idleSeconds || 0) > 60 ? ` · unloads in ~${Math.ceil(left)} min if unused` : "");
-    } else if (sv.status === "loading" || (sv.container === "running" && !sv.status)) sub.textContent = "Model loading…";
-    else if (sv.status === "error") sub.textContent = `Model failed to load: ${sv.error}`;
+    if (sv.status === "error") sub.textContent = `Model failed to load: ${sv.error}`;
     else if (sv.container === "missing") sub.textContent = "Model server not installed yet";
-    else sub.textContent = "Model not loaded — the GPU memory is free";
+    else showUnload("sp", sub, data.unload, "Model");
     stateEl.appendChild(sub);
 
     const pct = c.assets ? (100 * c.indexed) / c.assets : 0;
@@ -1564,6 +1593,11 @@
       $("sp-frames-v").textContent = String(cfg.video_frames);
     }
     $("sp-keep").checked = !!cfg.keep_updated;
+    [["sp-unload-after", "unload_after"], ["sp-check-every", "check_every"]].forEach(([id, key]) => {
+      const el = $(id), range = (data.limits || {})[key];
+      if (range) { el.min = String(range[0]); el.max = String(range[1]); }
+      if (document.activeElement !== el) el.value = String(cfg[key]);
+    });
 
     const fails = data.failures || [];
     $("sp-fail-box").classList.toggle("is-hidden", !c.failed);
@@ -1754,6 +1788,19 @@
   $("sp-frames").addEventListener("input", () => { $("sp-frames-v").textContent = $("sp-frames").value; });
   $("sp-frames").addEventListener("change", () => searchPlusCall("settings", { changes: { video_frames: Number($("sp-frames").value) } }));
   $("sp-keep").addEventListener("change", () => searchPlusCall("settings", { changes: { keep_updated: $("sp-keep").checked } }));
+  // whole minutes, 1-60 (the server's limits are in the status; a bad entry goes back to the saved value)
+  [["sp-unload-after", "unload_after", "Unload after"], ["sp-check-every", "check_every", "Look for new uploads every"]].forEach(([id, key, label]) => {
+    $(id).addEventListener("change", () => {
+      const el = $(id), value = el.value.trim() === "" ? NaN : Number(el.value);
+      const range = ((spState.data && spState.data.limits) || {})[key] || [1, 60];
+      if (!Number.isInteger(value) || value < range[0] || value > range[1]) {
+        toast(`${label} must be a whole number of minutes, ${range[0]} to ${range[1]}.`, true);
+        el.value = String(spState.data ? spState.data.settings[key] : "");
+        return;
+      }
+      searchPlusCall("settings", { changes: { [key]: value } }, "Saved.");
+    });
+  });
   $("sp-retry").addEventListener("click", () => searchPlusCall("index", { action: "retry" }, "They will be tried again."));
   $("sp-clear").addEventListener("click", () => searchPlusCall("index", { action: "clear" },
     "Cleared — those items are skipped (Try again brings them back)."));
@@ -1800,11 +1847,14 @@
     video_frames:   { kind: "frames" },
     batch_size:     { id: "tg-batch", kind: "int" },
     vram_gb:        { id: "tg-vram", kind: "int" },
+    unload_after:   { id: "tg-unload-after", kind: "int" },
+    check_every:    { id: "tg-check-every", kind: "int" },
   };
   const TG_LABELS = {
     vocabulary: "Renames and combinations", blocked: "Blocked tags", character_tags: "Character names", rating_tag: "Rating tag",
     write_tags: "Immich tags", max_tags: "Most tags per photo", rules: "Combinations (form)", video_frames: "Captures per video",
-    batch_size: "Assets per round", vram_gb: "GPU memory",
+    batch_size: "Assets per round", vram_gb: "GPU memory", unload_after: "Unload the models after",
+    check_every: "Look for new uploads every",
   };
   // Which settings change what is written, and the lightest reprocess mode that applies them. The server says which
   // (`reprocessKeys` in the status, see tgSetModes); the tagger keys follow the same rule: switching one on or off
@@ -1821,7 +1871,7 @@
     how: () => ["vocabulary", "blocked", ...tagState.taggerKeys.flatMap((k) => [`use_${k}`, `${k}_strictness`]),
       "character_tags", "rating_tag", "write_tags", "max_tags"],
     rules: () => ["rules"],
-    speed: () => ["video_frames", "batch_size", "vram_gb"],
+    speed: () => ["video_frames", "batch_size", "vram_gb", "unload_after", "check_every"],
   };
   const TG_RULE_KEYS = ["if_all", "if_any", "unless", "add", "remove"];
 
@@ -2037,6 +2087,8 @@
     const names = Object.entries(models).filter(([k, name]) => name && cfg[`use_${k}`] !== false).map(([, name]) => name);
     if (names.length) lines.push(`Models: ${names.join(" · ")}`);
     $("tg-service").textContent = lines.join("\n");
+    if (data.unload && tg.status !== "error") showUnload("tg", $("tg-unload-line"), data.unload, "Models");
+    else $("tg-unload-line").textContent = "";
 
     const toggle = $("tg-toggle");
     toggle.textContent = cfg.indexing ? "Pause" : (processed ? "Resume tagging" : "Start tagging");

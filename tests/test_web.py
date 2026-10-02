@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -1304,7 +1305,9 @@ class TestAiTagger(WebCase):
         self.assertEqual(data["limits"], {"video_frames": [1, 8], "batch_size": [1, 64],
                                           "vram_gb": list(self.at.VRAM_GB_LIMITS), "wd_strictness": [0.2, 0.95],
                                           "pixai_strictness": [0.2, 0.95], "ram_strictness": [0.2, 0.95],
-                                          "e621_strictness": [0.2, 0.95], "max_tags": [5, 100]})
+                                          "e621_strictness": [0.2, 0.95], "max_tags": [5, 100],
+                                          "unload_after": [1, 60], "check_every": [1, 60]})
+        self.assertEqual((data["settings"]["unload_after"], data["settings"]["check_every"]), (2, 1))
         self.assertEqual(data["limits"]["vram_gb"], [5, 8])                              # four taggers: 5-8 GB, default 6
         self.assertEqual(data["settings"]["vram_gb"], 6)
         for gone in ("describe", "instructions", "language", "vlm_parallel"):       # the describer's settings are gone
@@ -1317,6 +1320,8 @@ class TestAiTagger(WebCase):
         self.assertEqual(data["indexer"], {"state": "stopped", "detail": "", "error": None, "running": False,
                                            "ratePerMin": None, "etaMinutes": None})
         self.assertEqual(set(data["service"]), {"tagger", "gpu", "searchplusRunning", "exclusive"})      # no "vlm"
+        self.assertEqual(data["unload"], {"loaded": False, "idleSeconds": None, "unloadInSeconds": None,    # a stand-in that
+                                          "rule": None, "busy": False})                                      # can't say: not loaded
         self.assertEqual(data["service"]["tagger"]["status"], "down")
         self.assertEqual(data["service"]["gpu"], {"totalGb": 24, "usedGb": 1.0})
         self.assertFalse(data["service"]["searchplusRunning"])
@@ -1689,3 +1694,279 @@ class TestAiTagger(WebCase):
         message = "The GPU is in use by the AI Tagger — pause it to use Search+"
         self.services.ensure_ready = mock.Mock(side_effect=self.at.GpuBusy(message))
         self.assertEqual(self.refused(lambda: self.post("preview", {"id": self.ids[0]}), 503), message)
+
+
+class SearchService:
+    """Built in ``setUp``: the real ``searchplus.Service`` (so its interactive-use and in-flight bookkeeping is the real
+    one) with the network, docker and the model replaced. A text is a word of ``test_searchplus.BASIS``."""
+
+    @staticmethod
+    def make(idle=30, running=True):
+        import base64
+        import numpy as np
+        from immich_organizer import searchplus as sp
+        from tests import test_searchplus as t
+
+        def enc(v):
+            return base64.b64encode(np.asarray(v, dtype="<f2").tobytes()).decode()
+
+        class Fake(sp.Service):
+            def __init__(self):
+                super().__init__()
+                self.idle, self.running, self.health_calls, self.state_calls, self.stops = idle, running, 0, 0, 0
+
+            def ready(self, wait=0, progress=None, stop=None):
+                return {"status": "ok", "model": "fake", "dim": t.DIM}
+
+            def health(self, timeout=3):
+                self.health_calls += 1
+                if not self.running:
+                    return None
+                return {"status": "ok", "model": "fake", "dim": t.DIM, "idleSeconds": self.idle, "idleExitMinutes": 20}
+
+            def container_state(self, fresh=False):
+                self.state_calls += 1
+                return "running" if self.running else "stopped"
+
+            def stop(self):
+                self.stops += 1
+                was, self.running = self.running, False
+                return was
+
+            def _post(self, path, body, timeout=600):
+                if path == "/embed/text":
+                    return {"vectors": [enc(t.unit(t.BASIS[x])) for x in body["texts"]], "dim": t.DIM}
+                words = [base64.b64decode(b) for b in body["images"]]
+                vecs = [enc(t.unit(np.sum([t.BASIS[w] for w in b.decode().split("+")], axis=0))) for b in words]
+                return {"vectors": vecs, "errors": [None] * len(vecs), "dim": t.DIM}
+
+        return Fake()
+
+
+class TestSearchPlusUnload(WebCase):
+    """GET /api/searchplus: the ``unload`` object and the two new settings; what counts as interactive use of the model."""
+
+    def setUp(self):
+        super().setUp()
+        from immich_organizer import searchplus as sp
+        from tests import test_searchplus as t
+        self.sp, self.t = sp, t
+        ids = self.ids
+        self.catalog = [
+            {"id": ids[0], "type": "IMAGE", "taken": "2026-01-05", "name": "a.jpg", "preview": "beach", "original": "", "duration_ms": 0},
+            {"id": ids[1], "type": "IMAGE", "taken": "2026-01-04", "name": "b.jpg", "preview": "dog", "original": "", "duration_ms": 0},
+            {"id": ids[2], "type": "VIDEO", "taken": "2026-01-03", "name": "c.mp4", "preview": "car|beach+dog", "original": "", "duration_ms": 5000},
+        ]
+        self.store = sp.Store(Path(self.tmp.name) / "sp")
+        self.addCleanup(self.store.conn.close)
+        self.service = SearchService.make()
+        self.indexer = sp.Indexer(self.store, self.service, catalog=lambda: self.catalog, frames=t.fake_frames)
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+        self.httpd.RequestHandlerClass.searchplus_parts = (self.store, self.service, self.indexer)
+        self.addCleanup(setattr, self.httpd.RequestHandlerClass, "searchplus_parts", None)
+        self.backend = FakeThemeBackend({})
+        self.httpd.RequestHandlerClass.theme_backend = self.backend
+        self.addCleanup(setattr, self.httpd.RequestHandlerClass, "theme_backend", None)
+
+    def status(self):
+        return request(self.base + "/api/searchplus")[1]
+
+    def post(self, action, body):
+        return request(self.base + f"/api/searchplus/{action}", method="POST", body=body)[1]
+
+    def refused(self, call):
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            call()
+        self.assertEqual(err.exception.code, 400)
+        return json.loads(err.exception.read())["error"]
+
+    def build(self):
+        """Index everything (the run ends with the card freed, so the model server idles for long meanwhile), then put the
+        model server back as it was."""
+        self.service.idle = 500
+        self.post("settings", {"changes": {"keep_updated": False}})
+        self.indexer.start()
+        self.indexer.thread.join(30)
+        self.assertFalse(self.indexer.running())
+        self.service.idle, self.service.running, self.service.stops = 30, True, 0
+
+    def test_the_status_has_the_unload_object_and_the_settings(self):
+        data = self.status()
+        self.assertEqual(data["unload"], {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 1170, "rule": "server",
+                                          "busy": False})            # nothing indexing: only the server's own exit
+        self.assertEqual((data["settings"]["unload_after"], data["settings"]["check_every"]), (2, 1))
+        self.assertEqual(data["limits"], {"video_frames": [1, 8], "unload_after": [1, 60], "check_every": [1, 60]})
+        self.assertEqual(data["service"]["container"], "running")
+
+    def test_not_loaded_is_said_plainly(self):
+        self.service.running = False
+        self.assertEqual(self.status()["unload"], {"loaded": False, "idleSeconds": None, "unloadInSeconds": None,
+                                                   "rule": None, "busy": False})
+
+    def test_while_the_indexer_waits_the_countdown_is_the_short_rule(self):
+        self.post("settings", {"changes": {"keep_updated": True}})
+        self.indexer.start()
+        self.assertTrue(self.t.wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.assertEqual(self.status()["unload"], {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 90,
+                                                   "rule": "after-work", "busy": False})
+        self.service.idle = 130                                     # and the panel really stops it
+        self.assertTrue(self.t.wait_for(lambda: self.service.stops == 1))
+        self.assertFalse(self.status()["unload"]["loaded"])
+
+    def test_the_status_is_cheap_one_health_look_and_one_remembered_state_per_poll(self):
+        self.status()
+        before = (self.service.health_calls, self.service.state_calls)
+        for _ in range(3):
+            self.status()
+        self.assertEqual(self.service.health_calls - before[0], 3)      # one /health per poll, none extra for ``unload``
+        self.assertEqual(self.service.state_calls - before[1], 3)       # (the real one remembers its answer for 5 s)
+
+    def test_the_new_settings_are_checked_by_the_route(self):
+        data = self.post("settings", {"changes": {"unload_after": 5, "check_every": 10}})
+        self.assertEqual((data["settings"]["unload_after"], data["settings"]["check_every"]), (5, 10))
+        for changes in ({"unload_after": 0}, {"unload_after": 61}, {"check_every": 0}, {"check_every": "soon"},
+                        {"unload_after": 5, "check_every": 99}):
+            with self.subTest(changes=changes):
+                self.refused(lambda: self.post("settings", {"changes": changes}))
+        self.assertEqual(self.status()["settings"]["unload_after"], 5)
+
+    def test_a_text_search_is_interactive_use_a_like_search_is_not(self):
+        self.build()
+        self.assertIsNone(self.service.interactive_age())
+        self.post("search", {"like": self.ids[1]})                       # stored vectors only: the model is not used
+        self.assertIsNone(self.service.interactive_age())
+        self.service.idle = 130
+        self.post("search", {"text": "dog"})
+        self.assertIsNotNone(self.service.interactive_age())
+        self.assertEqual(self.status()["unload"]["rule"], "server")      # (indexer not running here)
+
+    def test_after_a_search_the_short_rule_waits_for_the_servers_own_idle_time(self):
+        self.build()
+        self.post("search", {"text": "dog"})
+        self.post("settings", {"changes": {"keep_updated": True}})
+        self.indexer.start()
+        self.assertTrue(self.t.wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.service.idle = 0                                            # the search was the server's last request
+        time.sleep(0.3)
+        unload = self.status()["unload"]
+        self.assertEqual(unload["rule"], "interactive")                  # not the 90 s of the short rule
+        self.assertGreater(unload["unloadInSeconds"], 1100)
+        self.service.idle = 130                                          # the short rule alone would stop it now
+        time.sleep(0.3)
+        self.assertEqual(self.service.stops, 0)                          # a search a moment ago: within the grace
+
+    def test_the_search_tab_with_the_searchplus_model_is_interactive_use(self):
+        self.build()
+        self.assertIsNone(self.service.interactive_age())
+        data = request(self.base + "/api/search", method="POST", body={"engine": "searchplus", "query": "dog", "limit": 3})[1]
+        self.assertEqual(data["engine"], "searchplus")
+        self.assertIsNotNone(self.service.interactive_age())
+
+    def test_smart_albums_on_searchplus_are_interactive_use_too(self):
+        self.build()
+        self.assertIsNone(self.service.interactive_age())
+        data = request(self.base + "/api/themes/preview", method="POST",
+                       body={"theme": {"description": "dog", "engine": "searchplus"}, "limit": 3})[1]
+        self.assertEqual(data["engine"], "searchplus")
+        self.assertIsNotNone(self.service.interactive_age())
+
+    def test_the_indexer_alone_never_counts_as_interactive_use(self):
+        self.build()                                                     # it sent pictures to the model
+        self.assertIsNone(self.service.interactive_age())
+
+
+class TestAiTaggerUnload(WebCase):
+    """GET /api/aitagger: the ``unload`` object and the two new settings; the Test card is interactive use."""
+
+    def setUp(self):
+        super().setUp()
+        from immich_organizer import aitagger as at
+        from tests import test_aitagger as t
+        self.at, self.t = at, t
+        self.services = t.IdleServices()
+        self.store = at.Store(Path(self.tmp.name) / "at")
+        self.addCleanup(self.store.conn.close)
+        self.catalog = t.catalog_for(self.ids)
+        self.indexer = at.Indexer(self.store, self.services, client=self.client, catalog=lambda: self.catalog,
+                                  frames=t.fake_frames)
+        self.indexer.DROP_WAIT = 0.01
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+        self.httpd.RequestHandlerClass.aitagger_parts = (self.store, self.services, self.indexer)
+        self.addCleanup(setattr, self.httpd.RequestHandlerClass, "aitagger_parts", None)
+
+    def get(self, path="/api/aitagger"):
+        return request(self.base + path)[1]
+
+    def post(self, action, body=None):
+        return request(self.base + f"/api/aitagger/{action}", method="POST", body=body or {})[1]
+
+    def refused(self, call, code=400):
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            call()
+        self.assertEqual(err.exception.code, code)
+        return json.loads(err.exception.read())["error"]
+
+    def test_the_status_has_the_unload_object(self):
+        self.services.idle = 40
+        self.assertEqual(self.get()["unload"], {"loaded": True, "idleSeconds": 40, "unloadInSeconds": 1160, "rule": "server",
+                                                "busy": False})
+        self.services.running = False
+        self.assertEqual(self.get()["unload"], {"loaded": False, "idleSeconds": None, "unloadInSeconds": None,
+                                                "rule": None, "busy": False})
+
+    def test_after_the_work_the_short_rule_counts_down_and_the_panel_stops_the_models(self):
+        self.services.idle = 40
+        self.post("settings", {"changes": {"keep_updated": True}})
+        self.post("index", {"action": "start"})
+        self.assertTrue(self.t.wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.assertEqual(self.get()["unload"], {"loaded": True, "idleSeconds": 40, "unloadInSeconds": 80,
+                                                "rule": "after-work", "busy": False})
+        self.services.idle = 125
+        self.assertTrue(self.t.wait_for(lambda: self.services.unloads == 1))
+        self.assertFalse(self.get()["unload"]["loaded"])
+
+    def test_a_busy_tagger_or_a_request_in_flight_is_busy(self):
+        self.services.busy_n = 1
+        self.assertTrue(self.get()["unload"]["busy"])
+        self.assertIsNone(self.get()["unload"]["unloadInSeconds"])
+        self.services.busy_n, self.services.inflight_n = 0, 2
+        self.assertTrue(self.get()["unload"]["busy"])
+
+    def test_preview_and_apply_are_interactive_use(self):
+        self.assertEqual(self.services.marks, 0)
+        self.post("preview", {"id": self.ids[0]})
+        self.assertEqual(self.services.marks, 2)                         # before the models run, and after
+        self.post("apply", {"id": self.ids[0]})
+        self.assertEqual(self.services.marks, 4)
+        self.assertEqual(self.get()["unload"]["unloadInSeconds"], 1200 - self.services.idle)   # (indexer not running)
+        self.post("settings", {"changes": {"keep_updated": True}})
+        self.post("index", {"action": "start"})
+        self.assertTrue(self.t.wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.services.idle = 125
+        self.services.age = 600                                          # the Test card ten minutes ago
+        time.sleep(0.3)
+        self.assertEqual(self.services.unloads, 0)
+        unload = self.get()["unload"]
+        self.assertEqual((unload["rule"], unload["unloadInSeconds"]), ("interactive", 600))
+
+    def test_the_indexer_alone_never_counts_as_interactive_use(self):
+        self.post("settings", {"changes": {"keep_updated": False}})
+        self.services.idle = 500
+        self.post("index", {"action": "start"})
+        self.indexer.thread.join(30)
+        self.assertEqual(self.services.marks, 0)
+        self.assertEqual(self.store.counts()["processed"], 3)
+
+    def test_the_new_settings_are_checked_by_the_route_and_make_nothing_outdated(self):
+        data = self.post("settings", {"changes": {"unload_after": 5, "check_every": 10}})
+        self.assertEqual((data["settings"]["unload_after"], data["settings"]["check_every"]), (5, 10))
+        self.assertEqual((data["changed"], data["suggest"]), ([], "none"))
+        self.assertEqual(data["settingsVersion"], 1)
+        for changes in ({"unload_after": 0}, {"unload_after": 61}, {"check_every": 0}, {"check_every": 1.5},
+                        {"unload_after": "2"}, {"unload_after": True}, {"unload_after": 5, "check_every": 99}):
+            with self.subTest(changes=changes):
+                self.refused(lambda: self.post("settings", {"changes": changes}))
+        self.assertEqual(self.get()["settings"]["unload_after"], 5)
+        self.assertEqual(self.get()["limits"]["unload_after"], [1, 60])

@@ -302,13 +302,16 @@ class OrganizerHandler(BaseHTTPRequestHandler):
     def _searchplus_status(self) -> dict:
         store, service, indexer = self._sp()
         health = service.health(timeout=1.5) or {}
+        container = service.container_state()           # remembered for a few seconds: this route is polled
         return {
             "model": searchplus_mod.MODEL_LABEL, "indexModel": store.model or None,
             "settings": searchplus_mod.load_settings(), "limits": {k: list(v) for k, v in searchplus_mod.LIMITS.items()},
             "counts": store.counts(), "indexer": indexer.status(), "failures": store.failures(),
-            "service": {"container": service.container_state(), "status": health.get("status"),
+            "service": {"container": container, "status": health.get("status"),
                         "error": health.get("error") or "", "idleExitMinutes": health.get("idleExitMinutes"),
                         "idleSeconds": health.get("idleSeconds"), "loadedIn": health.get("loadedIn")},
+            # when the model lets go of the graphics card: {loaded, idleSeconds, unloadInSeconds, rule, busy}
+            "unload": indexer.unload_status(running=container == "running", health=health or None),
         }
 
     def _searchplus_action(self, action: str, body: dict) -> dict:
@@ -416,6 +419,8 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             "limits": {k: list(v) for k, v in aitagger_mod.LIMITS.items()},
             "settingsVersion": store.settings_version, "counts": counts, "indexer": indexer.status(counts),
             "service": {**service.status(), "exclusive": searchplus_mod.AITAGGER_EXCLUSIVE},
+            # when the models let go of the graphics card: {loaded, idleSeconds, unloadInSeconds, rule, busy}
+            "unload": indexer.unload_status(),
             "models": aitagger_mod.model_labels(), "failures": store.failures(),
             "reprocessKeys": {mode: list(keys) for mode, keys in aitagger_mod.REPROCESS.items()},
         }

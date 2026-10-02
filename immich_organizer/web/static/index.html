@@ -626,10 +626,21 @@
           Applies to videos indexed from now on.</small>
       </label>
       <label class="check"><input id="sp-keep" type="checkbox"><span>Keep it up to date: index new uploads
-        automatically (the model loads for them, then unloads after 20 quiet minutes)</span></label>
+        automatically (the model loads for them, then unloads again once nothing new comes in)</span></label>
+      <label class="field">
+        <span>Unload the model after (minutes)</span>
+        <input id="sp-unload-after" type="number" min="1" max="60" step="1" inputmode="numeric">
+        <small>When everything is indexed and nothing new has come in for this long, the model is stopped and the graphics
+          memory is free. After a search of yours it stays loaded for 20 minutes instead.</small>
+      </label>
+      <label class="field">
+        <span>Look for new uploads every (minutes)</span>
+        <input id="sp-check-every" type="number" min="1" max="60" step="1" inputmode="numeric">
+        <small>One tiny question to Immich's database. A new photo is indexed once Immich has made its preview.</small>
+      </label>
       <p class="hint">The model needs about 6 GB of graphics memory while it runs. It loads when you search or
-        index and unloads by itself after 20 minutes without use; “Stop &amp; free GPU” unloads it now. The first
-        start downloads it (about 10 GB).</p>
+        index, and is unloaded again as soon as it is not needed (see above); “Stop &amp; free GPU” unloads it now.
+        The first start downloads it (about 10 GB).</p>
       <details class="more is-hidden" id="sp-fail-box">
         <summary id="sp-fail-sum">Could not index</summary>
         <p class="hint" id="sp-fail-hint"></p>
@@ -659,14 +670,15 @@
       <p class="hint" id="tg-progress"></p>
       <div class="stats" id="tg-stats"></div>
       <p class="hint" id="tg-service"></p>
+      <p class="hint" id="tg-unload-line"></p>
       <div class="row row-gap">
         <button class="btn btn-quiet" id="tg-load" type="button">Load models</button>
         <button class="btn btn-quiet" id="tg-toggle" type="button">Start tagging</button>
         <button class="btn btn-quiet" id="tg-unload" type="button">Stop &amp; free GPU</button>
       </div>
       <p class="hint" id="tg-exclusive-note" style="margin-top:10px">Search+ is paused while the AI Tagger uses the graphics card. Pause the
-        tagger and press “Stop &amp; free GPU” to give it back. The models also unload by themselves after a quiet
-        spell.</p>
+        tagger and press “Stop &amp; free GPU” to give it back. The models also unload by themselves once there is
+        nothing left to tag.</p>
       <details class="more is-hidden" id="tg-fail-box">
         <summary id="tg-fail-sum">Could not tag</summary>
         <p class="hint">Newest first. Each one is tried again a few times by itself.</p>
@@ -763,9 +775,20 @@
         <input class="slider" id="tg-vram" type="range" step="1">
         <small>Memory for the taggers together. It takes effect the next time the models start.</small>
       </label>
+      <label class="field">
+        <span>Unload the models after (minutes)</span>
+        <input id="tg-unload-after" type="number" step="1" inputmode="numeric">
+        <small>When everything is tagged and nothing new has come in for this long, the models are stopped and the
+          graphics memory is free. After a Test of yours they stay loaded for 20 minutes instead.</small>
+      </label>
+      <label class="field">
+        <span>Look for new uploads every (minutes)</span>
+        <input id="tg-check-every" type="number" step="1" inputmode="numeric">
+        <small>One tiny question to Immich's database. A new photo is tagged once Immich has made its preview.</small>
+      </label>
       <button class="btn btn-primary" id="tg-save-speed" type="button">Save</button>
       <label class="check" style="margin-top:14px"><input id="tg-keep" type="checkbox"><span>Keep it up to date: tag new uploads
-        automatically (the models load for them and unload after a quiet spell)</span></label>
+        automatically (the models load for them, then unload again once nothing new comes in)</span></label>
     </div>
 
     <div class="card" id="tg-test">

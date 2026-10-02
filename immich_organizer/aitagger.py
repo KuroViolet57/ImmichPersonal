@@ -335,10 +335,13 @@ def model_labels() -> dict[str, str]:
 # by ``configure_taggers`` (below), together with the tables that mention them.
 FIXED_DEFAULTS = {
     "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vram_gb": VRAM_GB_DEFAULT,
+    "unload_after": searchplus.DEFAULTS["unload_after"], "check_every": searchplus.DEFAULTS["check_every"],
     "character_tags": True, "rating_tag": True, "max_tags": 30, "vocabulary": "", "blocked": [], "rules": [],
     "write_tags": False,
 }
-FIXED_LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vram_gb": VRAM_GB_LIMITS, "max_tags": (5, 100)}
+# unload_after / check_every: whole minutes, as in Search+ (not content settings: they never make results outdated)
+FIXED_LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vram_gb": VRAM_GB_LIMITS, "max_tags": (5, 100),
+                "unload_after": searchplus.LIMITS["unload_after"], "check_every": searchplus.LIMITS["check_every"]}
 STRICTNESS = (0.2, 0.95)            # the limits of every ``<key>_strictness`` (calibrated: 0.5 = the model's own threshold)
 TEXT_LIMITS = {"vocabulary": 20000}
 MAX_BLOCKED, MAX_RULES, MAX_RULE_TAGS = 500, 100, 50
@@ -369,7 +372,8 @@ def configure_taggers(kinds=None) -> None:
     strict = [f"{kind.key}_strictness" for kind in TAGGERS]
     fixed = FIXED_DEFAULTS
     DEFAULTS.clear()
-    DEFAULTS.update({k: fixed[k] for k in ("indexing", "keep_updated", "video_frames", "batch_size", "vram_gb")})
+    DEFAULTS.update({k: fixed[k] for k in ("indexing", "keep_updated", "video_frames", "batch_size", "vram_gb",
+                                           "unload_after", "check_every")})
     DEFAULTS.update({f"use_{kind.key}": kind.default_on for kind in TAGGERS})
     DEFAULTS.update({key: 0.5 for key in strict})
     DEFAULTS.update({k: fixed[k] for k in ("character_tags", "rating_tag", "max_tags", "vocabulary", "blocked", "rules",
@@ -973,7 +977,10 @@ TAGGER_ENV_KEYS = ("AITAGGER_VRAM_GB",)      # what a start of the tagger contai
 
 class Services:
     """The tagger container and the HTTP client that talks to it (what the Indexer and the routes use). Only the
-    ``tagger`` compose service is ever started or stopped here. The container stops itself after a quiet spell."""
+    ``tagger`` compose service is ever started or stopped here. The container stops itself after a quiet spell
+    (the server's own 20 minutes); the Indexer stops it earlier, right after the work (``searchplus.IdleLoop``,
+    docs/AI-TAGGER.md "Unloading the models"). Here are the facts those rules need: the tagger's /health (remembered
+    a few seconds: the status route is polled), the requests in flight, and the last interactive use."""
 
     def __init__(self, tagger: Tagger | None = None, *, runner=run_command, store: "Store | None" = None,
                  settings_fn=None, clock=time.monotonic, sleep=time.sleep, search_stop=None):
@@ -987,14 +994,51 @@ class Services:
         self._memory: dict[str, str] = {}
         self._gpu: tuple[float, dict] | None = None
         self._total_gb: float | None = None
+        self._health: tuple[float, dict | None] | None = None
+        self._facts_lock = threading.Lock()
+        self._inflight = 0
+        self._interactive: float | None = None
 
     # ---- the client
     def tag(self, images: list[bytes], models: list[str] | None = None) -> tuple[list, list]:
+        with self._facts_lock:
+            self._inflight += 1
         try:
             return self.tagger.tag(images, models=models)
         except GpuBroken:
             self.tagger_box.stop()              # its CUDA context is gone for good: the next round starts a fresh one
             raise
+        finally:
+            with self._facts_lock:
+                self._inflight -= 1
+
+    # ---- what the unload rules need
+    def tagger_health(self, fresh: bool = False, timeout: float = 1.5) -> dict | None:
+        """The tagger's /health, remembered for ``STATE_TTL`` seconds unless ``fresh``."""
+        now = self.clock()
+        with self._facts_lock:                  # (not self._lock: that one is held while the container starts or stops)
+            if not fresh and self._health is not None and now - self._health[0] < STATE_TTL:
+                return self._health[1]
+        health = self.tagger.health(timeout=timeout)
+        with self._facts_lock:
+            self._health = (self.clock(), health)
+        return health
+
+    def inflight(self) -> int:
+        """Tagger requests this panel has sent and not had answered."""
+        return self._inflight
+
+    def mark_interactive(self) -> None:
+        """A person is using the models (the Test card): they keep their place for the server's own idle time."""
+        self._interactive = self.clock()
+
+    def interactive_age(self) -> float | None:
+        return None if self._interactive is None else self.clock() - self._interactive
+
+    def unload_inputs(self, fresh: bool = False) -> tuple[bool, dict | None]:
+        """(whether the container runs, its /health)."""
+        running = self.tagger_box.container_state(fresh=fresh) == "running"
+        return running, (self.tagger_health(fresh=fresh, timeout=3 if fresh else 1.5) if running else None)
 
     # ---- the graphics card
     def gpu(self) -> dict:
@@ -1103,7 +1147,7 @@ class Services:
 
     def status(self) -> dict:
         state = self.tagger_box.container_state()
-        health = self.tagger.health(timeout=1.5) if state == "running" else None
+        health = self.tagger_health(timeout=1.5) if state == "running" else None
         tagger = {"container": state, "status": "down", "error": None}
         if health:
             tagger.update(status=health.get("status") or "loading", error=health.get("error"))
@@ -1118,7 +1162,7 @@ class Services:
 SCHEMA = """
 create table if not exists assets (
   id text primary key, type text, taken text, name text, preview text, original text,
-  duration_ms integer default 0, gone integer default 0
+  duration_ms integer default 0, gone integer default 0, added integer default 0
 );
 create index if not exists assets_taken on assets(taken desc, id);
 create table if not exists raw (
@@ -1160,6 +1204,9 @@ class Store:
         self.conn.execute("pragma journal_mode=wal")
         self.conn.execute("pragma synchronous=normal")
         self.conn.executescript(SCHEMA)
+        if "added" not in {r[1] for r in self.conn.execute("pragma table_info(assets)")}:      # made before the preview hold-back
+            with self.conn:
+                self.conn.execute("alter table assets add column added integer default 0")
         self._meta = dict(self.conn.execute("select key, value from meta").fetchall())
         self._changes = 0
         self._tags_cache: tuple[int, list] | None = None
@@ -1221,12 +1268,12 @@ class Store:
         with self.lock, self.conn:
             self.conn.execute("update assets set gone=1")
             self.conn.executemany(
-                "insert into assets (id, type, taken, name, preview, original, duration_ms, gone)"
-                " values (?,?,?,?,?,?,?,0) on conflict(id) do update set type=excluded.type, taken=excluded.taken,"
+                "insert into assets (id, type, taken, name, preview, original, duration_ms, added, gone)"
+                " values (?,?,?,?,?,?,?,?,0) on conflict(id) do update set type=excluded.type, taken=excluded.taken,"
                 " name=excluded.name, preview=excluded.preview, original=excluded.original,"
-                " duration_ms=excluded.duration_ms, gone=0",
+                " duration_ms=excluded.duration_ms, added=excluded.added, gone=0",
                 [(r["id"], r["type"], r["taken"], r.get("name", ""), r.get("preview", ""), r.get("original", ""),
-                  int(r.get("duration_ms") or 0)) for r in rows])
+                  int(r.get("duration_ms") or 0), int(r.get("added") or 0)) for r in rows])
             self.set_meta("catalog_at", _now())
         return {"assets": len(rows)}
 
@@ -1245,16 +1292,17 @@ class Store:
     # ---- what to do next
     def work(self, n: int, skip=()) -> list[dict]:
         """Up to ``n`` assets to process: the queue first (oldest request first), then the assets that have no
-        written result yet, newest first. Each item has a ``mode``. ``skip`` are ids that are being worked on."""
+        written result yet, newest first. Each item has a ``mode``. ``skip`` are ids that are being worked on. An asset
+        Immich has not finished (no preview yet, added a moment ago) is left out until it has (``searchplus.READY``)."""
         skip = set(skip)
         out: list[dict] = []
         seen = set(skip)
         limit = n + len(skip)
-        guard = (MAX_ATTEMPTS, _ago(RETRY_AFTER))
+        guard = (MAX_ATTEMPTS, _ago(RETRY_AFTER), searchplus.preview_cutoff())
         with self.lock:
             rows = self.conn.execute(
                 f"select {_ITEM}, q.mode from queue q join assets a on a.id=q.id where a.gone=0{_NOT_EXCLUDED}"
-                f"{_NOT_FAILED} order by q.at, q.rowid limit ?", (*guard, limit)).fetchall()
+                f"{_NOT_FAILED} and {searchplus.READY} order by q.at, q.rowid limit ?", (*guard, limit)).fetchall()
             for row in rows:
                 if row[0] not in seen and len(out) < n:
                     seen.add(row[0])
@@ -1263,13 +1311,21 @@ class Store:
                 rows = self.conn.execute(
                     f"select {_ITEM}, case when r.id is null then 'full' else 'retag' end from assets a"
                     f" left join results r on r.id=a.id where a.gone=0 and (r.id is null or r.written_at is null)"
-                    f"{_NOT_EXCLUDED}{_NOT_FAILED} order by a.taken desc, a.id limit ?",
+                    f"{_NOT_EXCLUDED}{_NOT_FAILED} and {searchplus.READY} order by a.taken desc, a.id limit ?",
                     (*guard, limit + len(out))).fetchall()
                 for row in rows:
                     if row[0] not in seen and len(out) < n:
                         seen.add(row[0])
                         out.append({**dict(zip(_ITEM_KEYS, row[:7])), "mode": row[7]})
         return out
+
+    def held(self) -> int:
+        """How many untagged assets are waiting for Immich to make their preview (``searchplus.READY``)."""
+        with self.lock:
+            return self.conn.execute(
+                "select count(*) from assets a left join results r on r.id=a.id where a.gone=0"
+                f" and (r.id is null or r.written_at is null){_NOT_EXCLUDED} and not {searchplus.READY}",
+                (searchplus.preview_cutoff(),)).fetchone()[0]
 
     # ---- raw tagger scores
     def save_raw(self, asset_id: str, raw: dict) -> None:
@@ -1711,7 +1767,7 @@ def reprocess(store: Store, scope: str, mode: str, ids=None, tag: str = "") -> i
 
 # ---------------------------------------------------------------- the background worker
 
-class Indexer:
+class Indexer(searchplus.IdleLoop):
     """Background thread that tags the assets; stop / start at will, it resumes where it was.
 
     Work order: the queue (asked-for reprocessing) first, then the assets with no written result, newest first.
@@ -1724,23 +1780,31 @@ class Indexer:
     waits when ``TAG_REQUESTS`` requests are already out. So the GPU has the next batch waiting at every round
     boundary, and at most ``TAG_REQUESTS + 1`` batches of pictures are in memory (the ones on the GPU and the round
     being prepared).
+
+    Keeping up to date and the graphics card free work as in Search+ (``searchplus.CatalogWatch``, ``IdleLoop``): a
+    cheap probe of Immich's database every ``check_every`` minutes decides whether the library list is read again (and
+    it is read in full at least hourly); when there is nothing left to do, each wake-up of the waiting loop (at least
+    once a minute) lets the unload rules look at the tagger container, which is stopped once it has been idle for
+    ``unload_after`` minutes (``docs/AI-TAGGER.md``, "Unloading the models").
     """
 
-    CATALOG_EVERY = 600         # re-read the library list this often (and look for new photos)
     WORKERS = 6                 # threads reading previews / cutting video frames
     TAG_REQUESTS = 2            # tagger requests in flight
     WRITERS = 8                 # assets being written to Immich (and read back) at once
-    IDLE_POLL = 60              # seconds between looks for new work while there is nothing to do
+    IDLE_POLL = searchplus.IDLE_POLL      # seconds between looks (and unload checks) while there is nothing to do, at most
     DROP_WAIT = 10              # seconds to wait (times the number of drops in a row) after a server went away
 
     def __init__(self, store: Store, services, *, client=None, catalog=fetch_catalog, frames=prepare_captures,
-                 clock=time.monotonic):
+                 clock=time.monotonic, probe=None):
         self.store, self.services, self.catalog, self.clock, self.client = store, services, catalog, clock, client
         self.pipe = Pipeline(store, services, lambda: self.client, frames)
+        # the real probe goes with the real catalogue; a test that injects a catalogue has no database to ask
+        self._watch = searchplus.CatalogWatch(
+            probe if probe is not None else (searchplus.fetch_probe if catalog is fetch_catalog else None), clock)
         self.state, self.detail, self.error = "stopped", "", ""
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
-        self.last_sync = None
+        self.last_sync = None                   # when the library list was last read in full (None: read it next)
         self.done_times: collections.deque = collections.deque(maxlen=2000)
         self.batch_cap: int | None = None       # halved by a CUDA out-of-memory answer, for this session
         self._cap_for = None
@@ -1762,13 +1826,24 @@ class Indexer:
     def frames(self, fn) -> None:
         self.pipe.frames = fn
 
+    # ---- IdleLoop
+    def _model_server(self):
+        return self.services
+
+    def _unload_settings(self) -> dict:
+        return load_settings()
+
+    def _stop_model(self) -> bool:
+        return bool(self.services.unload())
+
     def running(self) -> bool:
         return bool(self.thread and self.thread.is_alive())
 
     def start(self) -> None:
         with self._lock:
             if self.running():
-                self._wake.set()                # already waiting for work: look again now
+                self._watch.force = True        # already waiting for work: look for new photos now
+                self._wake.set()
                 return
             self.stop_event = threading.Event()
             self.error = ""
@@ -1788,12 +1863,19 @@ class Indexer:
         self._wake.set()
 
     def refresh_catalog(self) -> None:
-        with self._sync_lock:
-            self.store.sync_catalog(self.catalog())
-            self.last_sync = self.clock()
+        self._read_catalog(self._watch.observe())
 
     def test(self, asset_id: str, write: bool = False) -> dict:
-        return self.pipe.test(asset_id, write=write, refresh=self.refresh_catalog)
+        """The Test card's preview / apply: interactive use of the models (they keep their place for the server's own
+        idle time afterwards, not just ``unload_after`` minutes)."""
+        mark = getattr(self.services, "mark_interactive", None)
+        if mark:
+            mark()
+        try:
+            return self.pipe.test(asset_id, write=write, refresh=self.refresh_catalog)
+        finally:
+            if mark:
+                mark()
 
     def remove(self, ids: list[str], exclude: bool) -> dict:
         return self.pipe.remove(ids, exclude)
@@ -1843,6 +1925,7 @@ class Indexer:
         except Exception as exc:  # noqa: BLE001
             self.state, self.detail, self.error = "error", f"{type(exc).__name__}: {exc}", f"{type(exc).__name__}: {exc}"
         finally:
+            self.waiting = False
             self._drain()
             for pool in (self._tagpool, self._writepool):
                 if pool:
@@ -1856,24 +1939,25 @@ class Indexer:
         to do, else "busy"."""
         version, settings = self.pipe.snapshot()
         self._reap_tags(self.TAG_REQUESTS)      # a request that failed since the last look: raise it before more is read
-        if self.last_sync is None or self.clock() - self.last_sync >= self.CATALOG_EVERY:
-            self.state, self.detail = "running", "reading the library list"
-            self.refresh_catalog()
+        self._sync_if_due(settings)             # the probe says whether the library list changed (and it is read hourly)
         # One round is one batch: the pictures of ``TAG_REQUESTS`` requests are on the GPU side and this round's are
         # being prepared, which is as far ahead as it pays to read (and as much memory as it is worth).
         items = self.store.work(self.batch_size(settings), skip=self._flying())
         if not items:
             if self._tag_futs or self._pending:
+                self.waiting = False
                 self._reap_tags(0, stop)        # earlier assets are still on the tagger ...
                 self._reap(0, stop)             # ... or being written
                 return "busy"
             if not settings["keep_updated"]:
                 self.state, self.detail = "done", "everything is tagged"
-                return "over"
-            self.state, self.detail = "done", "everything is tagged; looks for new photos every 10 minutes"
-            self._wake.wait(min(self.IDLE_POLL, max(self.CATALOG_EVERY - (self.clock() - self.last_sync), 1)))
+                return "idle" if self._wind_down(stop) else "over"    # frees the card first; woken: look again
+            self.state, self.detail = "done", self._idle_text(settings, "tagged")
+            self.waiting = True                 # nothing to do: the unload rules may look at the tagger container
+            self._wake.wait(self._idle_wait(settings, self.unload_check()))
             self._wake.clear()
             return "idle"
+        self.waiting = False
         self.state, self.detail = "running", "tagging"
         self._round(items, settings, version, stop)
         self._reap(self.WRITERS, stop)          # never more than a pool-full waiting to be written

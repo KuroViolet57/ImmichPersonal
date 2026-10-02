@@ -4428,12 +4428,12 @@ class TestWithRealClients(Base):
         status = services.status()
         self.assertEqual(status["tagger"]["status"], "ok")
         self.assertNotIn("vlm", status)
-        # and a retag afterwards needs no request to the server
-        before = len(tagger.requests)
+        # and a retag afterwards needs no tagging request to the server (it only looks at /health, to free the card)
+        before = len([r for r in tagger.requests if r[1] == "/tag"])
         self.set(blocked=["dog"])
         at.reprocess(self.store, "outdated", "retag")
         self.run_indexer()
-        self.assertEqual(len(tagger.requests), before)
+        self.assertEqual(len([r for r in tagger.requests if r[1] == "/tag"]), before)
         self.assertNotIn("dog", self.description(1))
         self.assertIn("grass", self.description(1))
         # turning a tagger off is sent on the next full pass: only the tagger that is still on is asked for
@@ -4468,6 +4468,654 @@ class TestInstance(Base):
     def test_autostart_never_breaks_the_panel(self):
         with mock.patch.object(at, "instance", side_effect=RuntimeError("boom")):
             at.autostart()
+
+
+# ---------------------------------------------------------------- keeping up to date, and freeing the card
+#
+# Same design as Search+ (tests/test_searchplus.py has the rules as a pure function and the probe's own tests): the
+# indexer's waiting loop looks at the tagger container and stops it once it has been idle for ``unload_after``
+# minutes, never while something is going on, and a cheap probe decides when the library list is read again.
+
+def wait_for(cond, timeout=5.0):
+    """Poll ``cond`` until it is true (the indexer runs on its own thread)."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return bool(cond())
+
+
+class IdleServices(FakeServices):
+    """FakeServices that say how long the tagger has been idle (what its /health says) and keep the facts the unload
+    rules need. ``idle`` is /health's idleSeconds, ``busy_n`` its ``busy``, ``inflight_n`` the panel's requests in flight,
+    ``age`` the seconds since a person last used the models (None: not at all)."""
+
+    def __init__(self):
+        super().__init__()
+        self.running, self.idle, self.exit_minutes, self.busy_n = True, 0, 20, 0
+        self.inflight_n, self.age, self.marks, self.unload_error = 0, None, 0, None
+
+    def unload_inputs(self, fresh=False):
+        if not self.running:
+            return False, None
+        return True, {"status": "ok", "idleSeconds": self.idle, "idleExitMinutes": self.exit_minutes, "busy": self.busy_n}
+
+    def inflight(self):
+        return self.inflight_n
+
+    def interactive_age(self):
+        return self.age
+
+    def mark_interactive(self):
+        self.marks += 1
+        self.age = 0
+
+    def unload(self):
+        self.unloads += 1
+        if self.unload_error:
+            raise self.unload_error
+        was, self.running = self.running, False
+        return ["immich_aitagger"] if was else []
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class Idle(Base):
+    """A real Indexer on IdleServices, looking every few milliseconds."""
+
+    def setUp(self):
+        super().setUp()
+        self.services = IdleServices()
+        self.make()
+
+    def make(self, **kw):
+        self.indexer = at.Indexer(self.store, self.services, client=self.client, catalog=lambda: self.catalog,
+                                  frames=fake_frames, **kw)
+        self.indexer.DROP_WAIT = 0.01
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+
+    def up_to_date(self, **settings):
+        """Tag everything and leave the indexer waiting for new photos."""
+        self.set(keep_updated=True, indexing=True, **settings)
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting), self.indexer.detail)
+
+    def quiet(self, seconds=0.25):
+        time.sleep(seconds)
+
+
+class TestUnloadAfterTheWork(Idle):
+    def test_the_models_are_stopped_once_the_tagger_has_been_idle_for_unload_after_minutes(self):
+        self.services.idle = 30
+        self.up_to_date()
+        self.quiet()
+        self.assertEqual(self.services.unloads, 0)
+        self.assertEqual(self.store.counts()["processed"], 3)          # the work is done
+        self.services.idle = 125
+        self.assertTrue(wait_for(lambda: self.services.unloads == 1))
+        self.assertFalse(self.services.running)
+        self.assertTrue(self.indexer.running())                        # it goes on watching for new photos
+        self.assertFalse(self.indexer.unload_status()["loaded"])
+        self.quiet()
+        self.assertEqual(self.services.unloads, 1)
+
+    def test_never_while_a_request_is_in_flight_or_the_tagger_says_busy(self):
+        self.services.idle, self.services.inflight_n = 500, 1
+        self.up_to_date()
+        self.quiet()
+        self.assertEqual(self.services.unloads, 0)
+        self.services.inflight_n, self.services.busy_n = 0, 2          # the tagger's own counter (a request from elsewhere)
+        self.quiet()
+        self.assertEqual(self.services.unloads, 0)
+        self.assertTrue(self.indexer.unload_status()["busy"])
+        self.services.busy_n = 0
+        self.assertTrue(wait_for(lambda: self.services.unloads == 1))
+
+    def test_never_while_the_indexer_is_working(self):
+        gate = threading.Event()
+
+        def slow(item, n):
+            gate.wait(5)
+            return fake_frames(item, n)
+
+        self.indexer.frames = slow
+        self.services.idle = 500
+        self.set(keep_updated=True, indexing=True)
+        self.indexer.start()
+        self.quiet(0.3)
+        self.assertEqual(self.services.unloads, 0)
+        status = self.indexer.unload_status()
+        self.assertEqual((status["loaded"], status["busy"], status["unloadInSeconds"]), (True, True, None))
+        gate.set()
+        self.assertTrue(wait_for(lambda: self.services.unloads == 1))
+        self.assertEqual(self.store.counts()["processed"], 3)          # the work came first
+
+    def test_not_within_the_interactive_grace_of_a_test_card_use(self):
+        self.services.idle = 500
+        self.up_to_date()
+        self.assertTrue(wait_for(lambda: self.services.unloads == 1))   # (no grace yet: nobody used the Test card)
+        self.services.running, self.services.unloads = True, 0
+        self.indexer.test(self.ids[0])                                  # a preview: interactive use
+        self.assertEqual(self.services.marks, 2)                        # before and after
+        self.services.idle, self.services.age = 500, 600
+        self.quiet()
+        self.assertEqual(self.services.unloads, 0)
+        status = self.indexer.unload_status()
+        self.assertEqual((status["rule"], status["unloadInSeconds"]), ("interactive", 600))
+        self.services.idle, self.services.age = 200, 1250               # the 20 minutes are over
+        self.assertTrue(wait_for(lambda: self.services.unloads == 1))
+
+    def test_the_unload_after_setting_decides(self):
+        self.services.idle = 130
+        self.up_to_date(unload_after=5)
+        self.quiet()
+        self.assertEqual(self.services.unloads, 0)
+        self.services.idle = 305
+        self.assertTrue(wait_for(lambda: self.services.unloads == 1))
+
+    def test_a_paused_indexer_leaves_it_to_the_server(self):
+        self.services.idle = 500
+        status = self.indexer.unload_status()                           # no thread
+        self.assertEqual((status["rule"], status["unloadInSeconds"], status["busy"]), ("server", 700, False))
+        self.run_indexer()                                              # works, winds down (idle 500: stops it), ends
+        self.services.running, self.services.unloads = True, 0
+        self.quiet()
+        self.assertEqual(self.services.unloads, 0)                      # nobody is looking any more
+
+    def test_a_failing_stop_does_not_end_the_indexer(self):
+        self.services.idle, self.services.unload_error = 500, OSError("docker is not answering")
+        self.up_to_date()
+        self.assertTrue(wait_for(lambda: self.services.unloads >= 2))
+        self.assertTrue(self.indexer.running())
+        self.assertEqual(self.indexer.state, "done")
+
+    def test_a_new_photo_after_the_unload_is_tagged_again(self):
+        self.services.idle = 500
+        self.up_to_date()
+        self.assertTrue(wait_for(lambda: self.services.unloads == 1))
+        extra = {"id": self.ids[5], "type": "IMAGE", "taken": "2026-02-01 10:00:00", "name": "n.jpg",
+                 "preview": DOG, "original": "", "duration_ms": 0}
+        self.catalog = self.catalog + [extra]
+        self.indexer.start()                                            # "look again now"
+        self.assertTrue(wait_for(lambda: self.store.counts()["processed"] == 4))
+        self.assertTrue(self.services.ready_calls)
+
+    def test_a_stand_in_that_cannot_say_is_never_unloaded(self):
+        self.services = FakeServices()
+        self.make()
+        self.up_to_date()
+        self.quiet()
+        self.assertEqual(self.services.unloads, 0)
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": False, "idleSeconds": None, "unloadInSeconds": None, "rule": None, "busy": False})
+
+
+class TestWhenKeepUpdatedIsOff(Idle):
+    """With "keep it up to date" off the thread ends after the work, but not before the card is freed."""
+
+    def finished(self):
+        return not self.indexer.running()
+
+    def start(self):
+        self.set(keep_updated=False, indexing=True)
+        self.indexer.start()
+
+    def test_the_card_is_freed_before_the_thread_ends(self):
+        self.services.idle = 500
+        self.start()
+        self.assertTrue(wait_for(self.finished))
+        self.assertEqual((self.indexer.state, self.services.unloads), ("done", 1))
+
+    def test_it_waits_out_the_short_rule(self):
+        self.services.idle = 30
+        self.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.quiet()
+        self.assertTrue(self.indexer.running())
+        self.assertEqual(self.services.unloads, 0)
+        self.services.idle = 125
+        self.assertTrue(wait_for(self.finished))
+        self.assertEqual(self.services.unloads, 1)
+
+    def test_an_interactive_grace_leaves_it_to_the_server(self):
+        self.services.idle, self.services.age = 500, 600
+        self.start()
+        self.assertTrue(wait_for(self.finished))
+        self.assertEqual(self.services.unloads, 0)
+
+    def test_a_restart_wakes_it_for_new_work(self):
+        self.services.idle = 30
+        self.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.store.retry_failed()
+        self.indexer.start()                                            # Try again: picks the two failures up again
+        self.assertTrue(wait_for(lambda: self.store.counts()["retrying"] == 2 and self.indexer.waiting))
+        self.assertEqual(self.services.unloads, 0)
+
+    def test_pausing_ends_the_wait_at_once(self):
+        self.services.idle = 30
+        self.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.indexer.stop(5)
+        self.assertTrue(self.finished())
+        self.assertEqual(self.services.unloads, 0)
+
+    def test_a_test_card_request_still_in_flight_keeps_it_waiting(self):
+        self.services.idle, self.services.inflight_n = 500, 1
+        self.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.quiet()
+        self.assertTrue(self.indexer.running())
+        self.assertEqual(self.services.unloads, 0)
+        self.services.inflight_n = 0
+        self.assertTrue(wait_for(self.finished))
+        self.assertEqual(self.services.unloads, 1)
+
+
+class TestUnloadStatusObject(Idle):
+    """The ``unload`` object of GET /api/aitagger, for each case."""
+
+    def test_not_loaded(self):
+        self.services.running = False
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": False, "idleSeconds": None, "unloadInSeconds": None, "rule": None, "busy": False})
+
+    def test_waiting_for_new_photos(self):
+        self.services.idle = 30
+        self.up_to_date()
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 90, "rule": "after-work", "busy": False})
+
+    def test_after_an_interactive_use(self):
+        self.services.idle, self.services.age = 30, 30
+        self.up_to_date()
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 1170, "rule": "interactive", "busy": False})
+
+    def test_paused(self):
+        self.services.idle = 30
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 1170, "rule": "server", "busy": False})
+
+    def test_busy_by_the_tagger_or_by_the_panel(self):
+        self.services.idle, self.services.busy_n = 30, 1
+        self.up_to_date()
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": None, "rule": "after-work", "busy": True})
+        self.services.busy_n, self.services.inflight_n = 0, 1
+        self.assertTrue(self.indexer.unload_status()["busy"])
+
+    def test_the_tagger_status_route_fields_are_unchanged(self):
+        self.assertEqual(set(self.services.status()), {"tagger", "gpu", "searchplusRunning"})
+
+
+class TestTheNewSettings(Base):
+    def test_defaults_limits_and_that_they_are_not_content(self):
+        s = at.load_settings()
+        self.assertEqual((s["unload_after"], s["check_every"]), (2, 1))
+        self.assertEqual((at.LIMITS["unload_after"], at.LIMITS["check_every"]), ((1, 60), (1, 60)))
+        self.assertEqual((sp.LIMITS["unload_after"], sp.LIMITS["check_every"]), ((1, 60), (1, 60)))
+        for key in ("unload_after", "check_every"):
+            self.assertNotIn(key, at.CONTENT)
+            self.assertFalse(any(key in keys for keys in at.REPROCESS.values()))
+        self.assertEqual(at.suggest_mode(["unload_after", "check_every"]), "none")
+
+    def test_saving_them_makes_nothing_outdated(self):
+        version = self.store.settings_version
+        settings, changed = at.apply_settings({"unload_after": 7, "check_every": 15}, self.store)
+        self.assertEqual((settings["unload_after"], settings["check_every"], changed), (7, 15, []))
+        self.assertEqual(self.store.settings_version, version)
+        self.assertEqual(at.load_settings()["check_every"], 15)
+
+    def test_they_are_whole_minutes_from_1_to_60(self):
+        for key in ("unload_after", "check_every"):
+            for bad in (0, 61, -5, 1.5, "2", True, None, float("nan")):
+                with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                    at.validate_setting(key, bad)
+            for good in (1, 2, 60, 5.0):
+                self.assertEqual(at.validate_setting(key, good), int(good))
+        with self.assertRaises(ValueError):
+            at.apply_settings({"unload_after": 0, "max_tags": 20}, self.store)                  # all or nothing
+        self.assertEqual(at.load_settings()["max_tags"], 30)
+
+    def test_a_hand_edited_value_falls_back_to_the_default(self):
+        at.settings_path().write_text(json.dumps({"unload_after": 0, "check_every": "soon"}))
+        s = at.load_settings()
+        self.assertEqual((s["unload_after"], s["check_every"]), (2, 1))
+
+    def test_an_old_settings_file_without_them_gets_the_defaults(self):
+        at.settings_path().write_text(json.dumps({"max_tags": 12}))
+        s = at.load_settings()
+        self.assertEqual((s["max_tags"], s["unload_after"], s["check_every"]), (12, 2, 1))
+
+
+class TestChangeProbe(Base):
+    """The library list is read in full only when the cheap probe changed, and at least once an hour."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock, self.signature, self.probes, self.reads = FakeClock(), ["A"], [], []
+
+        def probe():
+            self.probes.append(self.clock())
+            return (self.signature[0],)
+
+        def catalog():
+            self.reads.append(self.clock())
+            return list(self.catalog)
+
+        self.services = IdleServices()
+        self.indexer = at.Indexer(self.store, self.services, client=self.client, catalog=catalog, frames=fake_frames,
+                                  clock=self.clock, probe=probe)
+        self.indexer.DROP_WAIT = 0.01
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+        self.set(keep_updated=True, indexing=True)
+
+    def up_to_date(self):
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting), self.indexer.detail)
+
+    def advance(self, seconds):
+        self.clock.t += seconds
+
+    def test_the_first_look_reads_everything(self):
+        self.up_to_date()
+        self.assertEqual((len(self.reads), len(self.probes)), (1, 1))
+        self.assertEqual(self.store.counts()["processed"], 3)
+
+    def test_an_unchanged_probe_reads_nothing_however_often_it_looks(self):
+        self.up_to_date()
+        for _ in range(4):
+            self.advance(61)
+            self.assertTrue(wait_for(lambda n=len(self.probes): len(self.probes) > n))
+        self.assertEqual(len(self.reads), 1)
+
+    def test_it_does_not_even_probe_before_check_every_minutes_have_passed(self):
+        self.up_to_date()
+        self.signature[0] = "B"
+        self.advance(59)
+        time.sleep(0.2)
+        self.assertEqual((len(self.probes), len(self.reads)), (1, 1))
+        self.advance(2)
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+
+    def test_a_changed_probe_picks_up_the_new_upload(self):
+        self.up_to_date()
+        extra = {"id": self.ids[5], "type": "IMAGE", "taken": "2026-02-01 10:00:00",
+                 "name": "n.jpg", "preview": DOG, "original": "", "duration_ms": 0}
+        self.catalog = self.catalog + [extra]
+        self.signature[0] = "B"
+        self.advance(61)
+        self.assertTrue(wait_for(lambda: self.store.counts()["processed"] == 4))
+        self.assertEqual(len(self.reads), 2)
+        self.advance(61)                                                # nothing changed since: no more reads
+        self.assertTrue(wait_for(lambda: len(self.probes) == 3))
+        time.sleep(0.1)
+        self.assertEqual(len(self.reads), 2)
+
+    def test_check_every_is_a_setting(self):
+        self.up_to_date()
+        self.set(check_every=5)
+        self.signature[0] = "B"
+        self.advance(4 * 60)
+        time.sleep(0.2)
+        self.assertEqual(len(self.reads), 1)
+        self.advance(61)
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+
+    def test_a_safety_read_every_hour_even_when_the_probe_never_changes(self):
+        self.up_to_date()
+        self.advance(3599)
+        self.assertTrue(wait_for(lambda: len(self.probes) >= 2))
+        time.sleep(0.1)
+        self.assertEqual(len(self.reads), 1)
+        self.advance(2)
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+        self.advance(3601)
+        self.assertTrue(wait_for(lambda: len(self.reads) == 3))
+
+    def test_a_probe_that_fails_reads_nothing_and_does_not_stop_the_indexer(self):
+        self.up_to_date()
+
+        def broken():
+            raise RuntimeError("docker exec failed")
+
+        self.indexer._watch.probe = broken
+        self.advance(61)
+        time.sleep(0.2)
+        self.assertEqual((len(self.reads), self.indexer.state), (1, "done"))
+        self.advance(3600)
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+
+    def test_start_and_the_test_card_look_at_once(self):
+        self.up_to_date()
+        self.signature[0] = "B"
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+        self.signature[0] = "C"
+        self.indexer.refresh_catalog()                                  # what the sample / Test routes use: a full read now,
+        self.assertEqual(len(self.reads), 3)                            # and the probe's answer from before it is the baseline
+        self.advance(61)                                                # nothing changed since it: the probe agrees
+        self.assertTrue(wait_for(lambda: len(self.probes) >= 4))
+        time.sleep(0.1)
+        self.assertEqual(len(self.reads), 3)
+
+    def test_the_real_probe_goes_with_the_real_catalogue_only(self):
+        store = at.Store(Path(self.tmp.name) / "probe")
+        self.addCleanup(store.conn.close)
+        self.assertIs(at.Indexer(store, FakeServices())._watch.probe, sp.fetch_probe)
+        self.assertIsNone(at.Indexer(store, FakeServices(), catalog=lambda: [])._watch.probe)
+
+
+class TestPreviewHoldBack(Base):
+    """An asset Immich has not finished (no preview file yet) is not worked on, and not failed, until it has one."""
+
+    T0 = 1_790_000_000
+
+    def setUp(self):
+        super().setUp()
+        self.now = [self.T0]
+        patcher = mock.patch.object(sp, "_wall", side_effect=lambda: self.now[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.asked = []
+
+        def frames(item, n):
+            self.asked.append(item["id"])
+            if item["preview"] == "":                                  # as prepare_captures does: the picture itself
+                return [DOG.encode()], "image"
+            return fake_frames(item, n)
+
+        self.services = IdleServices()
+        self.indexer = at.Indexer(self.store, self.services, client=self.client, catalog=lambda: self.catalog, frames=frames)
+        self.indexer.DROP_WAIT = 0.01
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+        self.dog = self.catalog[1]                                      # a new upload Immich is still working on
+        self.held = {**self.dog, "preview": "", "added": self.T0 - 60}
+        self.catalog[1] = self.held
+
+    def work(self):
+        return [item["id"] for item in self.store.work(50)]
+
+    def test_a_new_asset_without_a_preview_is_left_out_of_the_work_list(self):
+        self.store.sync_catalog(self.catalog)
+        self.assertNotIn(self.ids[1], self.work())
+        self.assertIn(self.ids[0], self.work())
+        self.assertEqual(self.store.held(), 1)
+
+    def test_it_is_held_not_failed_and_picked_up_when_the_preview_appears(self):
+        self.set(keep_updated=True, indexing=True)
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.assertNotIn(self.ids[1], self.asked)
+        self.assertIsNone(self.store.conn.execute("select 1 from failed where id=?", (self.ids[1],)).fetchone())
+        self.assertIn("1 new item is waiting for Immich", self.indexer.detail)
+        self.assertEqual(self.store.counts()["processed"], 2)
+        self.catalog[1] = {**self.held, "preview": DOG}                   # Immich made the preview
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.store.counts()["processed"] == 3))
+        self.assertIn(self.ids[1], self.asked)
+        self.assertEqual(self.store.held(), 0)
+
+    def test_after_thirty_minutes_without_a_preview_it_is_processed_as_before(self):
+        self.store.sync_catalog(self.catalog)
+        self.now[0] = self.T0 - 60 + at.searchplus.PREVIEW_GRACE - 1
+        self.assertNotIn(self.ids[1], self.work())
+        self.now[0] = self.T0 - 60 + at.searchplus.PREVIEW_GRACE + 1
+        self.assertIn(self.ids[1], self.work())
+        self.assertEqual(self.store.held(), 0)
+        self.services.idle = 500                                           # (so that the run may end: the card is freed first)
+        self.run_indexer()
+        self.assertIn(self.ids[1], self.asked)                            # it fell back to the file itself
+        self.assertEqual(self.store.counts()["processed"], 3)
+
+    def test_queued_work_waits_too(self):
+        self.store.sync_catalog(self.catalog)
+        self.store.enqueue([self.ids[1]], "full")
+        self.assertNotIn(self.ids[1], self.work())
+        self.now[0] += at.searchplus.PREVIEW_GRACE
+        self.assertIn(self.ids[1], self.work())
+
+    def test_assets_of_unknown_age_and_older_assets_are_never_held(self):
+        self.catalog[1] = {**self.held, "added": 0}
+        self.catalog[2] = {**self.catalog[2], "preview": "", "added": self.T0 - 7200}
+        self.store.sync_catalog(self.catalog)
+        self.assertTrue({self.ids[1], self.ids[2]} <= set(self.work()))
+
+    def test_the_same_goes_for_videos(self):
+        self.catalog[2] = {**self.catalog[2], "preview": "", "added": self.T0 - 5}
+        self.store.sync_catalog(self.catalog)
+        self.assertNotIn(self.ids[2], self.work())
+        self.catalog[2] = {**self.catalog[2], "preview": CLIP}
+        self.store.sync_catalog(self.catalog)
+        self.assertIn(self.ids[2], self.work())
+
+    def test_a_store_made_before_this_gets_the_column_and_nothing_is_held(self):
+        folder = Path(self.tmp.name) / "old"
+        folder.mkdir()
+        conn = sqlite3.connect(str(folder / "tagger.sqlite"))
+        conn.executescript("create table assets (id text primary key, type text, taken text, name text, preview text,"
+                           " original text, duration_ms integer default 0, gone integer default 0);"
+                           "insert into assets (id, type, taken, name, preview, original) values ('old1','IMAGE','2024','o','','');")
+        conn.commit()
+        conn.close()
+        store = at.Store(folder)
+        self.addCleanup(store.conn.close)
+        self.assertEqual([i["id"] for i in store.work(5)], ["old1"])      # added = 0: unknown, not held
+        store.sync_catalog([{**self.held, "id": "old1"}])
+        self.assertEqual(store.work(5), [])
+        self.assertEqual(store.held(), 1)
+
+
+class TestServicesKeepTrack(Base):
+    """The facts the unload rules need from the real Services: requests in flight, the tagger's health, interactive use."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock, self.runner = Clock(), FakeRunner()
+        self.runner.state = {"immich_aitagger": "running"}
+        self.tagger = mock.Mock()
+        self.tagger.health.return_value = {"status": "ok", "idleSeconds": 7, "idleExitMinutes": 20, "busy": 0}
+        self.svc = at.Services(self.tagger, runner=self.runner, store=self.store, clock=self.clock, sleep=self.clock.sleep)
+
+    def test_requests_in_flight_are_counted_and_released(self):
+        seen = []
+
+        def tag(images, models=None):
+            seen.append(self.svc.inflight())
+            if models == ["boom"]:
+                raise at.ServiceDown("gone")
+            return [], []
+
+        self.tagger.tag.side_effect = tag
+        self.svc.tag([b"x"], models=["wd"])
+        with self.assertRaises(sp.ServiceDown):
+            self.svc.tag([b"x"], models=["boom"])
+        self.assertEqual(seen, [1, 1])
+        self.assertEqual(self.svc.inflight(), 0)
+
+    def test_the_health_is_remembered_for_a_few_seconds_but_a_decision_looks_fresh(self):
+        self.assertEqual(self.svc.tagger_health()["idleSeconds"], 7)
+        for _ in range(4):
+            self.svc.tagger_health()
+        self.assertEqual(self.tagger.health.call_count, 1)
+        self.clock.t += at.STATE_TTL + 1
+        self.svc.tagger_health()
+        self.assertEqual(self.tagger.health.call_count, 2)
+        self.svc.tagger_health(fresh=True)
+        self.assertEqual(self.tagger.health.call_count, 3)
+
+    def test_the_status_route_and_the_unload_object_share_one_health_call(self):
+        self.svc.status()
+        self.svc.unload_inputs()
+        self.svc.unload_inputs()
+        self.assertEqual(self.tagger.health.call_count, 1)
+        self.assertEqual([c[-1] for c in self.runner.commands("inspect")], ["immich_aitagger", "immich_searchplus"])  # once each
+
+    def test_interactive_use_is_remembered_with_its_age(self):
+        self.assertIsNone(self.svc.interactive_age())
+        self.svc.mark_interactive()
+        self.clock.t += 90
+        self.assertEqual(self.svc.interactive_age(), 90)
+
+    def test_unload_inputs(self):
+        self.assertEqual(self.svc.unload_inputs(), (True, {"status": "ok", "idleSeconds": 7, "idleExitMinutes": 20, "busy": 0}))
+        self.runner.state["immich_aitagger"] = "stopped"
+        self.assertEqual(self.svc.unload_inputs(fresh=True), (False, None))
+        self.tagger.health.reset_mock()
+        self.assertEqual(self.svc.unload_inputs(), (False, None))
+        self.tagger.health.assert_not_called()                              # a stopped container is not asked
+
+
+class TestUnloadWithTheRealServices(Base):
+    """The whole path to ``docker stop``, with the real Services over a stand-in tagger and a fake docker."""
+
+    def test_the_tagger_container_is_stopped_after_the_work_and_nothing_else(self):
+        idle, busy = [30], [0]
+
+        def tag(body):
+            got = [read_picture(base64.b64decode(i), body.get("models")) for i in body["images"]]
+            return 200, {"results": [g[0] for g in got], "errors": [g[1] for g in got], "tookMs": 1}
+
+        def health(_):
+            return 200, {"status": "ok", "error": None, "idleSeconds": idle[0], "idleExitMinutes": 20, "busy": busy[0]}
+
+        tagger = StubServer({("POST", "/tag"): tag, ("GET", "/health"): health})
+        self.addCleanup(tagger.close)
+        runner = FakeRunner()
+        runner.state = {"immich_aitagger": "running", "immich_searchplus": "running"}
+        services = at.Services(at.Tagger(tagger.url), runner=runner, store=self.store)
+        self.indexer = at.Indexer(self.store, services, client=self.client, catalog=lambda: self.catalog, frames=fake_frames)
+        self.indexer.DROP_WAIT = 0.01
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+        self.set(keep_updated=True, indexing=True)
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        time.sleep(0.2)
+        self.assertEqual(runner.commands("stop"), [])                        # 30 s idle: not yet
+        status = self.indexer.unload_status()
+        self.assertEqual((status["loaded"], status["rule"], status["busy"]), (True, "after-work", False))
+        self.assertLessEqual(status["unloadInSeconds"], 90)
+        busy[0] = 1                                                          # the tagger is serving someone else
+        idle[0] = 500
+        time.sleep(0.2)
+        self.assertEqual(runner.commands("stop"), [])
+        busy[0] = 0
+        self.assertTrue(wait_for(lambda: runner.commands("stop")))
+        self.assertEqual(runner.commands("stop"), [["docker", "stop", "-t", "20", "immich_aitagger"]])
+        self.assertEqual(runner.state, {"immich_aitagger": "stopped", "immich_searchplus": "running"})   # Search+ left alone
+        self.assertFalse(self.indexer.unload_status()["loaded"])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,16 @@ Pieces:
 * ``Indexer``: a background thread that reads previews / video frames and asks the model server
   for their vectors; it resumes where it stopped;
 * ``search``: scores every row against the query (numpy), keeps each asset's best frame.
+
+Keeping the library up to date, and the graphics card free (the AI Tagger imports these helpers from here):
+* the indexer asks Immich's database a cheap question (``fetch_probe``: how many live assets, the newest upload, the
+  newest preview file) every ``check_every`` minutes and reads the whole library list only when the answer changed,
+  plus once an hour as a safety net (``CatalogWatch``). A new upload is not touched until Immich has made its preview
+  (it is held back for up to ``PREVIEW_GRACE`` seconds; after that it is processed without one, as before);
+* a model is never kept loaded "just in case": when the indexer has nothing left to do and the model server has been
+  idle for ``unload_after`` minutes, the panel stops the container (``IdleLoop``, ``unload_status``). Interactive
+  use (a search, the AI Tagger's Test card) first earns the model the server's own idle time (20 minutes), which stays
+  the backstop everywhere else (``IDLE_EXIT_MINUTES`` in the model server).
 """
 
 from __future__ import annotations
@@ -43,12 +53,19 @@ AITAGGER_CONTAINER = os.environ.get("AITAGGER_CONTAINER", "immich_aitagger")   #
 # container runs (GpuBusy), and the AI Tagger stops a running Search+ before it starts its container.
 # False: they may run at the same time (set it when the card has room for both); nothing is stopped or refused.
 AITAGGER_EXCLUSIVE = False
-DEFAULTS = {"indexing": False, "keep_updated": True, "video_frames": 4}
-LIMITS = {"video_frames": (1, 8)}
+# unload_after: minutes the model server must be idle (and nothing left to index) before the panel stops it;
+# check_every: minutes between the cheap "did anything change in Immich?" looks. Whole minutes, 1-60 each.
+DEFAULTS = {"indexing": False, "keep_updated": True, "video_frames": 4, "unload_after": 2, "check_every": 1}
+LIMITS = {"video_frames": (1, 8), "unload_after": (1, 60), "check_every": (1, 60)}
 FRAME_SIDE = 640              # frames are sent at most this big; the model looks at 448 x 448
 MAX_ATTEMPTS = 3
 CLEARED = 99                  # attempts value for failures the user cleared from the list
 RETRY_AFTER = 900             # seconds before a photo that failed is tried again (e.g. its preview was not made yet)
+STATE_TTL = 5.0               # seconds a container's state is remembered (the status route is polled)
+SAFETY_SYNC = 3600            # the library list is read in full at least this often, whatever the probe says
+PREVIEW_GRACE = 1800          # seconds Immich gets to make a new asset's preview; an asset without one is held back till then
+IDLE_POLL = 60                # an indexer with nothing to do looks again at least this often (the unload check runs then)
+IDLE_EXIT_DEFAULT_MIN = 20    # the model servers' own idle exit (IDLE_EXIT_MINUTES), when /health does not say
 
 
 def _now() -> str:
@@ -57,6 +74,20 @@ def _now() -> str:
 
 def _ago(seconds: float) -> str:
     return datetime.fromtimestamp(time.time() - seconds, timezone.utc).isoformat(timespec="seconds")
+
+
+def _wall() -> float:
+    return time.time()
+
+
+def preview_cutoff() -> int:
+    """Epoch seconds: an asset Immich added after this that has no preview file yet is not worked on (see ``READY``)."""
+    return int(_wall() - PREVIEW_GRACE)
+
+
+# What the work list leaves out: an asset Immich has not finished, i.e. no preview file yet and added less than
+# ``PREVIEW_GRACE`` ago (``added`` 0 = unknown, never held back). One ``?`` in it, ``preview_cutoff()``. Both stores use it.
+READY = "(coalesce(a.preview,'') <> '' or coalesce(a.added,0) = 0 or a.added < ?)"
 
 
 def home() -> Path:
@@ -76,7 +107,15 @@ def load_settings() -> dict:
         data = json.loads(settings_path().read_text("utf-8"))
     except (OSError, ValueError):
         data = {}
-    return {**DEFAULTS, **{k: v for k, v in data.items() if k in DEFAULTS}}
+    out = {**DEFAULTS, **{k: v for k, v in data.items() if k in DEFAULTS}}
+    for key, (lo, hi) in LIMITS.items():            # a hand-edited value out of range falls back to the default
+        try:
+            out[key] = int(out[key])
+        except (TypeError, ValueError):
+            out[key] = DEFAULTS[key]
+        if not lo <= out[key] <= hi:
+            out[key] = DEFAULTS[key]
+    return out
 
 
 def save_settings(changes: dict) -> dict:
@@ -103,16 +142,49 @@ def save_settings(changes: dict) -> dict:
 
 # ---------------------------------------------------------------- the library list
 
+def _psql(sql: str, timeout: float = 600) -> str:
+    """Run one query in Immich's database (``docker exec immich_postgres psql``): rows end in \\x1e, fields in \\x1f."""
+    return subprocess.run(
+        ["docker", "exec", "-i", "immich_postgres", "psql", "-U", "postgres", "-d", "immich", "-At", "-F", "\x1f",
+         "-R", "\x1e"], input=sql, capture_output=True, text=True, timeout=timeout, check=True).stdout
+
+
+# What the library list shows: live photos and videos of the timeline and the archive.
+_LIVE = """a."deletedAt" is null and a.visibility in ('timeline','archive') and a.type in ('IMAGE','VIDEO')"""
+
+# The cheap change probe: five numbers that move when a photo is uploaded, deleted, trashed / restored, archived or
+# hidden, or when Immich makes (or drops) a preview. Columns checked against the live schema (Immich 2.x):
+# ``asset."createdAt"`` is set once when the row is made and ``asset."deletedAt"`` when it is trashed, while
+# ``asset."updatedAt"`` / ``updateId`` also move whenever anything is written to the asset (the AI Tagger writes every
+# description), so they would make the probe say "changed" all the time. ``asset_file."createdAt"`` is the time the
+# preview file's row was made (its ``updatedAt`` moves when a preview is regenerated: not a change for us).
+PROBE_SQL = f"""select
+  (select count(*) from asset a where {_LIVE}),
+  (select coalesce(max(a."createdAt")::text, '') from asset a where {_LIVE}),
+  (select coalesce(max(a."deletedAt")::text, '') from asset a),
+  (select count(*) from asset_file f where f.type = 'preview'),
+  (select coalesce(max(f."createdAt")::text, '') from asset_file f where f.type = 'preview')"""
+
+
+def fetch_probe() -> tuple:
+    """Immich's change signature: one small query. Two equal signatures mean the library list did not change."""
+    out = _psql(PROBE_SQL, timeout=60)
+    parts = tuple(out.split("\x1e")[0].strip("\n").split("\x1f"))
+    if len(parts) != 5:
+        raise RuntimeError(f"unexpected answer to the change probe: {out[:100]!r}")
+    return parts
+
+
 def fetch_catalog() -> list[dict]:
-    """Every photo and video Immich shows (timeline + archive), with host paths to its files."""
-    sql = """select a.id, a.type, coalesce(p.path,''), a."originalPath", coalesce(a.duration,0),
-                    coalesce(a."localDateTime"::text, a."fileCreatedAt"::text, ''), a."originalFileName"
+    """Every photo and video Immich shows (timeline + archive), with host paths to its files. ``added`` is when
+    Immich made the asset (epoch seconds): a new asset without a preview yet is held back for a while."""
+    sql = f"""select a.id, a.type, coalesce(p.path,''), a."originalPath", coalesce(a.duration,0),
+                    coalesce(a."localDateTime"::text, a."fileCreatedAt"::text, ''), a."originalFileName",
+                    coalesce(extract(epoch from a."createdAt")::bigint, 0)
              from asset a
              left join asset_file p on p."assetId" = a.id and p.type = 'preview'
-             where a."deletedAt" is null and a.visibility in ('timeline','archive') and a.type in ('IMAGE','VIDEO')"""
-    out = subprocess.run(
-        ["docker", "exec", "-i", "immich_postgres", "psql", "-U", "postgres", "-d", "immich", "-At", "-F", "\x1f",
-         "-R", "\x1e"], input=sql, capture_output=True, text=True, timeout=600, check=True).stdout
+             where {_LIVE}"""
+    out = _psql(sql)
     mounts = json.loads(subprocess.run(["docker", "inspect", "immich_server", "--format", "{{json .Mounts}}"],
                                        capture_output=True, text=True, timeout=30, check=True).stdout)
     outside = next(m["Source"] for m in mounts if m.get("Destination") == "/data")
@@ -123,12 +195,67 @@ def fetch_catalog() -> list[dict]:
     rows = []
     for rec in out.split("\x1e"):
         parts = rec.strip("\n").split("\x1f")
-        if len(parts) != 7:
+        if len(parts) != 8:
             continue
-        aid, typ, preview, original, duration, taken, name = parts
+        aid, typ, preview, original, duration, taken, name, added = parts
         rows.append({"id": aid, "type": typ, "preview": host(preview), "original": host(original),
-                     "duration_ms": int(duration or 0), "taken": taken, "name": name})
+                     "duration_ms": int(duration or 0), "taken": taken, "name": name, "added": int(added or 0)})
     return rows
+
+
+class CatalogWatch:
+    """Decides when the library list has to be read in full. Every ``check_every`` minutes it runs ``probe`` (cheap);
+    the list is read when the answer differs from the one at the last full read, when there has been no full read
+    yet, and at least every ``SAFETY_SYNC`` seconds whatever the probe says (a changed date, an asset moved between
+    timeline and archive by a path the probe does not see...). A probe that fails changes nothing: the safety read
+    covers it. Without a probe (``None``: an injected catalogue in a test) every look counts as a change, which makes
+    ``check_every`` the old fixed re-read period."""
+
+    def __init__(self, probe, clock=time.monotonic):
+        self.probe, self.clock = probe, clock
+        self.signature = None           # the probe's answer as of the last full read
+        self.seen = None                # the probe's answer at the look that asked for the current read
+        self.probed_at: float | None = None
+        self.force = False              # look again at the next chance (Start / Try again on a waiting indexer)
+
+    def observe(self):
+        """The probe's answer now, or None (no probe, or it failed)."""
+        if self.probe is None:
+            return None
+        try:
+            return self.probe()
+        except Exception:  # noqa: BLE001 - docker hiccup: the safety read is the net
+            return None
+
+    def due(self, last_sync, check_every: int) -> str:
+        """Why the library list should be read in full now ("first", "safety", "changed"), or "" (not now)."""
+        now = self.clock()
+        every = max(int(check_every), 1) * 60
+        if last_sync is None:
+            self.seen = self.observe()
+            self.probed_at = now
+            return "first"
+        if now - last_sync >= SAFETY_SYNC:
+            self.seen = self.observe()
+            self.probed_at = now
+            return "safety"
+        if not (self.force or self.probed_at is None or now - self.probed_at >= every):
+            return ""
+        self.force, self.probed_at = False, now
+        if self.probe is None:
+            return "changed"                    # nothing to compare with: every look is a full read
+        self.seen = self.observe()
+        return "changed" if self.seen is not None and self.seen != self.signature else ""
+
+    def synced(self, seen) -> None:
+        """A full read was done; ``seen`` is the probe's answer taken just before it (None: unknown)."""
+        self.signature = seen
+
+    def next_in(self, check_every: int) -> float:
+        """Seconds until the next look."""
+        if self.probed_at is None:
+            return 0.0
+        return max(max(int(check_every), 1) * 60 - (self.clock() - self.probed_at), 0.0)
 
 
 # ---------------------------------------------------------------- frames
@@ -242,10 +369,21 @@ def container_running(name: str) -> bool:
 
 
 class Service:
-    """Talks to the model server container."""
+    """Talks to the model server container.
 
-    def __init__(self, url: str = SERVICE_URL, container: str = CONTAINER, compose: Path = COMPOSE):
-        self.url, self.container, self.compose = url.rstrip("/"), container, compose
+    ``/health`` of the model server says ``idleSeconds`` (since its last request) and ``idleExitMinutes`` but, unlike
+    the AI Tagger's, no ``busy``: so the requests this panel has in flight are counted here (``inflight``), and the
+    panel's own "last interactive use" is kept (``embed_text`` is only ever called for a search, a smart album or a
+    theme: the indexer sends pictures, never words)."""
+
+    def __init__(self, url: str = SERVICE_URL, container: str = CONTAINER, compose: Path = COMPOSE, *,
+                 clock=time.monotonic):
+        self.url, self.container, self.compose, self.clock = url.rstrip("/"), container, compose, clock
+        self._state: str | None = None          # the container's state, remembered for STATE_TTL seconds
+        self._state_at = 0.0
+        self._count_lock = threading.Lock()
+        self._inflight = 0
+        self._interactive: float | None = None
 
     def health(self, timeout: float = 3) -> dict | None:
         try:
@@ -254,18 +392,42 @@ class Service:
         except (OSError, ValueError):
             return None
 
-    def container_state(self) -> str:
+    def container_state(self, fresh: bool = False) -> str:
+        """running / stopped / missing / unknown; remembered for a few seconds unless ``fresh`` (the status is polled)."""
+        if not fresh and self._state is not None and self.clock() - self._state_at < STATE_TTL:
+            return self._state
         try:
             out = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", self.container],
                                  capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.SubprocessError):
-            return "unknown"
-        if out.returncode != 0:
-            return "missing"
-        return "running" if out.stdout.strip() == "true" else "stopped"
+            state = "unknown"
+        else:
+            state = "missing" if out.returncode != 0 else "running" if out.stdout.strip() == "true" else "stopped"
+        self._state, self._state_at = state, self.clock()
+        return state
+
+    def invalidate(self) -> None:
+        self._state = None
+
+    # ---- what the unload rules need (see IdleLoop)
+    def inflight(self) -> int:
+        """Requests this panel has sent and not had answered."""
+        return self._inflight
+
+    def mark_interactive(self) -> None:
+        self._interactive = self.clock()
+
+    def interactive_age(self) -> float | None:
+        """Seconds since the panel last used the model for a person (None: not since it started)."""
+        return None if self._interactive is None else self.clock() - self._interactive
+
+    def unload_inputs(self, fresh: bool = False) -> tuple[bool, dict | None]:
+        """(whether the container runs, its /health). The state is remembered for a few seconds unless ``fresh``."""
+        running = self.container_state(fresh=fresh) == "running"
+        return running, (self.health(timeout=3 if fresh else 1.5) if running else None)
 
     def start(self) -> None:
-        state = self.container_state()
+        state = self.container_state(fresh=True)
         if state == "running":
             return
         if AITAGGER_EXCLUSIVE and container_running(AITAGGER_CONTAINER):       # take turns on the card
@@ -275,13 +437,15 @@ class Service:
         else:
             cmd = ["docker", "start", self.container]
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        self.invalidate()
         if out.returncode != 0:
             raise RuntimeError(f"could not start the Search+ model server: {(out.stderr or out.stdout).strip()[-300:]}")
 
     def stop(self) -> bool:
-        if self.container_state() != "running":
+        if self.container_state(fresh=True) != "running":
             return False
         subprocess.run(["docker", "stop", "-t", "10", self.container], capture_output=True, timeout=60)
+        self.invalidate()
         return True
 
     def ready(self, wait: float = 120, progress=None, stop: threading.Event | None = None) -> dict:
@@ -310,6 +474,8 @@ class Service:
     def _post(self, path: str, body: dict, timeout: float = 600) -> dict:
         req = urllib.request.Request(self.url + path, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
+        with self._count_lock:
+            self._inflight += 1
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read())
@@ -320,6 +486,9 @@ class Service:
             raise RuntimeError(f"Search+ model server error {exc.code}: {detail}") from exc
         except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
             raise ServiceDown(str(exc)) from exc
+        finally:
+            with self._count_lock:
+                self._inflight -= 1
 
     @staticmethod
     def _decode(b64: str):
@@ -327,8 +496,14 @@ class Service:
         return np.frombuffer(base64.b64decode(b64), dtype="<f2").astype(np.float32)
 
     def embed_text(self, texts: list[str]):
+        """Words to vectors: always for a person (a search, a smart album, a theme), so it counts as interactive use:
+        the model then keeps its place for the server's own idle time instead of the short ``unload_after``."""
         import numpy as np
-        data = self._post("/embed/text", {"texts": texts}, timeout=120)
+        self.mark_interactive()
+        try:
+            data = self._post("/embed/text", {"texts": texts}, timeout=120)
+        finally:
+            self.mark_interactive()
         return np.stack([self._decode(v) for v in data["vectors"]])
 
     def embed_images(self, images: list[bytes]) -> tuple[list, list]:
@@ -337,12 +512,184 @@ class Service:
         return vecs, data.get("errors") or [None] * len(vecs)
 
 
+# ---------------------------------------------------------------- freeing the graphics card
+#
+# The rules (the same for Search+ and the AI Tagger; ``unload_after`` is a setting of each, 1-60 minutes, default 2):
+#
+# * "after-work": the indexer has nothing left to do (it is waiting for new photos) and the model server has been idle
+#   for ``unload_after`` minutes: the panel stops the container. Never while the indexer works, never while a request
+#   is in flight (the tagger says ``busy`` in /health; the Search+ server doesn't, so the panel counts its own).
+# * "interactive": after a person used the model (a Search+ search, the AI Tagger's Test card) the short rule waits
+#   until the server's own idle time (20 minutes) has passed since that use: more searches usually follow.
+# * "server": nothing the panel does applies (the indexer is paused or stopped, so there is no waiting loop to run
+#   the check): the model server exits by itself after its ``IDLE_EXIT_MINUTES``. That is also the backstop for all the
+#   rest, and the only rule that never needs the panel.
+# The check runs from the indexer's waiting loop, which wakes at least every ``IDLE_POLL`` seconds.
+
+def unload_status(*, running: bool, health: dict | None, unload_after: int, indexer: str,
+                  interactive_age: float | None = None, busy: bool = False) -> tuple[dict, bool]:
+    """(the status ``unload`` object, whether the panel should stop the container now).
+
+    ``indexer`` is "working", "waiting" (nothing left to do: the unload check runs) or "off" (paused / stopped);
+    ``interactive_age`` the seconds since a person last used the model; ``busy`` a request the panel knows is in flight
+    (on top of the server's own ``busy``). The object: ``loaded`` (the container runs), ``idleSeconds`` (the server's,
+    None while it loads), ``unloadInSeconds`` (None: not counting down, e.g. while busy), ``rule`` (which rule will do
+    it: after-work, interactive or server), ``busy`` (in use right now: a request in flight or the indexer working)."""
+    if not running:
+        return {"loaded": False, "idleSeconds": None, "unloadInSeconds": None, "rule": None, "busy": False}, False
+    health = health if isinstance(health, dict) else {}
+    number = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None  # noqa: E731
+    ok = health.get("status") == "ok"
+    idle = number(health.get("idleSeconds")) if ok else None             # meaningless while it is loading
+    exit_min = number(health.get("idleExitMinutes"))
+    server_exit = exit_min * 60 if exit_min and exit_min > 0 else None   # None: it never exits (or does not say)
+    working = bool(busy or health.get("busy") or indexer == "working")
+    out = {"loaded": True, "idleSeconds": None if idle is None else round(idle), "unloadInSeconds": None,
+           "rule": "server" if indexer == "off" else "after-work", "busy": working}
+    if idle is None or working:
+        return out, False
+    server_in = None if server_exit is None else max(server_exit - idle, 0.0)
+    if indexer != "waiting":
+        out["unloadInSeconds"] = None if server_in is None else round(server_in)
+        return out, False
+    short_in = max(max(int(unload_after), 1) * 60 - idle, 0.0)
+    grace_len = server_exit if server_exit is not None else IDLE_EXIT_DEFAULT_MIN * 60.0
+    grace_in = grace_len - interactive_age if interactive_age is not None and interactive_age < grace_len else 0.0
+    panel_in = max(short_in, grace_in)
+    if server_in is not None and server_in < panel_in:             # the server lets go first (e.g. unload_after 30)
+        out.update(unloadInSeconds=round(server_in), rule="server")
+        return out, False
+    out.update(unloadInSeconds=round(panel_in), rule="interactive" if grace_in > short_in else "after-work")
+    return out, panel_in <= 0
+
+
+_NOW = object()         # "the probe's answer of the look that asked for this read" (see ``IdleLoop._read_catalog``)
+
+
+class IdleLoop:
+    """What Search+'s indexer and the AI Tagger's do while they have nothing to do, and how they keep the library list
+    current: the unload rules (``unload_status`` / ``unload_check``), the sleep between looks, and the probe-driven
+    re-read of the library list (``CatalogWatch``). The subclass says which model server it drives (``_model_server``),
+    where its settings are (``_unload_settings``) and how to stop it (``_stop_model``), has ``store``, ``catalog``,
+    ``clock``, ``last_sync``, ``_watch``, ``_wake``, ``_sync_lock``, ``IDLE_POLL``, ``running()``, and keeps ``waiting``
+    true while it has nothing to do. The model server object offers ``unload_inputs(fresh)`` -> (running, health),
+    ``inflight()`` and ``interactive_age()``; one that does not (a test's stand-in) is simply never unloaded."""
+
+    waiting = False
+
+    def _model_server(self):
+        raise NotImplementedError
+
+    def _unload_settings(self) -> dict:
+        raise NotImplementedError
+
+    def _stop_model(self) -> bool:
+        raise NotImplementedError
+
+    def _indexer_mode(self) -> str:
+        if not self.running():
+            return "off"
+        return "waiting" if self.waiting else "working"
+
+    def _judge(self, running: bool, health: dict | None) -> tuple[dict, bool, bool]:
+        """(the ``unload`` object, whether the panel should stop the server now, whether a request is in flight)."""
+        svc = self._model_server()
+        age, inflight = getattr(svc, "interactive_age", None), getattr(svc, "inflight", None)
+        busy = bool(inflight and inflight())
+        out, due = unload_status(running=bool(running), health=health, unload_after=self._unload_settings()["unload_after"],
+                                 indexer=self._indexer_mode(), interactive_age=age() if age else None, busy=busy)
+        return out, due, busy
+
+    def unload_status(self, *, running: bool | None = None, health: dict | None = None) -> dict:
+        """The status ``unload`` object. Pass ``running`` and ``health`` when the caller has them already (the status
+        route does): nothing is asked of docker or the model server then; otherwise the remembered state is used."""
+        if running is None:
+            inputs = getattr(self._model_server(), "unload_inputs", None)
+            running, health = inputs(fresh=False) if inputs else (False, None)
+        return self._judge(running, health)[0]
+
+    def unload_check(self) -> dict | None:
+        """Look at the model server with fresh eyes and stop it when the rules say so. Returns the ``unload`` object as
+        it is afterwards (None when the server can't be looked at). Meant for the waiting loop: the caller has set
+        ``waiting``."""
+        inputs = getattr(self._model_server(), "unload_inputs", None)
+        if inputs is None:
+            return None
+        try:
+            out, due, busy = self._judge(*inputs(fresh=True))
+            if due and not busy and self._stop_model():
+                return {"loaded": False, "idleSeconds": None, "unloadInSeconds": None, "rule": None, "busy": False}
+            return out
+        except Exception:  # noqa: BLE001 - never let a docker hiccup end the indexer; the server's own exit is the net
+            return None
+
+    MIN_LOOK = 5.0              # seconds: never look at the model server more often than this (a stop that fails, a busy server)
+
+    @staticmethod
+    def _seconds_to_unload(status: dict | None, rules=("after-work", "interactive")) -> float | None:
+        """When the panel itself will want to look again (None: nothing for it to wait for)."""
+        if not status or not status.get("loaded") or status.get("rule") not in rules:
+            return None
+        if status.get("busy"):
+            return 0.0                      # a request is in flight: look again soon, it will be idle after it
+        return status.get("unloadInSeconds")
+
+    # ---- the waiting loop (what an indexer does while it has nothing to do)
+    def _idle_wait(self, settings: dict, unload: dict | None) -> float:
+        """How long to sleep with nothing to do: until the next probe, until the unload rule may fire, at most
+        ``IDLE_POLL`` seconds (a wake-up is cheap, and it is what runs the unload check)."""
+        wait = min(self.IDLE_POLL, max(self._watch.next_in(settings["check_every"]), 1))
+        left = self._seconds_to_unload(unload)
+        return wait if left is None else min(wait, max(left + 1, self.MIN_LOOK))
+
+    def _wind_down(self, stop: threading.Event) -> bool:
+        """``keep_updated`` is off and everything is done: the thread is about to end, but first the card is freed once
+        the short rule allows (when an interactive grace is on, the model server's own exit does it). True: woken for
+        new work (Try again, Start) rather than ended."""
+        self.waiting = True
+        try:
+            while not stop.is_set():
+                left = self._seconds_to_unload(self.unload_check(), rules=("after-work",))
+                if left is None:
+                    return False
+                if self._wake.wait(min(self.IDLE_POLL, max(left + 1, self.MIN_LOOK))):
+                    self._wake.clear()
+                    return not stop.is_set()
+            return False
+        finally:
+            self.waiting = False
+
+    def _idle_text(self, settings: dict, done: str) -> str:
+        every = settings["check_every"]
+        text = f"everything is {done}; looks for new photos every {'minute' if every == 1 else f'{every} minutes'}"
+        held = self.store.held()
+        if held:
+            text += f"; {held} new {'item is' if held == 1 else 'items are'} waiting for Immich to finish them"
+        return text
+
+    # ---- the library list
+    def _read_catalog(self, seen=_NOW) -> None:
+        """Read the library list in full. ``seen`` is the probe's answer from just before the read (the next probe is
+        compared to it): the look that asked for this read by default."""
+        with self._sync_lock:
+            if seen is _NOW:
+                seen = self._watch.seen
+            self.store.sync_catalog(self.catalog())
+            self.last_sync = self.clock()
+            self._watch.synced(seen)
+
+    def _sync_if_due(self, settings: dict) -> None:
+        if self._watch.due(self.last_sync, settings["check_every"]):
+            self.state, self.detail = "running", "reading the library list"
+            self._read_catalog()
+
+
 # ---------------------------------------------------------------- the index
 
 SCHEMA = """
 create table if not exists assets (
   id text primary key, type text, taken text, name text, preview text, original text,
-  duration_ms integer default 0, gone integer default 0
+  duration_ms integer default 0, gone integer default 0, added integer default 0
 );
 create table if not exists indexed (
   id text primary key, first_row integer, n_rows integer, kind text, indexed_at text
@@ -412,6 +759,9 @@ class Store:
         self.conn.execute("pragma journal_mode=wal")
         self.conn.execute("pragma synchronous=normal")
         self.conn.executescript(SCHEMA)
+        if "added" not in {r[1] for r in self.conn.execute("pragma table_info(assets)")}:      # made before the preview hold-back
+            with self.conn:
+                self.conn.execute("alter table assets add column added integer default 0")
         self._meta = dict(self.conn.execute("select key, value from meta").fetchall())
         self._view: View | None = None
         self._view_key = None
@@ -474,12 +824,12 @@ class Store:
         with self.lock, self.conn:
             self.conn.execute("update assets set gone=1")
             self.conn.executemany(
-                "insert into assets (id, type, taken, name, preview, original, duration_ms, gone)"
-                " values (?,?,?,?,?,?,?,0) on conflict(id) do update set type=excluded.type, taken=excluded.taken,"
+                "insert into assets (id, type, taken, name, preview, original, duration_ms, added, gone)"
+                " values (?,?,?,?,?,?,?,?,0) on conflict(id) do update set type=excluded.type, taken=excluded.taken,"
                 " name=excluded.name, preview=excluded.preview, original=excluded.original,"
-                " duration_ms=excluded.duration_ms, gone=0",
+                " duration_ms=excluded.duration_ms, added=excluded.added, gone=0",
                 [(r["id"], r["type"], r["taken"], r.get("name", ""), r.get("preview", ""), r.get("original", ""),
-                  int(r.get("duration_ms") or 0)) for r in rows])
+                  int(r.get("duration_ms") or 0), int(r.get("added") or 0)) for r in rows])
             self.set_meta("catalog_at", _now())
         self._view = None
         return {"assets": len(rows)}
@@ -489,12 +839,20 @@ class Store:
             return self._todo(n)
 
     def _todo(self, n: int) -> list[dict]:
+        # an asset Immich has not finished (no preview yet, added a moment ago) is left out, not failed: see READY
         cur = self.conn.execute(
             "select a.id, a.type, a.preview, a.original, a.duration_ms, a.taken from assets a"
             " where a.gone=0 and not exists (select 1 from indexed i where i.id=a.id)"
             " and not exists (select 1 from failed f where f.id=a.id and (f.attempts >= ? or f.at > ?))"
-            " order by a.taken desc, a.id limit ?", (MAX_ATTEMPTS, _ago(RETRY_AFTER), n))
+            f" and {READY} order by a.taken desc, a.id limit ?", (MAX_ATTEMPTS, _ago(RETRY_AFTER), preview_cutoff(), n))
         return [dict(zip(("id", "type", "preview", "original", "duration_ms", "taken"), r)) for r in cur]
+
+    def held(self) -> int:
+        """How many assets are waiting for Immich to make their preview (see ``READY``)."""
+        with self.lock:
+            return self.conn.execute(
+                "select count(*) from assets a where a.gone=0 and not exists (select 1 from indexed i where i.id=a.id)"
+                f" and not {READY}", (preview_cutoff(),)).fetchone()[0]
 
     def append(self, asset_id: str, kind: str, vectors: list) -> None:
         import numpy as np
@@ -615,25 +973,44 @@ def search(store: Store, vector, *, media: str | None = None, after: str | None 
 
 # ---------------------------------------------------------------- building the index
 
-class Indexer:
-    """Background thread that fills the index; stop/start at will, it resumes where it was."""
+class Indexer(IdleLoop):
+    """Background thread that fills the index; stop/start at will, it resumes where it was.
 
-    CATALOG_EVERY = 600         # re-read the library list this often (and look for new photos)
+    Keeping up to date: a cheap probe of Immich's database every ``check_every`` minutes (``CatalogWatch``) decides
+    whether the library list is read again, and a full read is made at least once an hour. When there is nothing left
+    to do, the loop waits for at most ``IDLE_POLL`` seconds and, each time it wakes, lets the unload rules look at the
+    model server (``IdleLoop``): the model does not stay in the graphics card for a single new photo."""
+
     BUSY_WAIT = 30              # seconds between looks while the AI Tagger has the graphics card
     CHUNK = 96                  # assets prepared per round
     IMAGES_PER_REQUEST = 32
     WORKERS = 6                 # threads reading previews / cutting video frames
+    IDLE_POLL = IDLE_POLL       # seconds between looks (and unload checks) while there is nothing to do, at most
 
     def __init__(self, store: Store, service: Service, *, catalog=fetch_catalog, frames=prepare_frames,
-                 clock=time.monotonic):
+                 clock=time.monotonic, probe=None):
         self.store, self.service, self.catalog, self.frames, self.clock = store, service, catalog, frames, clock
+        # the real probe goes with the real catalogue; a test that injects a catalogue has no database to ask
+        self._watch = CatalogWatch(probe if probe is not None else (fetch_probe if catalog is fetch_catalog else None),
+                                   clock)
         self.state, self.detail, self.error = "stopped", "", ""
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
-        self.last_sync = None
+        self.last_sync = None                   # when the library list was last read in full (None: read it next)
         self.done_times: collections.deque = collections.deque(maxlen=2000)
         self._lock = threading.Lock()
+        self._sync_lock = threading.Lock()
         self._wake = threading.Event()          # cuts the "up to date" wait short (Try again, Build index)
+
+    # ---- IdleLoop
+    def _model_server(self):
+        return self.service
+
+    def _unload_settings(self) -> dict:
+        return load_settings()
+
+    def _stop_model(self) -> bool:
+        return self.service.stop()
 
     def running(self) -> bool:
         return bool(self.thread and self.thread.is_alive())
@@ -641,7 +1018,8 @@ class Indexer:
     def start(self) -> None:
         with self._lock:
             if self.running():
-                self._wake.set()                # already waiting for new photos: look again now
+                self._watch.force = True        # already waiting for new photos: look again now
+                self._wake.set()
                 return
             self.stop_event = threading.Event()
             self.error = ""
@@ -671,19 +1049,20 @@ class Indexer:
         try:
             while not stop.is_set():
                 settings = load_settings()
-                if self.last_sync is None or self.clock() - self.last_sync >= self.CATALOG_EVERY:
-                    self.state, self.detail = "running", "reading the library list"
-                    self.store.sync_catalog(self.catalog())
-                    self.last_sync = self.clock()
+                self._sync_if_due(settings)
                 todo = self.store.todo(self.CHUNK)
                 if not todo:
                     if not settings["keep_updated"]:
                         self.state, self.detail = "done", "everything is indexed"
+                        if self._wind_down(stop):
+                            continue
                         return
-                    self.state, self.detail = "done", "everything is indexed; looks for new photos every 10 minutes"
-                    self._wake.wait(max(self.CATALOG_EVERY - (self.clock() - self.last_sync), 5))
+                    self.state, self.detail = "done", self._idle_text(settings, "indexed")
+                    self.waiting = True             # nothing to do: the unload rules may look at the model server
+                    self._wake.wait(self._idle_wait(settings, self.unload_check()))
                     self._wake.clear()
                     continue
+                self.waiting = False
                 self.state = "starting"
                 try:
                     health = self.service.ready(wait=3600, stop=stop,
@@ -711,6 +1090,8 @@ class Indexer:
                 self.state, self.detail, self.error = "error", f"the model server stopped: {exc}", str(exc)
         except Exception as exc:  # noqa: BLE001
             self.state, self.detail, self.error = "error", f"{type(exc).__name__}: {exc}", f"{type(exc).__name__}: {exc}"
+        finally:
+            self.waiting = False
 
     def _index(self, todo: list[dict], settings: dict, stop: threading.Event) -> None:
         n = int(settings["video_frames"])

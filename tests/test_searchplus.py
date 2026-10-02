@@ -484,5 +484,854 @@ class TestCaptureHelpers(Base):
         self.assertEqual(len(animation_frames(str(path), 99, positions=[0.3, 0.7])), 2)
 
 
+# ---------------------------------------------------------------- keeping up to date, and freeing the card
+
+def wait_for(cond, timeout=5.0):
+    """Poll ``cond`` until it is true (the indexer runs on its own thread)."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return bool(cond())
+
+
+class IdleService(FakeService):
+    """A model server that says how long it has been idle (what /health says), so the unload rules can be tried
+    without waiting. ``idle`` is /health's idleSeconds, ``age`` the panel's seconds since a person last used the model
+    (None: not at all), ``inflight_n`` the panel's requests in flight."""
+
+    def __init__(self):
+        super().__init__()
+        self.running, self.idle, self.exit_minutes, self.age, self.inflight_n = True, 0, 20, None, 0
+        self.status, self.stops, self.stop_error = "ok", 0, None
+
+    def unload_inputs(self, fresh=False):
+        if not self.running:
+            return False, None
+        return True, {"status": self.status, "idleSeconds": self.idle, "idleExitMinutes": self.exit_minutes}
+
+    def inflight(self):
+        return self.inflight_n
+
+    def interactive_age(self):
+        return self.age
+
+    def stop(self):
+        self.stops += 1
+        if self.stop_error:
+            raise self.stop_error
+        was, self.running = self.running, False
+        self.stopped = True
+        return was
+
+    def health(self, timeout=3):
+        return self.unload_inputs()[1]
+
+    def container_state(self, fresh=False):
+        return "running" if self.running else "stopped"
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def health(idle=0, status="ok", exit_minutes=20, **more):
+    return {"status": status, "idleSeconds": idle, "idleExitMinutes": exit_minutes, **more}
+
+
+class TestUnloadRules(unittest.TestCase):
+    """``unload_status``: the rules as a pure function (both features use it)."""
+
+    def status(self, **kw):
+        kw = {"running": True, "health": health(), "unload_after": 2, "indexer": "waiting", **kw}
+        return sp.unload_status(**kw)
+
+    def test_not_loaded(self):
+        out, due = self.status(running=False, health=None)
+        self.assertEqual(out, {"loaded": False, "idleSeconds": None, "unloadInSeconds": None, "rule": None, "busy": False})
+        self.assertFalse(due)
+
+    def test_after_the_work_the_short_rule_counts_down_and_fires(self):
+        out, due = self.status(health=health(30))
+        self.assertEqual(out, {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 90, "rule": "after-work", "busy": False})
+        self.assertFalse(due)
+        out, due = self.status(health=health(119))
+        self.assertEqual((out["unloadInSeconds"], due), (1, False))
+        out, due = self.status(health=health(120))
+        self.assertEqual((out["unloadInSeconds"], out["rule"], due), (0, "after-work", True))
+        out, due = self.status(health=health(500), unload_after=10)             # 10 minutes: 600 s of quiet
+        self.assertEqual((out["unloadInSeconds"], due), (100, False))
+
+    def test_never_while_the_indexer_works_or_a_request_is_in_flight(self):
+        out, due = self.status(health=health(500), indexer="working")
+        self.assertEqual((out["busy"], out["unloadInSeconds"], due), (True, None, False))
+        out, due = self.status(health=health(500), busy=True)                    # a request the panel has out
+        self.assertEqual((out["busy"], out["unloadInSeconds"], due), (True, None, False))
+        out, due = self.status(health=health(500, busy=1))                       # the tagger's own busy counter
+        self.assertEqual((out["busy"], out["unloadInSeconds"], due), (True, None, False))
+        out, due = self.status(health=health(500, busy=0))
+        self.assertTrue(due)
+
+    def test_an_interactive_use_earns_the_servers_own_idle_time(self):
+        out, due = self.status(health=health(500), interactive_age=600)           # a search 10 minutes ago
+        self.assertEqual((out["rule"], out["unloadInSeconds"], due), ("interactive", 600, False))
+        out, due = self.status(health=health(60), interactive_age=60)             # the search was the last request
+        self.assertEqual((out["rule"], out["unloadInSeconds"], due), ("interactive", 1140, False))
+        out, due = self.status(health=health(200), interactive_age=1250)          # the 20 minutes are over: the short rule
+        self.assertEqual((out["rule"], out["unloadInSeconds"], due), ("after-work", 0, True))
+        out, due = self.status(health=health(30), interactive_age=1250)
+        self.assertEqual((out["rule"], out["unloadInSeconds"], due), ("after-work", 90, False))
+
+    def test_a_paused_indexer_leaves_it_to_the_server(self):
+        out, due = self.status(health=health(500), indexer="off")
+        self.assertEqual((out["rule"], out["unloadInSeconds"], out["busy"], due), ("server", 700, False, False))
+        out, due = self.status(health=health(1500), indexer="off")
+        self.assertEqual((out["unloadInSeconds"], due), (0, False))               # the panel never stops it then
+
+    def test_a_longer_unload_after_than_the_server_waits_is_the_servers_exit(self):
+        out, due = self.status(health=health(300), unload_after=30)
+        self.assertEqual((out["rule"], out["unloadInSeconds"], due), ("server", 900, False))
+
+    def test_while_loading_nothing_counts(self):
+        out, due = self.status(health=health(0, status="loading"))
+        self.assertEqual((out["loaded"], out["idleSeconds"], out["unloadInSeconds"], out["busy"], due),
+                         (True, None, None, False, False))
+        out, due = self.status(health=None)                                        # running, not answering (yet)
+        self.assertEqual((out["loaded"], out["idleSeconds"], out["unloadInSeconds"], due), (True, None, None, False))
+
+    def test_a_server_that_never_exits_has_no_server_countdown(self):
+        out, due = self.status(health=health(500, exit_minutes=0), indexer="off")
+        self.assertEqual((out["rule"], out["unloadInSeconds"]), ("server", None))
+        out, due = self.status(health=health(30, exit_minutes=0))
+        self.assertEqual((out["rule"], out["unloadInSeconds"]), ("after-work", 90))
+        out, due = self.status(health=health(500, exit_minutes=0), interactive_age=100)    # the grace is 20 minutes then
+        self.assertEqual((out["rule"], out["unloadInSeconds"], due), ("interactive", 1100, False))
+
+
+class Idle(Base):
+    """A real Indexer on an IdleService, looking every few milliseconds."""
+
+    def setUp(self):
+        super().setUp()
+        self.service = IdleService()
+        self.make()
+
+    def make(self, **kw):
+        self.indexer = sp.Indexer(self.store, self.service, catalog=lambda: self.catalog, frames=fake_frames, **kw)
+        self.indexer.IMAGES_PER_REQUEST = 3
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+
+    def up_to_date(self, **settings):
+        """Index everything and leave the indexer waiting for new photos."""
+        sp.save_settings({"keep_updated": True, **settings})
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting), self.indexer.detail)
+
+    def quiet(self, seconds=0.25):
+        """Give the waiting loop time to look a few times."""
+        time.sleep(seconds)
+
+
+class TestUnloadAfterTheWork(Idle):
+    def test_the_model_is_stopped_once_it_has_been_idle_for_unload_after_minutes(self):
+        self.service.idle = 30
+        self.up_to_date()
+        self.quiet()
+        self.assertEqual(self.service.stops, 0)
+        self.assertTrue(self.service.running)
+        self.service.idle = 125
+        self.assertTrue(wait_for(lambda: self.service.stops == 1))
+        self.assertFalse(self.service.running)
+        self.assertTrue(self.indexer.running())                       # it goes on watching for new photos
+        self.assertEqual(self.indexer.unload_status()["loaded"], False)
+        self.quiet()
+        self.assertEqual(self.service.stops, 1)                       # not stopped again: it is not running
+
+    def test_never_while_a_request_is_in_flight(self):
+        self.service.idle, self.service.inflight_n = 500, 1
+        self.up_to_date()
+        self.quiet()
+        self.assertEqual(self.service.stops, 0)
+        self.assertTrue(self.indexer.unload_status()["busy"])
+        self.service.inflight_n = 0
+        self.assertTrue(wait_for(lambda: self.service.stops == 1))
+
+    def test_never_while_the_indexer_is_working(self):
+        gate = threading.Event()
+
+        def slow(item, n):
+            gate.wait(5)
+            return fake_frames(item, n)
+
+        self.indexer.frames = slow
+        self.service.idle = 500
+        sp.save_settings({"keep_updated": True})
+        self.indexer.start()
+        self.quiet(0.3)
+        self.assertEqual(self.service.stops, 0)
+        status = self.indexer.unload_status()
+        self.assertEqual((status["loaded"], status["busy"], status["unloadInSeconds"]), (True, True, None))
+        gate.set()
+        self.assertTrue(wait_for(lambda: self.service.stops == 1))
+        self.assertEqual(self.store.counts()["indexed"], 4)           # the work was done first
+
+    def test_not_within_the_interactive_grace(self):
+        self.service.idle, self.service.age = 500, 600                # a search ten minutes ago
+        self.up_to_date()
+        self.quiet()
+        self.assertEqual(self.service.stops, 0)
+        status = self.indexer.unload_status()
+        self.assertEqual((status["rule"], status["unloadInSeconds"]), ("interactive", 600))
+        self.service.idle, self.service.age = 200, 1250               # 20 minutes passed since it; the indexer worked since
+        self.assertTrue(wait_for(lambda: self.service.stops == 1))
+
+    def test_the_unload_after_setting_decides(self):
+        self.service.idle = 130
+        self.up_to_date(unload_after=5)
+        self.quiet()
+        self.assertEqual(self.service.stops, 0)
+        self.service.idle = 305
+        self.assertTrue(wait_for(lambda: self.service.stops == 1))
+
+    def test_a_paused_indexer_never_stops_it_the_server_does(self):
+        self.service.idle = 500
+        status = self.indexer.unload_status()                          # no thread: paused / not started
+        self.assertEqual((status["rule"], status["unloadInSeconds"], status["busy"]), ("server", 700, False))
+        sp.save_settings({"keep_updated": True})
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done"))
+        self.indexer.stop(5)
+        self.quiet()
+        self.assertFalse(self.indexer.running())
+        self.assertLessEqual(self.service.stops, 1)                   # only before it was paused (idle was 500)
+        stops = self.service.stops
+        self.quiet()
+        self.assertEqual(self.service.stops, stops)
+
+    def test_a_failing_stop_does_not_end_the_indexer(self):
+        self.service.idle, self.service.stop_error = 500, OSError("docker is not answering")
+        self.up_to_date()
+        self.assertTrue(wait_for(lambda: self.service.stops >= 2))     # it keeps trying, quietly
+        self.assertTrue(self.indexer.running())
+        self.assertEqual(self.indexer.state, "done")
+
+    def test_a_new_photo_after_the_unload_is_indexed_again(self):
+        self.service.idle = 500
+        self.up_to_date()
+        self.assertTrue(wait_for(lambda: self.service.stops == 1))
+        self.catalog = self.catalog + [{"id": "n1", "type": "IMAGE", "taken": "2026-02-01", "name": "n1.jpg",
+                                        "preview": "dog", "original": "", "duration_ms": 0}]
+        self.indexer.start()                                           # "look again now"
+        self.assertTrue(wait_for(lambda: self.store.counts()["indexed"] == 5))
+
+    def test_nothing_is_stopped_when_the_stand_in_cannot_say(self):
+        self.service = FakeService()                                   # no unload_inputs: never unloaded
+        self.make()
+        self.up_to_date()
+        self.quiet()
+        self.assertEqual(self.service.stopped, False)
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": False, "idleSeconds": None, "unloadInSeconds": None, "rule": None, "busy": False})
+
+
+class TestWhenKeepUpdatedIsOff(Idle):
+    """With "keep it up to date" off the thread ends after the work, but not before the card is freed."""
+
+    def finished(self):
+        return not self.indexer.running()
+
+    def test_the_card_is_freed_before_the_thread_ends(self):
+        self.service.idle = 500
+        sp.save_settings({"keep_updated": False})
+        self.indexer.start()
+        self.assertTrue(wait_for(self.finished))
+        self.assertEqual((self.indexer.state, self.service.stops), ("done", 1))
+
+    def test_it_waits_out_the_short_rule(self):
+        self.service.idle = 30
+        sp.save_settings({"keep_updated": False})
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.quiet()
+        self.assertTrue(self.indexer.running())                        # still there: 90 s to go
+        self.assertEqual(self.service.stops, 0)
+        self.service.idle = 125
+        self.assertTrue(wait_for(self.finished))
+        self.assertEqual(self.service.stops, 1)
+
+    def test_an_interactive_grace_leaves_it_to_the_server(self):
+        self.service.idle, self.service.age = 500, 600
+        sp.save_settings({"keep_updated": False})
+        self.indexer.start()
+        self.assertTrue(wait_for(self.finished))
+        self.assertEqual(self.service.stops, 0)                        # the server's own 20 minutes
+
+    def test_a_restart_wakes_it_for_new_work(self):
+        self.service.idle = 30
+        sp.save_settings({"keep_updated": False})
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.catalog = self.catalog + [{"id": "n1", "type": "IMAGE", "taken": "2026-02-01", "name": "n1.jpg",
+                                        "preview": "dog", "original": "", "duration_ms": 0}]
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.store.counts()["indexed"] == 5))
+        self.assertEqual(self.service.stops, 0)
+
+    def test_pausing_ends_the_wait_at_once(self):
+        self.service.idle = 30
+        sp.save_settings({"keep_updated": False})
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.indexer.stop(5)
+        self.assertTrue(self.finished())
+        self.assertEqual(self.service.stops, 0)
+
+    def test_a_request_still_in_flight_keeps_it_waiting(self):
+        self.service.idle, self.service.inflight_n = 500, 1
+        sp.save_settings({"keep_updated": False})
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.quiet()
+        self.assertTrue(self.indexer.running())
+        self.assertEqual(self.service.stops, 0)
+        self.service.inflight_n = 0
+        self.assertTrue(wait_for(self.finished))
+        self.assertEqual(self.service.stops, 1)
+
+
+class TestTheSleepBetweenLooks(unittest.TestCase):
+    """What the waiting loop sleeps: at most a minute, until the unload rule may fire, never a tight loop."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = sp.Store(Path(tmp.name))
+        self.addCleanup(self.store.conn.close)
+        self.indexer = sp.Indexer(self.store, FakeService(), catalog=lambda: [])
+        self.settings = {"check_every": 10}
+
+    def wait(self, unload):
+        return self.indexer._idle_wait(self.settings, unload)
+
+    def test_the_sleep(self):
+        loaded = {"loaded": True, "rule": "after-work", "busy": False}
+        self.assertEqual(self.wait(None), 1)                                    # no probe yet: look at once (1 s at least)
+        self.indexer._watch.probed_at = self.indexer._watch.clock()
+        self.assertEqual(self.wait(None), 60)                                   # a minute at most: that is what runs the check
+        self.assertEqual(self.wait({**loaded, "unloadInSeconds": 500}), 60)
+        self.assertEqual(self.wait({**loaded, "unloadInSeconds": 30}), 31)      # the unload is due in 30 s: look just after
+        self.assertEqual(self.wait({**loaded, "unloadInSeconds": 0}), 5)        # due but it did not stop: not a tight loop
+        self.assertEqual(self.wait({**loaded, "unloadInSeconds": None, "busy": True}), 5)   # busy: look again soon
+        self.assertEqual(self.wait({**loaded, "rule": "server", "unloadInSeconds": 900}), 60)   # the server's job
+        self.assertEqual(self.wait({"loaded": False}), 60)
+
+
+class TestUnloadStatusObject(Idle):
+    """The ``unload`` object of GET /api/searchplus, for each case."""
+
+    def test_not_loaded(self):
+        self.service.running = False
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": False, "idleSeconds": None, "unloadInSeconds": None, "rule": None, "busy": False})
+
+    def test_waiting_for_new_photos(self):
+        self.service.idle = 30
+        self.up_to_date()
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 90, "rule": "after-work", "busy": False})
+
+    def test_after_an_interactive_use(self):
+        self.service.idle, self.service.age = 30, 30
+        self.up_to_date()
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 1170, "rule": "interactive", "busy": False})
+
+    def test_paused(self):
+        self.service.idle = 30
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 1170, "rule": "server", "busy": False})
+
+    def test_a_request_in_flight(self):
+        self.service.idle, self.service.inflight_n = 30, 1
+        self.up_to_date()
+        self.assertEqual(self.indexer.unload_status(),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": None, "rule": "after-work", "busy": True})
+
+    def test_the_caller_can_hand_in_what_it_already_knows(self):
+        self.service.running = False                                  # the object trusts what it is given, asks nothing
+        self.assertEqual(self.indexer.unload_status(running=True, health=health(30)),
+                         {"loaded": True, "idleSeconds": 30, "unloadInSeconds": 1170, "rule": "server", "busy": False})
+        self.assertEqual(self.indexer.unload_status(running=False)["loaded"], False)
+
+
+class TestSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"IMMICH_ORGANIZER_HOME": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_defaults_and_limits(self):
+        s = sp.load_settings()
+        self.assertEqual((s["unload_after"], s["check_every"]), (2, 1))
+        self.assertEqual((sp.LIMITS["unload_after"], sp.LIMITS["check_every"]), ((1, 60), (1, 60)))
+
+    def test_they_are_saved_and_checked(self):
+        s = sp.save_settings({"unload_after": 5, "check_every": 10})
+        self.assertEqual((s["unload_after"], s["check_every"]), (5, 10))
+        self.assertEqual(sp.load_settings()["unload_after"], 5)
+        self.assertEqual(sp.save_settings({"unload_after": "7"})["unload_after"], 7)         # the form sends numbers as text too
+        for key in ("unload_after", "check_every"):
+            for bad in (0, 61, -1, "x", None):
+                with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                    sp.save_settings({key: bad})
+        self.assertEqual(sp.load_settings()["unload_after"], 7)                               # a refused change changed nothing
+        for key in ("unload_after", "check_every"):                                          # the edges are fine
+            for ok in (1, 60):
+                self.assertEqual(sp.save_settings({key: ok})[key], ok)
+
+    def test_a_hand_edited_file_cannot_make_it_unload_at_once(self):
+        sp.settings_path().write_text('{"unload_after": 0, "check_every": "soon", "video_frames": 4}')
+        s = sp.load_settings()
+        self.assertEqual((s["unload_after"], s["check_every"]), (2, 1))
+        sp.settings_path().write_text('{"unload_after": 500}')
+        self.assertEqual(sp.load_settings()["unload_after"], 2)
+
+
+class TestChangeProbe(Base):
+    """The library list is read in full only when the cheap probe changed, and at least once an hour."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock, self.signature, self.probes, self.reads = FakeClock(), ["A"], [], []
+
+        def probe():
+            self.probes.append(self.clock())
+            return (self.signature[0],)
+
+        def catalog():
+            self.reads.append(self.clock())
+            return list(self.catalog)
+
+        self.indexer = sp.Indexer(self.store, self.service, catalog=catalog, frames=fake_frames, clock=self.clock,
+                                  probe=probe)
+        self.indexer.IMAGES_PER_REQUEST = 3
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+        sp.save_settings({"keep_updated": True})
+
+    def up_to_date(self):
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting), self.indexer.detail)
+
+    def advance(self, seconds):
+        self.clock.t += seconds
+
+    def test_the_first_look_reads_everything(self):
+        self.up_to_date()
+        self.assertEqual((len(self.reads), len(self.probes)), (1, 1))
+
+    def test_an_unchanged_probe_reads_nothing_however_often_it_looks(self):
+        self.up_to_date()
+        for _ in range(5):
+            self.advance(61)
+            self.assertTrue(wait_for(lambda n=len(self.probes): len(self.probes) > n))
+        self.assertEqual(len(self.reads), 1)
+        self.assertGreaterEqual(len(self.probes), 6)
+
+    def test_it_does_not_even_probe_before_check_every_minutes_have_passed(self):
+        self.up_to_date()
+        self.signature[0] = "B"
+        self.advance(59)
+        time.sleep(0.2)
+        self.assertEqual((len(self.probes), len(self.reads)), (1, 1))
+        self.advance(2)
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+
+    def test_a_changed_probe_picks_up_the_new_upload(self):
+        self.up_to_date()
+        self.assertEqual(self.store.counts()["indexed"], 4)
+        self.catalog = self.catalog + [{"id": "n1", "type": "IMAGE", "taken": "2026-02-01", "name": "n1.jpg",
+                                        "preview": "dog", "original": "", "duration_ms": 0}]
+        self.signature[0] = "B"
+        self.advance(61)
+        self.assertTrue(wait_for(lambda: self.store.counts()["indexed"] == 5))
+        self.assertEqual(len(self.reads), 2)
+        self.advance(61)                                               # nothing changed since: no more reads
+        self.assertTrue(wait_for(lambda: len(self.probes) == 3))
+        time.sleep(0.1)
+        self.assertEqual(len(self.reads), 2)
+
+    def test_check_every_is_a_setting(self):
+        self.up_to_date()
+        sp.save_settings({"check_every": 5})
+        self.signature[0] = "B"
+        self.advance(4 * 60)
+        time.sleep(0.2)
+        self.assertEqual(len(self.reads), 1)                           # four minutes: not yet
+        self.advance(61)
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+
+    def test_a_safety_read_every_hour_even_when_the_probe_never_changes(self):
+        self.up_to_date()
+        self.advance(3599)
+        self.assertTrue(wait_for(lambda: len(self.probes) >= 2))
+        time.sleep(0.1)
+        self.assertEqual(len(self.reads), 1)
+        self.advance(2)                                                # one hour since the last full read
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+        self.advance(3601)
+        self.assertTrue(wait_for(lambda: len(self.reads) == 3))
+
+    def test_a_probe_that_fails_reads_nothing_and_does_not_stop_the_indexer(self):
+        self.up_to_date()
+
+        def broken():
+            raise RuntimeError("docker exec failed")
+
+        self.indexer._watch.probe = broken
+        self.advance(61)
+        time.sleep(0.2)
+        self.assertEqual((len(self.reads), self.indexer.state), (1, "done"))
+        self.assertTrue(self.indexer.running())
+        self.advance(3600)                                             # the safety read is the net
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+
+    def test_start_looks_again_at_once(self):
+        self.up_to_date()
+        self.signature[0] = "B"
+        self.indexer.start()                                           # "Try again" / "Resume": do not wait a minute
+        self.assertTrue(wait_for(lambda: len(self.reads) == 2))
+
+    def test_the_wait_is_never_longer_than_a_minute_so_the_unload_check_runs(self):
+        self.assertEqual(sp.Indexer.IDLE_POLL, 60)
+        self.assertEqual(sp.IDLE_POLL, 60)
+
+
+class TestCatalogWatch(unittest.TestCase):
+    """The decision on its own, with a clock in the hand."""
+
+    def setUp(self):
+        self.clock, self.answer, self.calls = FakeClock(), ("A",), 0
+
+        def probe():
+            self.calls += 1
+            return self.answer
+
+        self.watch = sp.CatalogWatch(probe, self.clock)
+
+    def read(self):
+        self.watch.synced(self.watch.seen)
+        return self.clock()
+
+    def test_first_then_quiet_then_changed_then_safety(self):
+        self.assertEqual(self.watch.due(None, 1), "first")
+        last = self.read()
+        self.assertEqual(self.watch.due(last, 1), "")                  # not a minute yet: no probe
+        self.assertEqual(self.calls, 1)
+        self.clock.t += 60
+        self.assertEqual(self.watch.due(last, 1), "")                  # probed, same answer
+        self.assertEqual(self.calls, 2)
+        self.answer = ("B",)
+        self.clock.t += 60
+        self.assertEqual(self.watch.due(last, 1), "changed")
+        last = self.read()
+        self.clock.t += 60
+        self.assertEqual(self.watch.due(last, 1), "")                  # the answer is now the baseline
+        self.clock.t += sp.SAFETY_SYNC
+        self.assertEqual(self.watch.due(last, 1), "safety")
+
+    def test_a_failing_probe_is_not_a_change(self):
+        self.watch.due(None, 1)
+        last = self.read()
+
+        def broken():
+            raise OSError("no docker")
+
+        self.watch.probe = broken
+        self.clock.t += 120
+        self.assertEqual(self.watch.due(last, 1), "")
+
+    def test_without_a_probe_every_look_is_a_read(self):
+        watch = sp.CatalogWatch(None, self.clock)
+        self.assertEqual(watch.due(None, 1), "first")
+        last = self.clock()
+        self.assertEqual(watch.due(last, 1), "")
+        self.clock.t += 60
+        self.assertEqual(watch.due(last, 1), "changed")
+
+    def test_next_in(self):
+        self.assertEqual(self.watch.next_in(1), 0)
+        self.watch.due(None, 1)
+        self.clock.t += 20
+        self.assertEqual(self.watch.next_in(1), 40)
+        self.assertEqual(self.watch.next_in(5), 280)
+        self.clock.t += 100
+        self.assertEqual(self.watch.next_in(1), 0)
+
+
+class TestTheProbeQuery(unittest.TestCase):
+    """The probe and the catalogue as they talk to Immich's database (docker is replaced)."""
+
+    def docker(self, probe_out="", catalog_out=""):
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append((list(cmd), kwargs.get("input") or ""))
+            if cmd[:3] == ["docker", "exec", "-i"]:
+                sql = kwargs.get("input") or ""
+                return mock.Mock(returncode=0, stdout=probe_out if "count(*)" in sql else catalog_out, stderr="")
+            return mock.Mock(returncode=0, stdout='[{"Destination": "/data", "Source": "/srv/immich"}]', stderr="")
+
+        return calls, mock.patch.object(sp.subprocess, "run", side_effect=run)
+
+    def test_the_probe_is_one_small_select_on_columns_that_move_on_upload_and_delete(self):
+        sql = sp.PROBE_SQL
+        for needed in ('"createdAt"', '"deletedAt"', "asset_file", "type = 'preview'", "count(*)"):
+            self.assertIn(needed, sql)
+        for never in ("updatedAt", "updateId"):                         # they move whenever anything is written (tags!)
+            self.assertNotIn(never, sql)
+        for never in ("insert", "update ", "delete ", "alter", "drop"):
+            self.assertNotIn(never, sql.lower())
+        self.assertEqual(sql.lower().count("select"), 6)                # one statement: the outer select and five sub-selects
+
+    def test_fetch_probe_reads_the_five_numbers(self):
+        calls, patch = self.docker(probe_out="72987\x1f2026-10-02 22:07:08+00\x1f2026-10-01 09:40:33+00\x1f72972\x1f2026-10-02 22:07:09+00\x1e\n")
+        with patch:
+            got = sp.fetch_probe()
+        self.assertEqual(got, ("72987", "2026-10-02 22:07:08+00", "2026-10-01 09:40:33+00", "72972", "2026-10-02 22:07:09+00"))
+        self.assertEqual(len(calls), 1)                                  # one docker call, nothing else
+        self.assertEqual(calls[0][0][:6], ["docker", "exec", "-i", "immich_postgres", "psql", "-U"])
+        self.assertEqual(calls[0][1], sp.PROBE_SQL)
+        with self.docker(probe_out="oops")[1], self.assertRaises(RuntimeError):
+            sp.fetch_probe()
+
+    def test_the_catalogue_carries_when_each_asset_was_added(self):
+        row = "a1\x1fIMAGE\x1f/data/thumbs/a1.jpeg\x1f/data/upload/a1.jpg\x1f0\x1f2026-01-05 10:00:00+00\x1fa1.jpg\x1f1790978829\x1e\n"
+        row2 = "v1\x1fVIDEO\x1f\x1f/data/upload/v1.mp4\x1f9000\x1f2026-01-03 10:00:00+00\x1fv1.mp4\x1f1790978900\x1e\n"
+        calls, patch = self.docker(catalog_out=row + row2)
+        with patch:
+            rows = sp.fetch_catalog()
+        self.assertEqual([r["id"] for r in rows], ["a1", "v1"])
+        self.assertEqual((rows[0]["added"], rows[0]["preview"], rows[1]["preview"]), (1790978829, "/srv/immich/thumbs/a1.jpeg", ""))
+        self.assertIn('"createdAt"', calls[0][1])                        # the 8th column
+        with self.docker(catalog_out="a1\x1fIMAGE\x1fx\x1fy\x1f0\x1ft\x1fn\x1e")[1]:     # an old 7-field answer is skipped
+            self.assertEqual(sp.fetch_catalog(), [])
+
+    def test_the_real_probe_goes_with_the_real_catalogue_only(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = sp.Store(Path(tmp.name))
+        self.addCleanup(store.conn.close)
+        self.assertIs(sp.Indexer(store, FakeService())._watch.probe, sp.fetch_probe)
+        self.assertIsNone(sp.Indexer(store, FakeService(), catalog=lambda: [])._watch.probe)
+
+
+class TestPreviewHoldBack(Base):
+    """An asset Immich has not finished (no preview file yet) is not worked on, and not failed, until it has one."""
+
+    T0 = 1_790_000_000
+
+    def setUp(self):
+        super().setUp()
+        self.now = [self.T0]
+        patcher = mock.patch.object(sp, "_wall", side_effect=lambda: self.now[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.asked = []
+
+        def frames(item, n):
+            self.asked.append(item["id"])
+            if item["preview"] == "":                                  # as prepare_frames does: the picture itself
+                return [b"dog"], "image"
+            return fake_frames(item, n)
+
+        self.indexer = sp.Indexer(self.store, self.service, catalog=lambda: self.catalog, frames=frames)
+        self.indexer.IMAGES_PER_REQUEST = 3
+        self.indexer.IDLE_POLL = 0.02
+        self.addCleanup(self.indexer.stop, 5)
+        self.new = {"id": "n1", "type": "IMAGE", "taken": "2026-02-01", "name": "n1.jpg", "preview": "", "original": "",
+                    "duration_ms": 0, "added": self.T0 - 60}
+        self.catalog = list(CATALOG) + [self.new]
+
+    def todo(self):
+        return [t["id"] for t in self.store.todo(50)]
+
+    def test_a_new_asset_without_a_preview_is_left_out_of_the_work_list(self):
+        self.store.sync_catalog(self.catalog)
+        self.assertNotIn("n1", self.todo())
+        self.assertEqual(self.store.held(), 1)
+        self.assertIn("a1", self.todo())
+
+    def test_it_is_held_not_failed_and_picked_up_when_the_preview_appears(self):
+        sp.save_settings({"keep_updated": True})
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.indexer.state == "done" and self.indexer.waiting))
+        self.assertNotIn("n1", self.asked)
+        self.assertIsNone(self.store.conn.execute("select 1 from failed where id='n1'").fetchone())
+        self.assertIn("1 new item is waiting for Immich", self.indexer.detail)
+        self.assertEqual(self.store.counts()["indexed"], 4)
+        # Immich made the preview: the next full read brings its path, and the asset goes in
+        self.catalog = list(CATALOG) + [{**self.new, "preview": "dog"}]
+        self.indexer.start()
+        self.assertTrue(wait_for(lambda: self.store.counts()["indexed"] == 5))
+        self.assertIn("n1", self.asked)
+        self.assertEqual(self.store.held(), 0)
+
+    def test_after_thirty_minutes_without_a_preview_it_is_processed_as_before(self):
+        self.store.sync_catalog(self.catalog)
+        self.now[0] = self.T0 - 60 + sp.PREVIEW_GRACE - 1
+        self.assertNotIn("n1", self.todo())
+        self.now[0] = self.T0 - 60 + sp.PREVIEW_GRACE + 1
+        self.assertIn("n1", self.todo())
+        self.assertEqual(self.store.held(), 0)
+        sp.save_settings({"keep_updated": False})
+        self.indexer.start()
+        self.indexer.thread.join(10)
+        self.assertIn("n1", self.asked)                                  # it fell back to the file itself
+        self.assertEqual(self.store.counts()["indexed"], 5)
+
+    def test_assets_of_unknown_age_and_older_assets_are_never_held(self):
+        rows = [{**self.new, "id": "x1", "added": 0},                     # a catalogue that does not say (and old stores)
+                {**self.new, "id": "x2", "added": self.T0 - 7200}]
+        self.store.sync_catalog(rows)
+        self.assertEqual(sorted(self.todo()), ["x1", "x2"])
+
+    def test_the_same_goes_for_videos(self):
+        self.store.sync_catalog([{**self.new, "id": "vid", "type": "VIDEO", "duration_ms": 5000}])
+        self.assertEqual(self.todo(), [])
+        self.store.sync_catalog([{**self.new, "id": "vid", "type": "VIDEO", "duration_ms": 5000, "preview": "car"}])
+        self.assertEqual(self.todo(), ["vid"])
+
+    def test_a_store_made_before_this_gets_the_column_and_nothing_is_held(self):
+        import sqlite3
+        folder = Path(self.tmp.name) / "old"
+        folder.mkdir()
+        conn = sqlite3.connect(str(folder / "index.sqlite"))
+        conn.executescript("create table assets (id text primary key, type text, taken text, name text, preview text,"
+                           " original text, duration_ms integer default 0, gone integer default 0);"
+                           "create table indexed (id text primary key, first_row integer, n_rows integer, kind text,"
+                           " indexed_at text);"
+                           "insert into assets (id, type, taken, name, preview, original) values ('old1','IMAGE','2024','o','','');")
+        conn.commit()
+        conn.close()
+        store = sp.Store(folder)
+        self.addCleanup(store.conn.close)
+        self.assertEqual([t["id"] for t in store.todo(5)], ["old1"])      # added = 0: unknown, not held
+        store.sync_catalog([{**self.new, "id": "old1"}])
+        self.assertEqual(store.todo(5), [])                              # now it is known to be new
+        self.assertEqual(store.held(), 1)
+
+
+class TestTheServiceKeepsTrack(unittest.TestCase):
+    """The facts the unload rules need from the real Service: requests in flight, interactive use, the container."""
+
+    class Reply:
+        def __init__(self, data):
+            self.data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            import json
+            return json.dumps(self.data).encode()
+
+    def test_requests_in_flight_are_counted_and_released(self):
+        service = sp.Service()
+        seen = []
+
+        def urlopen(req, timeout=0):
+            seen.append(service.inflight())
+            if "fail" in req.full_url:
+                raise sp.urllib.error.URLError("down")
+            return self.Reply({"vectors": [], "errors": []})
+
+        with mock.patch.object(sp.urllib.request, "urlopen", urlopen):
+            service.embed_images([b"x"])
+            with self.assertRaises(sp.ServiceDown):
+                service._post("/fail", {})
+        self.assertEqual(seen, [1, 1])
+        self.assertEqual(service.inflight(), 0)
+
+    def test_only_a_text_embedding_is_interactive_use(self):
+        import base64
+        clock = FakeClock()
+        service = sp.Service(clock=clock)
+        vec = base64.b64encode(np.asarray([1, 0, 0, 0], dtype="<f2").tobytes()).decode()
+        with mock.patch.object(service, "_post", return_value={"vectors": [], "errors": []}):
+            service.embed_images([b"x"])                                  # the indexer's calls are not
+        self.assertIsNone(service.interactive_age())
+        with mock.patch.object(service, "_post", return_value={"vectors": [vec]}):
+            service.embed_text(["a dog"])
+        clock.t += 90
+        self.assertEqual(service.interactive_age(), 90)
+        with mock.patch.object(service, "_post", return_value={"vectors": [], "errors": []}):
+            service.embed_images([b"x"])
+        self.assertEqual(service.interactive_age(), 90)
+
+    def test_a_failed_text_embedding_still_counts_as_a_use(self):
+        clock = FakeClock()
+        service = sp.Service(clock=clock)
+        with mock.patch.object(service, "_post", side_effect=sp.ServiceDown("loading")), self.assertRaises(sp.ServiceDown):
+            service.embed_text(["a dog"])
+        self.assertEqual(service.interactive_age(), 0)
+
+    def test_the_container_state_is_remembered_for_a_few_seconds(self):
+        clock, calls = FakeClock(), []
+
+        def run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return mock.Mock(returncode=0, stdout="true\n", stderr="")
+
+        service = sp.Service(clock=clock)
+        with mock.patch.object(sp.subprocess, "run", side_effect=run):
+            for _ in range(5):
+                self.assertEqual(service.container_state(), "running")
+            self.assertEqual(len(calls), 1)
+            clock.t += sp.STATE_TTL + 1
+            service.container_state()
+            self.assertEqual(len(calls), 2)
+            service.container_state(fresh=True)
+            self.assertEqual(len(calls), 3)
+
+    def test_stop_looks_fresh_and_forgets_what_it_remembered(self):
+        clock, states, stops = FakeClock(), ["true\n", "true\n", "false\n"], []
+
+        def run(cmd, **kwargs):
+            if cmd[:2] == ["docker", "inspect"]:
+                return mock.Mock(returncode=0, stdout=states.pop(0), stderr="")
+            stops.append(cmd)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        service = sp.Service(clock=clock)
+        with mock.patch.object(sp.subprocess, "run", side_effect=run):
+            self.assertEqual(service.container_state(), "running")        # remembered ...
+            self.assertTrue(service.stop())                                # ... but a stop asks again,
+            self.assertEqual(stops[0][:3], ["docker", "stop", "-t"])
+            self.assertEqual(service.container_state(), "stopped")        # and forgets
+        self.assertEqual(states, [])
+
+    def test_unload_inputs_is_the_container_and_its_health(self):
+        service = sp.Service()
+        with mock.patch.object(service, "container_state", return_value="stopped"), \
+                mock.patch.object(service, "health") as h:
+            self.assertEqual(service.unload_inputs(), (False, None))
+            h.assert_not_called()
+        with mock.patch.object(service, "container_state", return_value="running"), \
+                mock.patch.object(service, "health", return_value={"status": "ok"}):
+            self.assertEqual(service.unload_inputs(), (True, {"status": "ok"}))
+
+
 if __name__ == "__main__":
     unittest.main()
