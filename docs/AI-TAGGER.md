@@ -13,9 +13,9 @@ add a **third tagger** that is good on both real photos and illustration, or is 
 
 1. **No describer.** The `vlm` service/container, the VLM client, the prompt and the guards that existed for it are
    removed. The settings `describe`, `instructions`, `language` and `vlm_parallel` are removed (old settings files
-   holding them still load; sending them is refused like any unknown key). `vocabulary` keeps only its
-   `old -> new` renames; other lines are ignored. Reprocess modes are `retag` and `full` (a stored or requested
-   `describe` counts as `retag`).
+   holding them still load; sending them is refused like any unknown key). `vocabulary` holds renames and
+   combinations (`a + b -> c`, see "Renames and combinations" below; before it held only `old -> new` renames and
+   ignored other lines). Reprocess modes are `retag` and `full` (a stored or requested `describe` counts as `retag`).
 2. **Block format:** `[AI Tagger]\nTags: a, b, c\n[/AI Tagger]`, with no Description line. Results made with a
    Description line become outdated (settings version bump), and a `retag` rewrites them without the line.
 3. **Taggers are a registry.** There is an ordered list of tagger kinds (`wd`, `pixai`, `ram`: the third is RAM++,
@@ -295,6 +295,84 @@ generated keys, and `reprocessKeys` is `{retag: [...], full: [...]}`. The previe
 `models.rating`, `models.dropped` when the explicit-tag check removed tags, and no `vlm` or `description`. The web tab and
 the Android screen build their tagger switches and strictness sliders from `models` + `settings` + `limits` (the web tab
 also takes the reprocess mode of each setting from `reprocessKeys`).
+
+### Renames and combinations (the `vocabulary` text)
+
+The owner: "the how-to-tag section only lets you rename one tag to another; there are no instructions on how to do a
+combination of tags." The Rules card could (the web tab's "Rules", the Android screen's "Rules"), but sat apart and
+nobody found it. Now the same combinations can be typed in the Vocabulary box, one entry per line, and the two places are
+one feature: **form or text** (the card is titled "Combinations (form)", the box "Renames and combinations", and each says
+so). Nothing new is stored: it is all the existing `vocabulary` string (so it is already a `retag` setting, no new
+setting, nothing for `full`), whose limit is now 20,000 characters (was 4,000).
+
+| Line | Meaning |
+|---|---|
+| `old -> new` | rename: a single tag on both sides, no sign (`→` works as the arrow) |
+| `a + b -> c` | when the asset has a **and** b, add c |
+| `a \| b -> c` | when it has a **or** b, add c |
+| `a + !b -> c` | a and **not** b. `!` works on any tag of a `+` line (`!b + a`, `a + !b + !c`) |
+| `a + b -> c, -d` | several results, comma separated: `-tag` removes, `+tag` or a bare tag adds |
+| `a -> +b` | add b and **keep** a: one condition with an explicit sign is a rule, not a rename |
+| `# note`, blank line | ignored (but counted in line numbers). A `#` only starts a note at the start of a line |
+
+Examples: `1girl -> woman`, `furry with non-furry -> human on anthro` (WD's own tag, renamed), `furry + human -> human on
+anthro`, `anthro | furry -> furry art`, `1girl + 1boy -> couple, -solo`, `furry + !human -> furry only`.
+
+**Rules of the syntax.**
+- Tags are normalised as everywhere (`norm_tag`: lowercase, `_` is a space, one line, 60 characters), on both sides.
+  Write the tags as they are *after the renames* (renames happen first, see below).
+- `+` and `|` are operators only with a space on each side: `a + b`, not `a+b` (which is refused, with a message, rather
+  than read as a tag called `a+b`). Tags that contain the signs (`c++`, `+_+`, `^_^`) stay tags. A target that itself
+  starts with `+` or `-` needs a sign in front (`++_+` adds the tag `+_+`).
+- Mixing `+` and `|` on one left side is an error. `!` with `|` is an error too (`a | !b` cannot be said in the rule
+  shape; use `a + !b`). A left side needs at least one tag that must be present (not only `!tags`) and cannot require and
+  exclude the same tag.
+- A line is a rename only when the left side is one bare tag and the right side is one bare tag. Anything else is a
+  rule: `a -> b, c` adds b and c and keeps a; `a -> -b` removes b when a is there; `a -> +b` adds b. To replace a by two
+  tags write `a -> b, c, -a`. `a -> a` changes nothing and is ignored. Two renames of one tag: the later line wins; a
+  rename is one step (`a -> b` and `b -> c` do not chain).
+- No `!` on the right, no inline comments, at most 50 tags on each side (`MAX_RULE_TAGS`), one `->` per line.
+
+**How it runs.** A rename is applied while the tags are detected (before blocked, the explicit-tag check, the rating
+and every rule). Each other line becomes a rule in exactly the Rules card's shape,
+`{if_all, if_any, unless, add, remove}` (`+` fills `if_all`, `|` fills `if_any`, `!` fills `unless`), plus a `label`
+(`"line 3"`). `finalize` runs `settings["rules"]` (the card) followed by the typed rules, in the order written, through
+the one repeat-until-stable engine (`apply_rules`, at most `MAX_RULE_PASSES = 5` passes: a chain written backwards needs
+a pass per link). Added tags score 1.0 with source `rule`; `blocked` and the `max_tags` cap apply afterwards, as for the
+card.
+
+**Errors.** `Vocabulary(text)` reads forgivingly: a line it cannot use is skipped and listed in `errors`
+(`(line number, message)`), which keeps v2 vocabularies (preferred terms on lines without an arrow) working: loading
+the saved file never drops them. **Saving is strict**: `validate_setting("vocabulary", ...)` refuses with HTTP 400 and a
+message that names every bad line (the first five, then "N more lines have problems"), for example
+`Line 3: use + or |, not both; Line 5: there is nothing after ->`. The messages (after `Line N: `):
+
+| Message | When |
+|---|---|
+| `write it as "tags -> result", for example a + b -> c` | no arrow (a plain term, a typo like `>`) |
+| `only one -> per line` | two arrows |
+| `there is nothing before ->` / `there is nothing after ->` | an empty side (`a -> ,` counts as empty) |
+| `use + or \|, not both` | `+` and `\|` on one left side |
+| `! can't be used with \| (a + !b means 'a and not b')` | `!` on an `\|` line |
+| `it needs at least one tag that must be present, not only !tags` | `!a -> b` |
+| `a tag can't be both required and excluded` | `a + !a -> b` |
+| `put a tag on each side of + or \|, with spaces around it (a + b)` | `a+b`, `a +b`, `a + ->` |
+| `a tag is missing before or after + / \| / !` | `a + _ -> b`, `! -> b` |
+| `"-" needs a tag after it` / `"+" needs a tag after it` | `a + b -> -` |
+| `a tag is missing after ->` | a target that normalises to nothing |
+| `! only works on the left of -> (a + !b -> c)` | `a + b -> !c` |
+| `a tag can't be both added and removed` | `a + b -> c, -c` |
+| `at most 50 tags before ->` / `at most 50 tags after ->` | too long a side |
+
+**Preview.** The Test card's `rules` trace names a Rules-card rule by its number (the existing 0-based `rule` integer; the
+apps show "Rule N") and a typed rule by its line, `{"rule": "line 3", "added": [...], "removed": [...]}`. The apps show
+"Line 3 (the saved text of that line): added ..., removed ...". Card rules come first in the trace, then typed lines in the
+order written; a rule that changed nothing is not listed.
+
+**Screens.** Web: the "Vocabulary" textarea is "Renames and combinations", with a collapsible "Syntax and examples" under
+it (open by default); the Rules card is "Combinations (form)", directly after the "How to tag" card, each pointing at the
+other. Android: the same label and cheat-sheet in the "Tags" card, and the "Combinations (form)" card right after it
+(before "Taggers"). The web service worker `CACHE` was bumped for it.
 
 ## v2 (2026-10-02) — superseded by v3 where they differ
 

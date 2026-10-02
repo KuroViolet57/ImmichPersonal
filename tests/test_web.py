@@ -1439,6 +1439,41 @@ class TestAiTagger(WebCase):
         data = self.post("settings", {"changes": {"ram_strictness": 0.6}})
         self.assertEqual((data["changed"], data["suggest"]), (["ram_strictness"], "retag"))
 
+    def test_the_vocabulary_takes_combinations_and_refuses_unreadable_lines_with_the_line_number(self):
+        text = "# renames and combinations\n1girl -> woman\nfurry + human -> human on anthro\nanthro | furry -> furry art\n" \
+               "1girl + 1boy -> couple, -solo\na + !b -> c\na -> +b"
+        data = self.post("settings", {"changes": {"vocabulary": text}})
+        self.assertEqual(data["settings"]["vocabulary"], text)                       # kept as typed
+        self.assertEqual((data["changed"], data["suggest"]), (["vocabulary"], "retag"))
+        self.assertEqual(data["settingsVersion"], 2)
+        for bad, message in [("1girl -> woman\na + b | c -> d", "Line 2: use + or |, not both"),
+                             ("# note\n\nthe lake house", 'Line 3: write it as "tags -> result"'),
+                             ("a | !b -> c", "Line 1: ! can't be used with |"),
+                             ("x -> y\nz + -> w", "Line 2: put a tag on each side of + or |"),
+                             ("a + b -> c, -c", "Line 1: a tag can't be both added and removed"),
+                             ("a ->", "Line 1: there is nothing after ->")]:
+            self.assertIn(message, self.refused(lambda: self.post("settings", {"changes": {"vocabulary": bad}}), 400))
+        message = self.refused(lambda: self.post("settings", {"changes": {"vocabulary": "a | b + c -> d\nok -> fine\nnonsense"}}), 400)
+        self.assertIn("Line 1: use + or |, not both", message)
+        self.assertIn("Line 3: ", message)                                           # every bad line is named
+        self.assertIn("at most 20000", self.refused(
+            lambda: self.post("settings", {"changes": {"vocabulary": "# " + "x" * 20000}}), 400))
+        data = self.get("/api/aitagger")
+        self.assertEqual((data["settings"]["vocabulary"], data["settingsVersion"]), (text, 2))           # refused: nothing saved
+        self.assertEqual(self.get("/api/aitagger")["settings"]["vocabulary"], text)
+
+    def test_the_preview_trace_names_typed_combinations_by_line(self):
+        self.post("settings", {"changes": {"rules": [{"if_all": ["girl"], "add": ["happy"]}],
+                                           "vocabulary": "# summer\ngirl + beach -> summer, -solo\ndog | cat -> pet"}})
+        data = self.post("preview", {"id": self.ids[0]})
+        self.assertEqual(data["rules"], [{"rule": 0, "added": ["happy"], "removed": []},
+                                         {"rule": "line 2", "added": ["summer"], "removed": ["solo"]}])
+        tags = {t["tag"]: t["source"] for t in data["tags"]}
+        self.assertEqual((tags["summer"], tags["happy"]), ("rule", "rule"))
+        self.assertNotIn("solo", tags)
+        self.assertNotIn("pet", tags)
+        self.assertEqual(self.description(0), "")                                    # a preview writes nothing
+
     def test_settings_can_reprocess_the_old_results(self):
         self.build(pause=True)
         data = self.post("settings", {"changes": {"max_tags": 5}, "reprocess": "retag", "scope": "outdated"})

@@ -220,6 +220,154 @@ class TestNames(unittest.TestCase):
         self.assertEqual(at.Vocabulary("").renames, {})
 
 
+def combos(text: str, **settings) -> dict:
+    """The tags that ``at.build`` leaves for PHOTO-like scores when the vocabulary is ``text``."""
+    return at.build(raw_of(settings.pop("picture", PHOTO)), S(vocabulary=text, **settings))
+
+
+class TestVocabularySyntax(unittest.TestCase):
+    """The text of the Vocabulary setting: renames and combinations (``a + b -> c``), one entry per line."""
+
+    def parse(self, text):
+        v = at.Vocabulary(text)
+        self.assertEqual(v.errors, [], v.problems())
+        return v
+
+    def only_rule(self, text):
+        rules = self.parse(text).rules
+        self.assertEqual(len(rules), 1, text)
+        return {k: v for k, v in rules[0].items() if k != "label"}
+
+    def error_of(self, text):
+        v = at.Vocabulary(text)
+        self.assertEqual(len(v.errors), 1, (text, v.errors))
+        return v.errors[0]
+
+    def test_a_plain_arrow_is_a_rename(self):
+        v = self.parse("1girl -> girl\nlong hair -> hair long\nrating: general -> safe")
+        self.assertEqual(v.renames, {"1girl": "girl", "long hair": "hair long", "rating: general": "safe"})
+        self.assertEqual(v.rules, [])
+        self.assertEqual(self.parse("a → b").renames, {"a": "b"})                  # the arrow character works too
+        self.assertEqual(self.parse("a->b").renames, {"a": "b"})                    # no spaces around the arrow
+        self.assertEqual(self.parse("a -> a\nb -> b").renames, {})                  # a rename to itself changes nothing
+
+    def test_and(self):
+        self.assertEqual(self.only_rule("a + b -> c"),
+                         rule(if_all=["a", "b"], add=["c"]))
+        self.assertEqual(self.only_rule("a + b + c -> d"), rule(if_all=["a", "b", "c"], add=["d"]))
+        self.assertEqual(self.parse("a + b -> c").renames, {})
+
+    def test_or(self):
+        self.assertEqual(self.only_rule("a | b -> c"), rule(if_any=["a", "b"], add=["c"]))
+        self.assertEqual(self.only_rule("a | b | c -> d"), rule(if_any=["a", "b", "c"], add=["d"]))
+        self.assertEqual(self.only_rule("a | a -> b"), rule(if_any=["a"], add=["b"]))
+
+    def test_not(self):
+        self.assertEqual(self.only_rule("a + !b -> c"), rule(if_all=["a"], unless=["b"], add=["c"]))
+        self.assertEqual(self.only_rule("!b + a -> c"), rule(if_all=["a"], unless=["b"], add=["c"]))     # any position
+        self.assertEqual(self.only_rule("a + !b + !c + d -> e"),
+                         rule(if_all=["a", "d"], unless=["b", "c"], add=["e"]))
+        self.assertEqual(self.only_rule("a + ! b -> c"), rule(if_all=["a"], unless=["b"], add=["c"]))   # a space after ! is fine
+
+    def test_the_right_side_has_several_targets(self):
+        self.assertEqual(self.only_rule("a + b -> c, -d"), rule(if_all=["a", "b"], add=["c"], remove=["d"]))
+        self.assertEqual(self.only_rule("a + b -> -d, +c, e"), rule(if_all=["a", "b"], add=["c", "e"], remove=["d"]))
+        self.assertEqual(self.only_rule("a | b -> - d , + c"), rule(if_any=["a", "b"], add=["c"], remove=["d"]))
+        self.assertEqual(self.only_rule("a + b -> c, c, +c"), rule(if_all=["a", "b"], add=["c"]))        # no repeats
+        self.assertEqual(self.only_rule("a + b -> c,"), rule(if_all=["a", "b"], add=["c"]))              # an empty piece is skipped
+
+    def test_one_condition_with_a_sign_or_several_results_is_a_rule_not_a_rename(self):
+        v = self.parse("a -> +b")
+        self.assertEqual(v.renames, {})                                              # a is kept
+        self.assertEqual(v.rules, [{**rule(if_all=["a"], add=["b"]), "label": "line 1"}])
+        self.assertEqual(self.only_rule("a -> -b"), rule(if_all=["a"], remove=["b"]))
+        self.assertEqual(self.only_rule("a -> b, c"), rule(if_all=["a"], add=["b", "c"]))
+        self.assertEqual(self.only_rule("a -> b, -a"), rule(if_all=["a"], add=["b"], remove=["a"]))     # the long way to rename
+        self.assertEqual(self.only_rule("a -> +a_b"), rule(if_all=["a"], add=["a b"]))
+        self.assertEqual(self.parse("a -> b").renames, {"a": "b"})                  # and the plain form is the rename
+        self.assertEqual(self.parse("a -> b").rules, [])
+        v = self.parse("a -> b\na -> +c")                                           # both on one tag
+        self.assertEqual((v.renames, [r["add"] for r in v.rules]), ({"a": "b"}, [["c"]]))
+
+    def test_blank_lines_and_comments_are_ignored_and_lines_are_counted_anyway(self):
+        v = self.parse("# my tags\n\n   \n  # indented note -> still a note\na + b -> c\r\n\r\n# end\nd -> e")
+        self.assertEqual(v.renames, {"d": "e"})
+        self.assertEqual([r["label"] for r in v.rules], ["line 5"])                  # CRLF is one break; blanks count
+        self.assertEqual(at.Vocabulary("").rules, [])
+        self.assertEqual(at.Vocabulary(None).renames, {})
+
+    def test_tags_are_normalised_like_everywhere_else(self):
+        self.assertEqual(self.only_rule("Long_Hair + Hatsune_Miku_(Vocaloid) -> Two_Girls, -SOLO"),
+                         rule(if_all=["long hair", "hatsune miku (vocaloid)"], add=["two girls"], remove=["solo"]))
+        self.assertEqual(self.only_rule("  A   B +  !C_D  ->   E  "), rule(if_all=["a b"], unless=["c d"], add=["e"]))
+        self.assertEqual(self.parse("1Girl -> Woman_").renames, {"1girl": "woman"})
+        self.assertEqual(self.only_rule("a + a -> b"), rule(if_all=["a"], add=["b"]))              # the same tag twice
+
+    def test_tags_that_contain_signs_are_not_operators(self):
+        self.assertEqual(self.only_rule("c++ + x -> y"), rule(if_all=["c++", "x"], add=["y"]))
+        self.assertEqual(self.only_rule("+_+ | ^_^ -> eyes"), rule(if_any=["+ +", "^ ^"], add=["eyes"]))
+        self.assertEqual(self.parse("non-furry -> human").renames, {"non-furry": "human"})
+        self.assertEqual(self.parse("furry with non-furry -> human on anthro").renames,
+                         {"furry with non-furry": "human on anthro"})
+        self.assertEqual(self.only_rule("a -> ++_+"), rule(if_all=["a"], add=["+ +"]))            # a tag that starts with a sign
+
+    def test_the_rules_carry_the_line_they_came_from(self):
+        v = self.parse("a -> b\n# note\nx + y -> z\n\nx | y -> w")
+        self.assertEqual([r["label"] for r in v.rules], ["line 3", "line 5"])
+
+    def test_every_kind_of_mistake_names_its_line_and_the_problem(self):
+        for text, problem in [
+                ("a + b | c -> d", "use + or |, not both"),
+                ("a | b + c -> d", "use + or |, not both"),
+                ("a + !b | c -> d", "use + or |, not both"),
+                ("a | !b -> c", "! can't be used with |"),
+                ("!a -> b", "at least one tag that must be present"),
+                ("!a + !b -> c", "at least one tag that must be present"),
+                ("a + !a -> b", "both required and excluded"),
+                ("just a term", 'write it as "tags -> result"'),
+                ("a + b", 'write it as "tags -> result"'),
+                ("a -> b -> c", "only one ->"),
+                ("a -> b → c", "only one ->"),
+                ("-> b", "nothing before ->"),
+                ("a ->", "nothing after ->"),
+                ("a -> ,", "nothing after ->"),
+                ("a + b -> -", "needs a tag after it"),
+                ("a + b -> c, +", "needs a tag after it"),
+                ("a + b -> c, -c", "both added and removed"),
+                ("a + b -> c, -c, d", "both added and removed"),
+                ("a + b -> !c", "! only works on the left"),
+                ("a+b -> c", "spaces around it"),
+                ("a|b -> c", "spaces around it"),
+                ("a +b -> c", "spaces around it"),
+                ("a | b+c -> d", "spaces around it"),
+                ("a + -> c", "spaces around it"),
+                ("+ b -> c", "spaces around it"),
+                ("a + _ -> b", "a tag is missing"),
+                ("! -> b", "a tag is missing"),
+                (" + ".join(f"t{i}" for i in range(51)) + " -> x", "at most 50 tags before"),
+                ("x -> " + ", ".join(f"t{i}" for i in range(51)), "at most 50 tags after"),
+        ]:
+            with self.subTest(text=text):
+                number, message = self.error_of("# first\n\n" + text)
+                self.assertEqual(number, 3)                                           # blank and comment lines count
+                self.assertIn(problem, message)
+
+    def test_the_message_for_the_person_names_the_lines(self):
+        v = at.Vocabulary("ok -> fine\na + b | c -> d\nx -> y\nnonsense\na ->")
+        self.assertEqual(v.problems(), 'Line 2: use + or |, not both; Line 4: write it as "tags -> result", for example '
+                                       'a + b -> c; Line 5: there is nothing after ->')
+        self.assertEqual(at.Vocabulary("a + b -> c").problems(), "")
+        many = at.Vocabulary("\n".join(f"bad {i}" for i in range(8))).problems()
+        self.assertTrue(many.startswith("Line 1: ") and "Line 5: " in many and "Line 6" not in many)
+        self.assertTrue(many.endswith("3 more lines have problems"))
+
+    def test_reading_skips_a_bad_line_and_keeps_the_good_ones(self):
+        v = at.Vocabulary("1girl -> girl\nthe lake house\na + b | c -> d\nx + y -> z")
+        self.assertEqual(v.renames, {"1girl": "girl"})
+        self.assertEqual([(r["add"], r["label"]) for r in v.rules], [(["z"], "line 4")])
+        self.assertEqual([n for n, _ in v.errors], [2, 3])
+
+
 class TestSettings(Base):
     def test_defaults_match_the_contract(self):
         s = at.load_settings()
@@ -241,7 +389,7 @@ class TestSettings(Base):
                          ("wd_strictness", True), ("wd_strictness", float("nan")), ("pixai_strictness", None),
                          ("use_ram", "true"), ("use_ram", 1), ("ram_strictness", "0.5"), ("ram_strictness", True),
                          ("ram_strictness", float("inf")),
-                         ("vocabulary", 5), ("vocabulary", "x" * 4001), ("vocabulary", ["a"]), ("blocked", "cat"),
+                         ("vocabulary", 5), ("vocabulary", "a -> b\n" * 3000), ("vocabulary", ["a"]), ("blocked", "cat"),
                          ("blocked", [1]), ("rules", {}), ("nope", 1)]:
             with self.assertRaises(ValueError, msg=f"{key}={bad!r}"):
                 at.save_settings({key: bad}, self.store)
@@ -314,6 +462,53 @@ class TestSettings(Base):
             with self.assertRaises(ValueError) as ctx:
                 at.save_settings({"rules": bad}, self.store)
             self.assertIn(text, str(ctx.exception))
+
+    def test_the_vocabulary_is_checked_line_by_line_when_it_is_saved(self):
+        good = ("# my tags\n1girl -> woman\nfurry + human -> human on anthro\nanthro | furry -> furry art\n\n"
+                "1girl + 1boy -> couple, -solo\na + !b -> c\na -> +b")
+        s = at.save_settings({"vocabulary": good + "\r\nx -> y"}, self.store)
+        self.assertEqual(s["vocabulary"], good + "\nx -> y")                  # kept as typed: comments and all
+        self.assertEqual(at.load_settings()["vocabulary"], s["vocabulary"])
+        version = self.store.settings_version
+        for bad, message in [("a + b | c -> d", "Line 1: use + or |, not both"),
+                             ("ok -> fine\n\n# note\nx + -> y", "Line 4: put a tag on each side of + or |"),
+                             ("a -> b\nthe lake house", 'Line 2: write it as "tags -> result"'),
+                             ("a + b -> c, -c", "Line 1: a tag can't be both added and removed"),
+                             ("!a -> b", "Line 1: it needs at least one tag that must be present")]:
+            with self.assertRaises(ValueError, msg=bad) as ctx:
+                at.save_settings({"vocabulary": bad, "max_tags": 7}, self.store)
+            self.assertIn(message, str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:                                  # every bad line is named
+            at.save_settings({"vocabulary": "a | b + c -> d\nfine -> ok\nnonsense\na ->"}, self.store)
+        self.assertEqual(str(ctx.exception).count("Line "), 3)
+        for number in ("Line 1: ", "Line 3: ", "Line 4: "):
+            self.assertIn(number, str(ctx.exception))
+        self.assertEqual(at.load_settings()["vocabulary"], s["vocabulary"])        # nothing was saved, not even max_tags
+        self.assertEqual((at.load_settings()["max_tags"], self.store.settings_version), (30, version))
+
+    def test_the_vocabulary_may_be_long(self):
+        text = "\n".join(f"tag {i} + other {i} -> result {i}" for i in range(500))
+        self.assertGreater(len(text), 4000)                                         # the old limit
+        self.assertLessEqual(len(text), at.TEXT_LIMITS["vocabulary"])
+        self.assertEqual(at.save_settings({"vocabulary": text}, self.store)["vocabulary"], text)
+        self.assertEqual(at.TEXT_LIMITS["vocabulary"], 20000)
+        with self.assertRaises(ValueError) as ctx:
+            at.save_settings({"vocabulary": "# " + "x" * 20000}, self.store)
+        self.assertIn("at most 20000 characters", str(ctx.exception))
+
+    def test_a_saved_vocabulary_with_unreadable_lines_is_kept_when_loaded(self):
+        # the v2 vocabulary had preferred terms on lines without an arrow: it still loads as it was (those lines are
+        # skipped when tags are made); only saving it again is refused, with the line number
+        at.settings_path().write_text(json.dumps({"vocabulary": "1girl -> woman\nthe lake house\na + b | c -> d"}))
+        s = at.load_settings()
+        self.assertEqual(s["vocabulary"], "1girl -> woman\nthe lake house\na + b | c -> d")
+        with self.assertRaises(ValueError) as ctx:
+            at.save_settings({"vocabulary": s["vocabulary"]}, self.store)
+        self.assertIn("Line 2: ", str(ctx.exception))
+        self.assertIn("Line 3: use + or |, not both", str(ctx.exception))
+        self.assertEqual(at.save_settings({"max_tags": 9}, self.store)["vocabulary"], s["vocabulary"])    # other saves are fine
+        at.settings_path().write_text(json.dumps({"vocabulary": 5, "max_tags": 9}))
+        self.assertEqual(at.load_settings()["vocabulary"], "")                      # a wrong type is still the default
 
     def test_a_hand_edited_bad_value_falls_back_to_the_default(self):
         at.settings_path().write_text(json.dumps({"max_tags": 9999, "use_wd": "no", "video_frames": 3, "zzz": 1}))
@@ -761,6 +956,124 @@ class TestRules(unittest.TestCase):
     def test_a_removed_tag_stays_removed_for_later_rules_in_the_pass(self):
         r = [rule(if_all=["girl"], remove=["girl"], add=["woman"]), rule(if_all=["girl"], add=["never"])]
         self.assertEqual(self.run_rules(r, "girl")[0], ["woman"])
+
+    def test_a_rule_with_a_label_is_named_by_it_in_the_trace(self):
+        r = [rule(if_all=["a"], add=["b"]), {**rule(if_all=["b"], add=["c"]), "label": "line 7"}]
+        _, fired, _ = self.run_rules(r, "a")
+        self.assertEqual(fired, [{"rule": 0, "added": ["b"], "removed": []}, {"rule": "line 7", "added": ["c"], "removed": []}])
+
+
+# ---------------------------------------------------------------- combinations typed in the vocabulary
+
+class TestVocabularyCombinations(unittest.TestCase):
+    """``a + b -> c`` lines make rules that run after the Rules card's, in the order written, in the same engine."""
+
+    def names(self, text, **settings):
+        return tags_of(combos(text, **settings))
+
+    def test_and(self):
+        self.assertIn("summer", self.names("girl + beach -> summer"))
+        self.assertNotIn("summer", self.names("girl + dog -> summer"))                   # one of the two is missing
+        self.assertNotIn("summer", self.names("dog + girl -> summer"))
+
+    def test_or(self):
+        self.assertIn("shore", self.names("dog | beach -> shore"))
+        self.assertIn("shore", self.names("beach | sea -> shore"))
+        self.assertNotIn("shore", self.names("dog | cat -> shore"))
+
+    def test_not(self):
+        self.assertIn("day", self.names("girl + !night -> day"))
+        self.assertNotIn("day", self.names("girl + !beach -> day"))                      # beach is there
+        self.assertNotIn("day", self.names("girl + !beach + !night -> day"))
+        self.assertIn("day", self.names("!night + girl + !dog -> day"))
+
+    def test_add_and_remove(self):
+        got = self.names("girl + solo -> couple, -solo, +duo")
+        self.assertTrue({"couple", "duo"} <= set(got) and "solo" not in got)
+        self.assertNotIn("solo", self.names("girl -> -solo"))
+        self.assertIn("girl", self.names("girl -> -solo"))
+
+    def test_a_rule_adds_with_score_1_and_the_source_rule(self):
+        by = {t["tag"]: t for t in combos("girl + beach -> summer")["tags"]}
+        self.assertEqual(by["summer"], {"tag": "summer", "score": 1.0, "source": "rule"})
+
+    def test_a_plus_before_the_target_keeps_the_tag_and_a_plain_arrow_renames(self):
+        kept = self.names("girl -> +woman")
+        self.assertTrue({"girl", "woman"} <= set(kept))
+        renamed = self.names("girl -> woman")
+        self.assertIn("woman", renamed)
+        self.assertNotIn("girl", renamed)
+
+    def test_renames_happen_before_the_rules_see_the_tags(self):
+        pic = "wd:1girl=0.9,beach=0.8|rating:general=0.9"
+        got = combos("1girl -> girl\ngirl + beach -> summer\n1girl + beach -> never", picture=pic)
+        names = tags_of(got)
+        self.assertIn("summer", names)                         # the rule saw the renamed tag
+        self.assertNotIn("never", names)                       # ... and not the name it had before
+        self.assertNotIn("1girl", names)
+        self.assertEqual(got["rules"], [{"rule": "line 2", "added": ["summer"], "removed": []}])
+        # a combination can name a tag that only a rename produces, whatever the order of the lines
+        self.assertIn("summer", tags_of(combos("girl + beach -> summer\n1girl -> girl", picture=pic)))
+
+    def test_a_combination_runs_on_the_tags_before_the_cap_and_blocked_still_wins(self):
+        got = combos("girl -> +cat, +dog", blocked=["cat"])
+        self.assertIn("dog", tags_of(got))
+        self.assertNotIn("cat", tags_of(got))                                            # added by the line, blocked afterwards
+        self.assertEqual(got["rules"], [{"rule": "line 1", "added": ["cat", "dog"], "removed": []}])
+        got = combos("girl -> +zzz", max_tags=5)                                           # 5 = 4 tags + the rating
+        self.assertEqual(len(got["tags"]), 5)
+        self.assertEqual(tags_of(got)[-1], "rating: general")
+        self.assertIn("zzz", tags_of(got))                                                # its score 1.0 is the best
+
+    def test_the_text_rules_run_after_the_card_rules(self):
+        # the card's rule takes `girl` away first, so the line that needs it never fires
+        card = [rule(if_all=["girl"], remove=["girl"], add=["woman"])]
+        got = combos("girl -> +never", rules=card)
+        self.assertNotIn("never", tags_of(got))
+        self.assertEqual(got["rules"], [{"rule": 0, "added": ["woman"], "removed": ["girl"]}])
+        self.assertIn("never", tags_of(combos("girl -> +never")))                       # without the card rule it does fire
+        # ... and the line sees what the card's rule added, in the same pass
+        got = combos("happy + beach -> party", rules=[rule(if_all=["girl"], add=["happy"])])
+        self.assertIn("party", tags_of(got))
+        self.assertEqual([r["rule"] for r in got["rules"]], [0, "line 1"])               # card first, then the line
+
+    def test_the_text_rules_run_in_the_order_written(self):
+        got = combos("# one\ngirl -> +a\n\nbeach -> +b\nsolo -> -hat, +c")
+        self.assertEqual([r["rule"] for r in got["rules"]], ["line 2", "line 4", "line 5"])
+        # order changes the outcome when rules disagree: the first line removes what the second needs
+        gone = combos("girl -> -beach\nbeach -> +never")
+        self.assertNotIn("never", tags_of(gone))
+        there = combos("beach -> +never\ngirl -> -beach")
+        self.assertIn("never", tags_of(there))
+
+    def test_rules_repeat_until_nothing_changes_across_cards_and_text(self):
+        # written backwards, so each line needs the next pass; the card's rule needs what the lines add
+        got = combos("z -> +end\ny -> +z\ngirl -> +y", rules=[rule(if_all=["end"], add=["done"])])
+        names = tags_of(got)
+        self.assertTrue({"y", "z", "end", "done"} <= set(names))
+        self.assertEqual([r["rule"] for r in got["rules"]], [0, "line 1", "line 2", "line 3"])
+        # a loop of lines that undo each other still stops (the same five passes as the card's rules)
+        flip = combos("girl -> +b, -girl\nb -> +girl, -b")
+        self.assertTrue(flip["rules"])
+        self.assertEqual(len([n for n in tags_of(flip) if n in ("girl", "b")]), 1)
+
+    def test_a_line_that_changes_nothing_is_not_reported(self):
+        self.assertEqual(combos("girl -> +girl\nbeach -> -nothing here")["rules"], [])
+
+    def test_the_trace_names_a_typed_rule_by_its_line_and_a_card_rule_by_its_number(self):
+        got = combos("# note\n\ngirl + beach -> summer\ndog | cat -> pet", rules=[rule(if_all=["girl"], add=["happy"])])
+        self.assertEqual(got["rules"], [{"rule": 0, "added": ["happy"], "removed": []},
+                                        {"rule": "line 3", "added": ["summer"], "removed": []}])    # the dog line never fired
+
+    def test_a_line_that_cannot_be_read_is_skipped_when_tags_are_made(self):
+        got = combos("the lake house\ngirl + beach | sea -> nope\ngirl + beach -> summer")        # as a v2 vocabulary may have
+        self.assertIn("summer", tags_of(got))
+        self.assertNotIn("nope", tags_of(got))
+        self.assertEqual(got["rules"], [{"rule": "line 3", "added": ["summer"], "removed": []}])
+
+    def test_no_vocabulary_changes_nothing(self):
+        self.assertEqual(tags_of(combos("")), tags_of(at.build(raw_of(PHOTO), S())))
+        self.assertEqual(combos("# only a note\n\n")["rules"], [])
 
 
 # ---------------------------------------------------------------- the explicit-tag check, the final list
@@ -2618,6 +2931,17 @@ class TestReprocess(Base):
         self.assertEqual(self.services.tag_calls, [])                         # the stored scores are enough
         self.assertEqual(self.description(0), "[AI Tagger]\nTags: woman, beach, miku, solo, sea, rating: general\n[/AI Tagger]")
 
+    def test_typed_combinations_are_a_retag_too(self):
+        text = "# my combinations\ngirl + beach -> summer, -solo\n1girl -> woman"
+        self.assertEqual(self.set(vocabulary=text), ["vocabulary"])
+        self.assertEqual(self.store.counts()["outdated"], 3)                   # the tagged assets were made without it
+        self.assertEqual(at.reprocess(self.store, "outdated", "retag"), 3)
+        self.run_indexer()
+        self.assertEqual(self.services.tag_calls, [])                            # the stored scores are enough, no GPU
+        self.assertEqual(self.description(0),
+                         "[AI Tagger]\nTags: summer, girl, beach, miku, sea, rating: general\n[/AI Tagger]")   # solo removed
+        self.assertEqual(self.store.counts()["outdated"], 0)
+
     def test_describe_is_handled_as_a_retag(self):
         self.set(blocked=["solo"])
         self.assertEqual(at.reprocess(self.store, "all", "describe"), 3)                 # what an old app asks for
@@ -2825,6 +3149,18 @@ class TestTestCard(Base):
         self.assertEqual(self.fake.asset_puts, [])
         self.assertEqual(self.services.ready_calls[0], {"tagger": True})
         self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram"]])
+
+    def test_the_trace_names_typed_combinations_by_line(self):
+        self.set(rules=[rule(if_all=["girl", "beach"], add=["summer"])],
+                 vocabulary="# combinations\nsea + beach -> seaside, -solo\nsea + !beach -> never\nglass | hat -> never")
+        got = self.indexer.test(self.ids[0])
+        self.assertEqual(got["rules"], [{"rule": 0, "added": ["summer"], "removed": []},          # the form's rule: its number
+                                        {"rule": "line 2", "added": ["seaside"], "removed": ["solo"]}])   # a typed one: its line
+        names = [t["tag"] for t in got["tags"]]
+        self.assertTrue({"summer", "seaside"} <= set(names))
+        self.assertNotIn("solo", names)
+        self.assertNotIn("never", names)
+        self.assertEqual(self.description(0), "")                                                 # still only a preview
 
     def test_apply_writes_and_remembers(self):
         got = self.indexer.test(self.ids[0], write=True)

@@ -681,12 +681,35 @@
     <div class="card" id="tg-how">
       <h2>How to tag</h2>
       <label class="field">
-        <span>Vocabulary</span>
-        <textarea id="tg-vocabulary" rows="4" maxlength="4000" spellcheck="false"
-          placeholder="1girl -> woman&#10;solo -> alone"></textarea>
-        <small>One rename per line: <code>old -&gt; new</code> renames a tag everywhere (for example
-          <code>1girl -&gt; woman</code>). Lines without an arrow are ignored.</small>
+        <span>Renames and combinations</span>
+        <textarea id="tg-vocabulary" rows="8" maxlength="20000" spellcheck="false"
+          placeholder="1girl -> woman&#10;furry + human -> human on anthro&#10;1girl + 1boy -> couple, -solo"></textarea>
       </label>
+      <details class="more tg-cheat" id="tg-cheat" open>
+        <summary>Syntax and examples</summary>
+        <p class="hint">One entry per line. What the photo has goes left of <code>-&gt;</code>, what to do goes right.
+          Use the tags as they are after the renames. A line starting with <code>#</code> is a note.</p>
+        <ul>
+          <li><code>old -&gt; new</code> renames a tag everywhere (one plain tag each side)</li>
+          <li><code>a + b -&gt; c</code> if it has a <b>and</b> b, add c</li>
+          <li><code>a | b -&gt; c</code> if it has a <b>or</b> b, add c</li>
+          <li><code>a + !b -&gt; c</code> a and <b>not</b> b (<code>!</code> goes with <code>+</code>, not <code>|</code>)</li>
+          <li><code>a + b -&gt; c, -d</code> several results: a bare tag or <code>+tag</code> adds, <code>-tag</code> removes</li>
+          <li><code>a -&gt; +b</code> add b and keep a (without the <code>+</code> it is a rename)</li>
+        </ul>
+        <p class="hint">Examples</p>
+        <ul>
+          <li><code>furry with non-furry -&gt; human on anthro</code> (rename one tag)</li>
+          <li><code>furry + human -&gt; human on anthro</code> (both tags)</li>
+          <li><code>anthro | furry -&gt; furry art</code> (either tag)</li>
+          <li><code>1girl + 1boy -&gt; couple, -solo</code> (add one tag, remove another)</li>
+          <li><code>furry + !human -&gt; furry only</code> (one tag but not the other)</li>
+        </ul>
+        <p class="hint">Typed combinations are the same feature as the form <b>Combinations (form)</b> below: type
+          them here or fill in the form. The form's run first, then these lines in the order written; all of them repeat
+          until nothing changes. Spaces around <code>+</code> and <code>|</code> are needed. A line that can't be read
+          is refused when you save, with its line number.</p>
+      </details>
       <label class="field">
         <span>Blocked tags (comma separated)</span>
         <input id="tg-blocked" type="text" placeholder="watermark, text, signature" autocomplete="off" spellcheck="false">
@@ -708,10 +731,12 @@
     </div>
 
     <div class="card" id="tg-rules-card">
-      <h2>Rules</h2>
-      <p class="hint">A rule adds or removes tags after the models have run. It fires when <b>all</b> of its “IF all of”
-        tags are there, at least one of its “IF any of” tags is there (if you list any), and none of its “UNLESS” tags
-        are. Rules run in order and repeat until nothing changes.</p>
+      <h2>Combinations (form)</h2>
+      <p class="hint">The same feature as the typed lines in “Renames and combinations” above (<code>a + b -&gt; c</code>):
+        fill in this form or type them there, whichever you like. The form's run first.</p>
+      <p class="hint">A combination (a rule) adds or removes tags after the models have run. It fires when <b>all</b> of its
+        “IF all of” tags are there, at least one of its “IF any of” tags is there (if you list any), and none of its
+        “UNLESS” tags are. They run in order and repeat until nothing changes.</p>
       <div id="tg-rules"></div>
       <div class="row row-gap">
         <button class="btn btn-quiet" id="tg-rule-add" type="button">+ Add rule</button>
