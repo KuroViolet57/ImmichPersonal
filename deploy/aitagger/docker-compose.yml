@@ -1,10 +1,8 @@
-# AI Tagger (experimental): two GPU containers the panel starts when it needs them.
-#   tagger  WD EVA02-Large Tagger v3 + PixAI Tagger v1.0 image taggers (immich_organizer/tagger_service.py)
-#   vlm     Qwen3.5-2B, text only, behind vLLM's OpenAI API; strings the tags into a description
-# Both stop by themselves / are stopped by the panel, freeing the GPU (restart is "no" on purpose).
+# AI Tagger (experimental): one GPU container the panel starts when it needs it.
+#   tagger  WD EVA02-Large Tagger v3 + PixAI Tagger v1.0 + RAM++ image taggers (immich_organizer/tagger_service.py)
+# It stops by itself / is stopped by the panel, freeing the GPU (restart is "no" on purpose).
 #   build once:  docker compose -p immich-aitagger -f deploy/aitagger/docker-compose.yml build tagger
-#   (the vlm image is pulled: docker compose -p immich-aitagger -f deploy/aitagger/docker-compose.yml pull vlm)
-# The model files (about 1.4 GB WD + 1.9 GB PixAI + 4.5 GB Qwen3.5-2B on first use) live in AITAGGER_CACHE
+# The model files (about 1.4 GB WD + 1.9 GB PixAI + 3.0 GB RAM++ on first use) live in AITAGGER_CACHE
 # (set it in deploy/aitagger/.env, see .env.example).
 name: immich-aitagger
 services:
@@ -21,66 +19,14 @@ services:
       - ${AITAGGER_CACHE:-~/vlm/models/aitagger}:/cache
       - ../../immich_organizer:/app:ro
     environment:
-      AITAGGER_VRAM_GB: ${AITAGGER_VRAM_GB:-5}      # memory cap for the tagger process (WD + PixAI together)
+      AITAGGER_VRAM_GB: ${AITAGGER_VRAM_GB:-5}      # memory cap for the tagger process (WD + PixAI + RAM++ together)
       AITAGGER_BATCH: ${AITAGGER_BATCH:-8}          # pictures per GPU micro-batch (speed does not depend on it; memory does)
       IDLE_EXIT_MINUTES: ${IDLE_EXIT_MINUTES:-20}   # the server exits after this long without a request (never mid-request)
       WD_MODEL: SmilingWolf/wd-eva02-large-tagger-v3
       PIXAI_MODEL: pixai-labs/pixai-tagger-v1.0     # the revision (commit) is pinned in tagger_service.py
+      RAM_MODEL: xinyu1205/recognize-anything-plus-model   # ditto; RAM++'s source files are pinned in the Dockerfile
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       HF_HUB_DISABLE_TELEMETRY: "1"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
-  vlm:
-    # vLLM 0.30.0 (2026-09-22, CUDA 13 build) is the current stable release and serves Qwen3.5 (hybrid
-    # Gated-DeltaNet text model) natively. Pinned so a pull never changes behaviour under you.
-    image: vllm/vllm-openai:v0.30.0
-    container_name: immich_aitagger_vlm
-    restart: "no"
-    ports:
-      - "127.0.0.1:11441:8000"
-    volumes:
-      - ${AITAGGER_CACHE:-~/vlm/models/aitagger}/hf:/root/.cache/huggingface
-      - ${AITAGGER_CACHE:-~/vlm/models/aitagger}/vllm:/root/.cache/vllm      # torch.compile cache: saves ~30 s per start
-    # vLLM shares memory between its processes; Docker's default 64 MB is too small. "host" is what the vLLM docs
-    # recommend; it only shares the IPC namespace.
-    ipc: host
-    environment:
-      HF_HUB_DISABLE_TELEMETRY: "1"
-    # The image's entrypoint is `vllm serve`, so the command starts with the model.
-    #   --language-model-only       text only: every multimodal limit is 0 (same as --limit-mm-per-prompt '{"image":0}'),
-    #                               so the vision tower is neither loaded nor profiled (weights: 3.6 GiB bf16)
-    #   --quantization fp8          linear layers are quantised to FP8 on load (Ada / RTX 4090 supports it): weights 2.4 GiB,
-    #                               ~30% faster at 8 requests in flight, a 4.5x larger KV cache for the same memory share, and
-    #                               answers as good as bf16's (measured, see docs/AI-TAGGER.md)
-    #   --gpu-memory-utilization    this container's share of the GPU's TOTAL memory (weights + activations + KV cache).
-    #                               0.22 leaves KV room for 32 requests in flight; 0.18 is the bare minimum to start
-    #   --max-model-len             a prompt (about 30 tags + instructions) and the answer are far below 4096 tokens
-    #   --max-num-batched-tokens    same as max-model-len; the default (16384) only costs activation memory
-    #   --max-num-seqs              concurrent requests; the panel's "parallel descriptions" setting
-    #   --default-chat-template-kwargs  thinking off even when a client forgets chat_template_kwargs.enable_thinking
-    command:
-      - Qwen/Qwen3.5-2B
-      - --served-model-name
-      - tagger-vlm
-      - --language-model-only
-      - --quantization
-      - fp8
-      - --gpu-memory-utilization
-      - ${AITAGGER_VLM_UTIL:-0.22}
-      - --max-model-len
-      - "4096"
-      - --max-num-batched-tokens
-      - "4096"
-      - --max-num-seqs
-      - ${AITAGGER_VLM_SEQS:-8}
-      - --default-chat-template-kwargs
-      - '{"enable_thinking":false}'
     deploy:
       resources:
         reservations:

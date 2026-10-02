@@ -18,8 +18,8 @@ add a **third tagger** that is good on both real photos and illustration, or is 
    `describe` counts as `retag`).
 2. **Block format:** `[AI Tagger]\nTags: a, b, c\n[/AI Tagger]`, with no Description line. Results made with a
    Description line become outdated (settings version bump), and a `retag` rewrites them without the line.
-3. **Taggers are a registry.** There is an ordered list of tagger kinds (`wd`, `pixai`, then the third, whose key
-   is chosen by the research). Each has `use_<key>` and `<key>_strictness` settings, a label, the categories it
+3. **Taggers are a registry.** There is an ordered list of tagger kinds (`wd`, `pixai`, `ram`: the third is RAM++,
+   item 4). Each has `use_<key>` and `<key>_strictness` settings, a label, the categories it
    contributes (general / character / copyright…), and whether it reports a rating. Everything that was hard-wired
    to two taggers loops over the registry:
    - detection and merging (highest score wins, `source` = that tagger's key)
@@ -27,11 +27,193 @@ add a **third tagger** that is good on both real photos and illustration, or is 
    - the status `models` labels, the preview's per-model lists, and the settings validation
    - **the explicit-tag check:** on a general/sensitive rating, a tag in `EXPLICIT_TAGS` is kept only when **at
      least two enabled taggers** found it. With a single tagger on, it is dropped.
-4. **The third tagger** runs in the same `tagger` container and `/tag` answer under its own key, with the same
-   calibration idea (0.5 = its recommended threshold) and `floor`. The research picks the model; its key, label,
-   categories and measured numbers are written here when it is integrated.
-5. **GPU:** only the `immich_aitagger` container. `vram_gb` stays the taggers' cap. Defaults and limits are
-   re-measured with three taggers.
+4. **The third tagger is RAM++ (Recognize Anything Plus Model), key `ram`**, in the same `tagger` container and
+   `/tag` answer, with the same calibration idea (0.5 = its recommended threshold), `floor`, per-picture errors,
+   VRAM cap, out-of-memory splitting and optional `models` field. It was chosen by testing JoyTag, RAM++ and the
+   WD EVA02 2026 "canary" on 53 real library pictures next to WD and PixAI (see "Third tagger: research and test"). In
+   short: it is the only candidate that adds many *correct* tags on real photographs and screenshots (objects, scenes,
+   food, "screenshot", "selfie", "poster") with few made-up ones, it costs 0.7 GB of VRAM and about 4.5 ms a picture, and
+   it names what the two Danbooru taggers have no word for. What it does **not** do: it adds nothing on illustration,
+   it reports no rating, and it cannot vote in the explicit-tag check (it has no sexual vocabulary). The registry
+   entry is `{"key": "ram", "label": "RAM++ (swin-large)", "categories": ["general"], "rating": false}`.
+5. **GPU:** only the `immich_aitagger` container. `vram_gb` stays the taggers' cap (`AITAGGER_VRAM_GB`). Re-measured
+   with three taggers: **default 5, limits 4-8** (it was 3-8: with three models a cap of 3 no longer loads, 3.5
+   does). The process uses 4.2 GB at a cap of 5 and 15 pictures/s. See "Measured (v3)".
+
+### Third tagger: RAM++ as built
+
+| | |
+|---|---|
+| Key | `ram` |
+| Label | panel: "RAM++ (swin-large)"; `/health` `models[].name`: `ram_plus_swin_large_14m` |
+| Model | Recognize Anything Plus Model (Huang, Zhang et al.; paper arXiv 2310.15200), Swin-L image encoder at 384 px + a label-embedding re-weighting + two cross-attention layers; 329M parameters; file `ram_plus_swin_large_14m.pth` (3.0 GB, it still holds the optimizer state; 0.66 GB on the GPU in fp16) |
+| Hugging Face | `xinyu1205/recognize-anything-plus-model`, revision `84d4aee3a0265c4e0df1f714f0572011d1bf2ec3` (2023-10-25, the repository's only revision), cached under `/cache/hub` like the others (`RAM_REVISION` overrides) |
+| Source files | the official `ram` package is not installed (it pins `timm==0.4.12`, `fairscale` and an old `transformers`). The image build fetches one pinned commit of https://github.com/xinyu1205/recognize-anything, `7cb804a8609e9f4b1a50b7f31436d2df40bb9481`, and keeps `swin_transformer.py`, `ram_tag_list.txt`, `ram_tag_list_threshold.txt` and the licence texts in `/opt/ram` (each file checked against its SHA-256); `tagger_service.py` holds the small tagging head. It was checked against the official code on real pictures in v1 (identical logits in fp32; the network code is unchanged). New dependency: `scipy==1.18.1` (imported at the top of the Swin source, not used for inference) |
+| Licence | Apache-2.0 (model card and repository; the Swin source inside is MIT, see its `NOTICE.txt`): free for personal self-hosted use |
+| Vocabulary | 4,585 plain-English tags (objects, scenes, actions, "screenshot", "selfie", "anime", "birthday cake"...), unique, no commas or slashes. Names have spaces, some capitals (`3D CG rendering`); the panel's normalisation lowercases them |
+| Categories | `general` only: no characters, no series, **no rating** |
+| Calibration | the model's own per-tag thresholds (`ram_tag_list_threshold.txt`: 0.45-1.0, mean 0.69; 10 tags have 1.0 and are never returned): `s' = sigmoid(logit(s) - logit(t))`, so **0.5 = the model's threshold**; `floor` as for the others (default 0.05, so the panel's `ram_strictness` 0.5 is the model's own operating point) |
+| Input | RGB (transparency flattened onto white), resized to 384 x 384 with bilinear interpolation, aspect ratio **not** kept (what the official transform does), ImageNet mean/std |
+| Precision | fp16 (`RAM_PRECISION`; bf16 and fp32 work). Over 240 library pictures fp16 differs from fp32 in 6 of 1,723 decisions at 0.5 (0.35%, largest score difference 0.007); bf16 in 19 (1.1%) |
+| Typical output | 7.2 tags >= 0.5 per picture over 240 library previews: 10.4 on the 70 that look like photographs, 5.9 on the 170 that do not (WD 25.9, PixAI 27.0) |
+
+`POST /tag` answers one more key per picture, with the same nesting as the others and no `rating`:
+```json
+{"results": [{"wd": {...}, "pixai": {...},
+              "ram": {"general": {"screenshot": 0.88, "text message": 0.62, "person": 0.55}}}, null],
+ "errors": [null, "cannot identify image file"], "tookMs": 412}
+```
+`"models"` accepts `"wd"`, `"pixai"` and `"ram"` in any mix (any other name is a 400 listing the three); `/health` has
+`effectiveBatch: {"wd": 8, "pixai": 4, "ram": 8}` and a third entry in `models`
+(`{"name": "ram_plus_swin_large_14m", "kind": "ram", "tags": 4585, "precision": "fp16", "loadedIn": 2.1}`). Environment:
+`RAM_MODEL`, `RAM_REVISION`, `RAM_PRECISION`, `RAM_CODE` (default `/opt/ram`).
+
+What the panel should know about it:
+- **Plain English next to Danbooru.** `man`, `woman`, `girl`, `person` say what `1boy`, `1girl`, `solo` say; the panel does
+  not merge them (different words), the owner can with `old -> new` renames. The rest is new: `screenshot` (WD and PixAI
+  only say `fake screenshot`), `selfie`, `text message`, `website`, `poster`, `qr code`, `calendar`, `pizza`, `paella`,
+  `stove`, `liquor`...
+- **Not in the explicit-tag check.** RAM++ has no sexual tag, so it can neither confirm nor remove one: the check stays
+  "both WD and PixAI found it", whether RAM++ is on or off. A third voter that did name such tags (JoyTag) was tested
+  and was worse, see below.
+- **A little noise at 0.5.** Over 240 previews, 7 words make 4.3% of its output without describing anything:
+  `image`, `catch`, `peak`, `miss`, `take`, `wear`, `label`. Put them in `blocked` (or ship them as default blocked
+  words); `stand`, `sit` and `lay` are true but vague.
+- It is by far the fastest of the three, so it never becomes the bottleneck.
+
+Changes to the service that came with it:
+- `MODEL_NAMES = ("wd", "pixai", "ram")`, in that order (also the order the models run in a request).
+- **A bug fixed in the out-of-memory splitting.** The retry used to run inside the `except` block, where the exception's
+  traceback still held the failed batch's tensors in GPU memory, so after one OOM even a single picture failed. It now
+  retries after the block. With two models this showed only at the edge of the cap; with three, before the warm-up
+  change below, it was the first thing that happened at a cap of 5 (every PixAI picture failed).
+- **Warm-up after all weights are loaded.** PixAI and RAM++ share PyTorch's memory cap, so each finds its largest
+  micro-batch only once both are in memory (before, PixAI warmed up first and its first real batch ran out of memory).
+- A cap that is too small now fails the load with `... AITAGGER_VRAM_GB=3 is too small for the three models: raise it`
+  in `/health` `error`.
+- `deploy/aitagger`: the `Dockerfile` adds `scipy` and the pinned RAM++ source files; `docker-compose.yml` has only the
+  `tagger` service (the `vlm` service and its environment, volumes and comments are gone); `.env.example` is updated;
+  `deploy/aitagger/bench.py` is the benchmark used below. The old `hf` and `vllm` model caches on disk are not deleted.
+  The image must be rebuilt (`docker compose ... build tagger`); the first start has nothing to download if
+  `/cache/hub` already holds RAM++ from v1.
+- `tests/test_tagger_service.py`: 20 tests that need no GPU (calibration, the answer keys, the request checks, the
+  per-picture errors, the OOM splitting including the retry-outside-the-exception regression).
+
+### Third tagger: research and test
+
+The owner's wish: a tagger that is good on real photos *and* illustration, or bigger, newer, more accurate. The library
+(~73k pictures, ~18k videos) is personal photos, screenshots and memes next to a lot of anime, MMD/3D and adult
+content; WD and PixAI are Danbooru-vocabulary anime taggers (on photos WD adds art-medium tags such as
+`traditional media` and `colored pencil (medium)`, and sexual tags on everyday pictures; PixAI has no photographic
+words). Every claim below was checked on the model cards, the repositories or the Hugging Face API on 2026-10-02.
+
+| Candidate | Vocabulary | Licence | Verdict |
+|---|---|---|---|
+| **RAM++**: https://huggingface.co/xinyu1205/recognize-anything-plus-model, https://github.com/xinyu1205/recognize-anything | 4,585 plain-English tags, trained on large-scale web image-text data (the paper: arXiv 2310.15200; +10.2 mAP over CLIP on OpenImages, +15.4 on ImageNet); per-tag thresholds shipped | Apache-2.0 | **Chosen.** Tested: 3.6 useful new tags per picture on the 36 non-illustration pictures, 16% of what it adds false; 232 pictures/s alone (model only); 1.0 GB loaded. Nothing for illustration; no rating |
+| JoyTag: https://huggingface.co/fancyfeast/joytag, https://github.com/fpgaminer/joytag | 5,813 Danbooru tags (no categories, no rating); ViT-B/16 448 px, 91.5M parameters; F1 0.578 at 0.4; trained on Danbooru 2021 (0.3% photographs) plus a small hand-tagged set | Apache-2.0 | Tested, not chosen. Marks 56 of the 70 photo-like pictures as photographs (`photo (medium)`, `real life`, `selfie`), names characters about as well as WD, 133 pictures/s. But of the tags it adds on non-illustration pictures only 36% are useful, 29% vague and 35% false, and it hallucinated `penis`, `fellatio`, `oral` on everyday pictures (screenshots, an old black-and-white photo): as a third voter it would have confirmed WD's false sexual tags |
+| WD EVA02 2026 canary: https://huggingface.co/ashen-sensored/wd-eva02-tagger-2026-canary | 16,473 Danbooru tags (WD v3's 10,861 + 5,999 new, data to 2026-05-18); EVA02-L 448 px, 0.3B; P=R threshold 0.6094, F1 0.5416 | Apache-2.0 | Tested, not chosen. Same vocabulary and the same photo habits as WD (`3d`, `realistic`; `implied nudity` on a meme); a better WD (no art-medium false tags on the 70 photo-like pictures, WD had 5), but only 0.5 new useful tags per picture. Worth swapping for WD later, not worth a third slot |
+| `animetimm/caformer_b36.pexelsv0-full`: https://huggingface.co/animetimm/caformer_b36.pexelsv0-full | 18,440 tags in 15 categories, trained on a Pexels photo set; CAFormer-B36 384 px | **GPL-3.0 and gated** (manual approval, contact details required; files answer 401 without a Hugging Face login) | Not testable here; a gated GPL download is not something to build a service on. 0 downloads, 1 like |
+| Camie Tagger v2: https://huggingface.co/Camais03/camie-tagger-v2 | 70,527 Danbooru-2024 tags, micro-F1 67.3%; ViT 143M | GPL-3.0 | Anime only (trained on Danbooru 2024): another WD, not a photo tagger |
+| DINOv3 booru tagger `lodestones/taggerine`: https://huggingface.co/lodestones/taggerine | 74,625 e621 + Danbooru tags; ViT-H/16+ (~1.1B parameters, 5.3 GB file) | Apache-2.0 on the card (the DINOv3 backbone has its own licence) | No recommended thresholds, a "proto" checkpoint, evaluated only on booru and furry art according to its card, and 5.3 GB of weights is far over "a few GB" |
+| `cella110n/cl_tagger_v2`: https://huggingface.co/cella110n/cl_tagger_v2 | Danbooru-style | "other", gated (auto-approval after login) | Needs a login and a custom licence; anime |
+| `sorryhyun/anima-tagger`: https://huggingface.co/sorryhyun/anima-tagger | 2,532 anime tags | MIT, but it loads the gated GPL `animetimm` backbone | Anime only, gated backbone |
+
+Nothing newer than RAM++ (2023) that tags photographs *and* illustration with per-tag scores, an open licence, an
+ungated download and a loader that runs on torch 2.14 turned up in searches of the Hugging Face model API (tagger,
+photo tagger, booru, recognize anything, ram, pexels, SigLIP / DINOv3 / OpenImages taggers, WD and JoyTag
+derivatives) and of the web. SmilingWolf's last tagger is from July 2024, JoyTag's model from March 2024; the RAM++
+repository's last push is 2025-02-18. The PixAI v1.0 already in the service (2026-09) is the newest anime tagger.
+
+**How it was tested.** 240 random Immich preview JPEGs (read-only copies in a temp folder, deleted afterwards) went
+through WD and PixAI (the service's own code), JoyTag (the repository's ONNX, fp32; its logits match the repository's
+PyTorch model: 68 decisions of 308,089 differ), RAM++ (the code above) and the canary (timm, fp16, BGR input as WD),
+all calibrated to their recommended thresholds. 53 of them were picked by looking: 21 real photographs (people, food,
+places, objects), 9 screenshots/documents, 6 memes, 17 anime/illustration/3D. For the 36 that are not
+illustration, every tag a candidate gave at >= 0.5 that neither WD nor PixAI gave was judged by eye as *useful* (right
+and informative), *vague* (right but trivial or a repeat, such as `person` next to `1boy`) or *false*:
+
+| added to what WD + PixAI already say, on the 36 | tags | useful | vague | false | useful per picture |
+|---|---|---|---|---|---|
+| **RAM++** | 282 | **131 (46%)** | 107 (38%) | 44 (16%) | **3.6** |
+| JoyTag | 173 | 63 (36%) | 50 (29%) | 60 (35%) | 1.8 |
+| WD canary | 64 | 17 (27%) | 21 (33%) | 26 (41%) | 0.5 |
+
+(Hand-judged, one reader, so read it as a ranking, not as exact percentages.) On the 17 illustrations RAM++ says
+`girl`, `anime`, `illustration` and little else; JoyTag and the canary tag them like WD and PixAI do (JoyTag names
+characters and series: Uraraka Ochako, Hatsune Miku, Mankanshoku Mako, Taimanin), so neither adds much there.
+
+Examples (calibrated >= 0.5, abbreviated):
+
+| picture | WD / PixAI already | RAM++ adds | JoyTag |
+|---|---|---|---|
+| a pot of tomato stew being stirred on a stove (video frame) | kitchen, cooking pot, stove, tile wall, curry, spoon; WD also `chopsticks`, `soy sauce`, `1girl` | **stew, tomato sauce, tomato, stir, cook, kitchenware, kitchen counter, cooker, mixture** (one wrong: `blender`) | `1boy, 1girl, screencap, solo, male focus` |
+| a plate of paella with prawns and a scallop | WD `shrimp tempura`, `fried chicken`; PixAI `lobster`, `fried rice`, `fate (series)` | **paella, seafood, scallop, silverware, dinning table** (the tag's own spelling), **platter** | `food, fork, plate`, and `ice cube` (wrong) |
+| a Licor 43 poster (bottle, cocktail glass) | WD `traditional media`, `colored pencil (medium)`, `acrylic paint (medium)`, `painting (medium)` (all wrong: it is a photograph); both `alcohol`, `whiskey` | **liquor, wine glass, poster, martini** | `beer` (wrong), `photo (medium)` |
+| a Reddit page and a tweet, as screenshots | `fake screenshot`, `fake phone screenshot`, `twitter`, `english text` | **screenshot, text message, website, app** | `phone screen`, `text-only page`; but also `touhou`, `cirno`, `1girl`, `grey hair` on the Reddit page |
+
+**Would it have caught WD's false sexual tags?** Of the 240 pictures, 183 are rated general or sensitive by WD and
+PixAI together (the pictures the explicit-tag check is for). On them WD raised 6 sexual tags, 3 of them wrong
+(`penis` on a TikTok screenshot of a man with glasses; `condom`, `sex toy` on a TikTok feed screen; the owner's
+earlier example, `oral, fellatio, loli` on an ordinary photo, is the same problem), PixAI 7, 3 of them wrong (`nude,
+sex, hetero` on a meme of two silhouettes in the sea), the canary 1 (right). **JoyTag raised 10 on 5 pictures, 9 of
+them wrong**: `penis, fellatio, oral, erection, hetero` on that same TikTok screenshot (so the rule would now have
+*kept* WD's false `penis`), `censored, penis` on an Instagram profile screen, `penis` on a black-and-white photo of
+three men. A third voter is only worth having if its yes is trustworthy; JoyTag's is not on photographs. RAM++
+never votes yes, so it neither rescues nor spoils the check.
+
+**Speed and memory of the candidates**, each alone, batch of 8 (model only, preprocessed pictures, GPU: used-memory
+growth by `nvidia-smi`): RAM++ 232 pictures/s, 1.0 GB loaded, 1.9 GB at peak; JoyTag 133 pictures/s, 0.9 GB loaded, 2.4 GB
+at peak (onnxruntime's default arena; the fp16 conversion of its ONNX file fails); canary 127 pictures/s, 1.0 GB
+loaded, 1.4 GB at peak. For reference WD does 80-83 and PixAI 19-20 pictures/s on the same pictures.
+
+**Why RAM++ again.** v2 dropped it only because the owner preferred PixAI as the second tagger, and for that job PixAI
+is better (characters, series, the Danbooru words the owner searches by). As a *third* tagger the question is
+different: what do WD and PixAI both miss? On the library that is real-world things (food, rooms, drinks, vehicles,
+"screenshot", "poster"), and RAM++ is the only open candidate built for them. At 0.7 GB and 7% of the time it is cheap
+enough to keep next to the other two.
+
+### Measured (v3)
+
+Measured on 2026-10-02 on the owner's RTX 4090 (24 GB, WSL2, Docker 29), with Immich ML (2.7 GB) and Search+ (loaded,
+idle) in memory. torch 2.14.1+cu130, transformers 4.57.6, onnxruntime-gpu 1.30.0. 720 pictures (240 real library
+previews shrunk to 1024 px, three times over) sent as base64 JPEG through the HTTP API with `deploy/aitagger/bench.py`
+(decoding and transfer included), 8 pictures per request and 2 requests in flight (16 per request for micro-batch 16).
+"GB" is nvidia-smi's MiB / 1024; "process VRAM" is the growth of the GPU's used memory from before the container
+started to the peak while it worked.
+
+**Pictures per second** (everything loaded, model-native thresholds)
+
+| | micro-batch 8 | micro-batch 16 |
+|---|---|---|
+| RAM++ alone | 131 | not measured |
+| PixAI alone | 20.0 | 20.0 (v2) |
+| WD alone | 83.9 | (WD is held to 8) |
+| WD + PixAI | 16.3 | 16.3 (v2) |
+| **WD + PixAI + RAM++ (all three)** | **15.2** | **15.1** |
+
+RAM++ costs about 4.5 ms a picture on top of WD + PixAI (61 -> 66 ms): 7%. PixAI is still the whole story (20
+pictures/s, compute-bound), so the micro-batch buys nothing but memory.
+
+**Memory by cap** (`AITAGGER_VRAM_GB`, micro-batch 8; "settles on" is `effectiveBatch` in `/health`: the largest micro-batch
+each model fits in after all weights are loaded, PixAI / RAM++ / WD):
+
+| cap | settles on | process VRAM | WD + PixAI + RAM++ |
+|---|---|---|---|
+| 3 | does not load (`... too small for the three models`) | - | - |
+| 3.5 | 1 / 2 / 4 | 3.47 GB | 14.6 pictures/s |
+| 4 | 2 / 4 / 8 | 3.79 GB | 15.1 |
+| **5** | 4 / 8 / 8 | **4.20 GB** | 15.1 |
+| 6 | 8 / 8 / 8 | 4.76 GB | 15.1 |
+| 8 | 8 / 8 / 8 | 4.76 GB | 15.2 |
+| 8, micro-batch 16 | 16 / 16 / 8 | 6.17 GB | 15.1 |
+
+Loaded and idle the process holds 2.8 GB. Immich ML and Search+ (loaded, idle) held 7.7 GB together; with the tagger
+busy at a cap of 6 or 8 the whole GPU used 12.6 GB, so Search+ and the tagger fit together with room to spare.
+Start-up with the files cached: 8 s until `status: ok` (WD 1.3 s, PixAI 2.3 s, RAM++ 2.1 s to load, plus the
+warm-ups). Down to a cap of 4 no speed is lost (a small cap only shrinks the micro-batches: PixAI is
+compute-bound); at 3.5 it is 3% lower, because WD then runs at a micro-batch of 4. **Recommended: `vram_gb` default 5
+(4.2 GB used, PixAI settles on 4) and `AITAGGER_BATCH` 8; limits 4-8** (6 and above use 4.8 GB; 3.5 loads but has no
+room to spare; 3 does not load).
 
 ### v3, panel side: as built (design details and where it differs from the list above)
 
