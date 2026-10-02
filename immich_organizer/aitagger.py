@@ -66,7 +66,23 @@ PREVIEW_SIDE = 256            # pictures in the Test card
 SEGMENTS = 8                  # a video is cut into this many equal parts; the first and last are skipped
 MAX_IMAGES_PER_REQUEST = 64   # what the tagger accepts in one /tag call
 MAX_RULE_PASSES = 5
-VLM_ADD_SCORE = 0.7           # a tag only the VLM saw ranks below the taggers' sure ones (rules still score 1.0)
+# Sexual Danbooru tags (normalised). On a picture the combined rating calls general or sensitive, one of these is kept
+# only when both taggers found it: measured on the library, WD alone tagged an everyday photo of a person by a door
+# "oral, fellatio, loli, cunnilingus" while PixAI saw "indoors, shirt, shorts" and both ratings said general.
+EXPLICIT_TAGS = frozenset(t.strip() for t in """
+    sex, vaginal, anal, oral, fellatio, irrumatio, deepthroat, cunnilingus, anilingus, paizuri, handjob, footjob,
+    thighjob, masturbation, fingering, group sex, gangbang, threesome, foursome, orgy, rape, implied sex,
+    implied fellatio, after sex, after vaginal, after anal, sex from behind, doggystyle, missionary, cowgirl position,
+    reverse cowgirl position, girl on top, mating press, 69, penis, large penis, small penis, veiny penis, dark penis,
+    penis on head, penis on face, erection, testicles, foreskin, glans, pussy, spread pussy, clitoris, labia, anus,
+    nipples, areolae, nude, completely nude, bottomless, pubic hair, female pubic hair, male pubic hair, cum,
+    cum in pussy, cum in mouth, cum on body, cum on breasts, cum on hair, facial, bukkake, ejaculation, cumdrip,
+    creampie, pussy juice, precum, sex toy, dildo, vibrator, condom, used condom, surrounded by penises,
+    clothed female nude male, clothed male nude female, hetero, loli, shota, toddlercon, uncensored, censored,
+    mosaic censoring, bar censor, cameltoe, exhibitionism, public indecency, prostitution, bdsm, lactation,
+    breast sucking, groping, molestation, sex machine, tentacle sex, bestiality
+""".replace("\n", " ").split(",") if t.strip())
+VLM_ADD_SCORE = 0.7          # a tag only the VLM saw ranks below the taggers' sure ones (rules still score 1.0)
 VLM_PROTECT = 0.9             # the VLM can't remove a tag a tagger is at least this sure of
 MAX_ATTEMPTS = searchplus.MAX_ATTEMPTS
 CLEARED = searchplus.CLEARED
@@ -394,15 +410,18 @@ def detect(raw: dict, settings: dict) -> dict:
             per_capture = [r[model] for r in ratings if isinstance(r.get(model), dict) and r[model]]
             if per_capture:
                 parts[model] = _mean_scores(per_capture)
+    best = None
     if parts:
         names = set().union(*parts.values())
         mean = {name: sum(p.get(name, 0.0) for p in parts.values()) / len(parts) for name in names}
         display["rating"] = {name: round(p, 3) for name, p in mean.items()}
+        best = max(sorted(mean), key=lambda name: mean[name])
         if settings["rating_tag"]:
-            best = max(sorted(mean), key=lambda name: mean[name])
             source = max(parts, key=lambda model: parts[model].get(best, 0.0))       # a tie goes to WD
             candidates.append((RATING_PREFIX + best, mean[best], source))
     tags: dict[str, tuple[float, str]] = {}
+    kept_by: dict[str, set] = {}
+    explicit: set[str] = set()
     for tag, score, source in candidates:
         original = norm_tag(tag)
         if not original:
@@ -410,8 +429,18 @@ def detect(raw: dict, settings: dict) -> dict:
         name = vocab.rename(original)
         if original in blocked or name in blocked:
             continue
+        kept_by.setdefault(name, set()).add(source)
+        if original in EXPLICIT_TAGS or name in EXPLICIT_TAGS:
+            explicit.add(name)
         if name not in tags or score > tags[name][0]:
             tags[name] = (score, source)
+    # A sexual tag on a picture both ratings call general/sensitive must be confirmed by both taggers.
+    if best in ("general", "sensitive"):
+        doubtful = sorted(n for n in explicit if n in tags and len(kept_by.get(n, ())) < 2)
+        for name in doubtful:
+            del tags[name]
+        if doubtful:
+            display["dropped"] = doubtful
     return {"tags": tags, "display": display, "terms": vocab.terms}
 
 

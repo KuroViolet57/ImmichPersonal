@@ -548,6 +548,43 @@ class TestRules(unittest.TestCase):
 
 # ---------------------------------------------------------------- the VLM's words, the cap, the final list
 
+class TestSexualTagsNeedAgreement(unittest.TestCase):
+    """A sexual tag on a picture rated general/sensitive is kept only when both taggers found it."""
+    EVERYDAY = "wd:door=0.97,oral=0.96,loli=0.74,shirt=0.6|pixai:door=0.93,shirt=0.94,indoors=0.96|rating:general=0.9"
+
+    def tags(self, *pictures, **settings):
+        return at.detect(raw_of(*pictures), S(**settings))
+
+    def test_one_tagger_alone_is_not_enough_on_a_general_picture(self):
+        got = self.tags(self.EVERYDAY)
+        self.assertNotIn("oral", got["tags"])
+        self.assertNotIn("loli", got["tags"])
+        self.assertIn("door", got["tags"])
+        self.assertEqual(got["display"]["dropped"], ["loli", "oral"])
+
+    def test_both_taggers_agreeing_keeps_it(self):
+        got = self.tags("wd:nude=0.9,beach=0.8|pixai:nude=0.8,beach=0.9|rating:sensitive=0.7,general=0.3")
+        self.assertIn("nude", got["tags"])
+        self.assertNotIn("dropped", got["display"])
+
+    def test_an_explicit_rating_keeps_everything(self):
+        got = self.tags("wd:oral=0.96,penis=0.9|pixai:penis=0.95|rating:explicit=0.95,general=0.05")
+        self.assertIn("oral", got["tags"])                  # only WD, but the picture is rated explicit
+
+    def test_with_one_tagger_switched_off_a_general_picture_drops_them(self):
+        got = self.tags(self.EVERYDAY, use_pixai=False)
+        self.assertNotIn("oral", got["tags"])
+        self.assertIn("door", got["tags"])
+
+    def test_without_a_rating_nothing_is_dropped(self):
+        got = self.tags("wd:oral=0.96|pixai:door=0.9")
+        self.assertIn("oral", got["tags"])
+
+    def test_the_check_runs_on_renamed_tags_too(self):
+        got = self.tags(self.EVERYDAY, vocabulary="oral -> mouth stuff")
+        self.assertNotIn("mouth stuff", got["tags"])
+
+
 class TestFinalTags(unittest.TestCase):
     def build(self, vlm=None, pictures=(PHOTO,), **settings):
         return at.build(raw_of(*pictures), vlm, S(**settings))
