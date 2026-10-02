@@ -1,18 +1,18 @@
 """AI Tagger: tags every photo and video, and writes the result into the asset's Immich description.
 
-Two image taggers (WD EVA02 and PixAI v1.0, both Danbooru-style: illustration / anime, people, clothing, characters,
-series) say what is in the picture; a small text-only language model (the "VLM" container, which sees no pictures)
-turns the final tags into a short description following the owner's instructions and may add or drop a few tags.
-The result goes into a managed ``[AI Tagger]`` block inside the Immich description; the owner's own text is never
-changed. Contract: ``docs/AI-TAGGER.md`` (its v2 section is binding).
+Image taggers (WD EVA02, PixAI v1.0 and, once it is chosen, a third; all Danbooru-style or compatible: illustration /
+anime, people, clothing, characters, series) say what is in the picture. The registry ``TAGGERS`` lists them; everything
+that used to be hard-wired to two taggers loops over it. The result is only tags: a managed ``[AI Tagger]`` block inside
+the Immich description (``Tags: a, b, c``); the owner's own text is never changed. Contract: ``docs/AI-TAGGER.md`` (its
+v3 section is binding).
 
 Pieces:
-* settings (``settings.json``) and the SQLite ``Store`` (catalogue, raw tagger scores, results, history, queue);
-* pure functions: ``aggregate``/``detect``/``finalize`` (scores -> tags), ``apply_rules``, ``compose_block`` and
+* the tagger registry, and the settings generated from it, and the SQLite ``Store`` (catalogue, raw tagger scores,
+  results, history, queue);
+* pure functions: ``detect``/``finalize`` (scores -> tags), ``apply_rules``, ``compose_block`` and
   ``merge_description`` (the block, with the owner's text kept exactly);
-* ``Tagger`` and ``VLM``: HTTP clients of the two model containers (the VLM is sent text only); ``Services``: starts /
-  stops those containers;
-* ``Pipeline``: everything done to one asset (captures, tagging, VLM, write-back, read-back, history);
+* ``Tagger``: HTTP client of the tagger container; ``Services``: starts / stops that container;
+* ``Pipeline``: everything done to one asset (captures, tagging, write-back, read-back, history);
 * ``Indexer``: a background thread that works through the queue and the untagged assets, like Search+.
 """
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import dataclasses
 import json
 import math
 import os
@@ -41,23 +42,17 @@ from .config import state_dir
 from .searchplus import GpuBusy, ServiceDown, fetch_catalog   # noqa: F401 - GpuBusy is re-exported
 
 TAGGER_URL = os.environ.get("AITAGGER_URL", "http://127.0.0.1:11440")
-VLM_URL = os.environ.get("AITAGGER_VLM_URL", "http://127.0.0.1:11441")
-TAGGER_CONTAINER = os.environ.get("AITAGGER_CONTAINER", "immich_aitagger")
-VLM_CONTAINER = searchplus.AITAGGER_VLM_CONTAINER
+TAGGER_CONTAINER = searchplus.AITAGGER_CONTAINER
 COMPOSE = Path(__file__).resolve().parent.parent / "deploy" / "aitagger" / "docker-compose.yml"
 PROJECT = "immich-aitagger"
-TAGGER_SERVICE, VLM_SERVICE = "tagger", "vlm"      # service names inside the compose file
-VLM_MODEL = "tagger-vlm"
-MODEL_LABELS = {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0", "vlm": "Qwen3.5-2B (text)"}
+TAGGER_SERVICE = "tagger"      # the only compose service this module starts and stops
 
-# ---- graphics memory. PROVISIONAL: these come from measurements that are still being made; change them here only.
-VRAM_GB_DEFAULT = 5           # setting `vram_gb`, its default: the memory cap of the two taggers (AITAGGER_VRAM_GB)
+# ---- graphics memory. PROVISIONAL: the v3 numbers (three taggers) are still being measured; change them here only.
+VRAM_GB_DEFAULT = 5           # setting `vram_gb`, its default: the memory cap of the taggers (AITAGGER_VRAM_GB)
 VRAM_GB_LIMITS = (3, 8)       # what `vram_gb` may be set to
-VLM_UTIL = 0.22               # the describer's share of the whole card (AITAGGER_VLM_UTIL); measured 5.1 GB on 24 GB
 # ----
 
 DEFAULT_GPU_GB = 24           # when nvidia-smi can't say
-IDLE_EXIT_MINUTES = 20        # the VLM container is stopped after this long without work
 STATE_TTL = 5.0               # seconds a container's state is remembered (the status route is polled)
 FLOOR = 0.05                  # the tagger returns calibrated scores from this up
 DISPLAY_FLOOR = 0.2           # the Test card lists scores from this up (the kept ones always)
@@ -67,8 +62,9 @@ SEGMENTS = 8                  # a video is cut into this many equal parts; the f
 MAX_IMAGES_PER_REQUEST = 64   # what the tagger accepts in one /tag call
 MAX_RULE_PASSES = 5
 # Sexual Danbooru tags (normalised). On a picture the combined rating calls general or sensitive, one of these is kept
-# only when both taggers found it: measured on the library, WD alone tagged an everyday photo of a person by a door
-# "oral, fellatio, loli, cunnilingus" while PixAI saw "indoors, shirt, shorts" and both ratings said general.
+# only when at least two enabled taggers found it (with a single tagger on it is dropped): measured on the library, WD
+# alone tagged an everyday photo of a person by a door "oral, fellatio, loli, cunnilingus" while PixAI saw "indoors,
+# shirt, shorts" and both ratings said general.
 EXPLICIT_TAGS = frozenset(t.strip() for t in """
     sex, vaginal, anal, oral, fellatio, irrumatio, deepthroat, cunnilingus, anilingus, paizuri, handjob, footjob,
     thighjob, masturbation, fingering, group sex, gangbang, threesome, foursome, orgy, rape, implied sex,
@@ -82,8 +78,6 @@ EXPLICIT_TAGS = frozenset(t.strip() for t in """
     mosaic censoring, bar censor, cameltoe, exhibitionism, public indecency, prostitution, bdsm, lactation,
     breast sucking, groping, molestation, sex machine, tentacle sex, bestiality
 """.replace("\n", " ").split(",") if t.strip())
-VLM_ADD_SCORE = 0.7          # a tag only the VLM saw ranks below the taggers' sure ones (rules still score 1.0)
-VLM_PROTECT = 0.9             # the VLM can't remove a tag a tagger is at least this sure of
 MAX_ATTEMPTS = searchplus.MAX_ATTEMPTS
 CLEARED = searchplus.CLEARED
 RETRY_AFTER = searchplus.RETRY_AFTER
@@ -94,8 +88,9 @@ EPS = 1e-9
 OPEN, CLOSE = "[AI Tagger]", "[/AI Tagger]"
 RATING_PREFIX = "rating: "
 NATIVE_PREFIX = "AI/"
-MODES = ("retag", "describe", "full")
-RANK = {"retag": 1, "describe": 2, "full": 3}
+MODES = ("retag", "full")
+RANK = {"retag": 1, "full": 2}
+LEGACY_MODES = {"describe": "retag"}     # the v2 mode: a stored or requested "describe" is handled as "retag"
 
 
 def _now() -> str:
@@ -147,55 +142,124 @@ def norm_tag(text) -> str:
 
 
 class Vocabulary:
-    """``old -> new`` lines rename a tag; any other line is a preferred term for the VLM."""
+    """``old -> new`` lines rename a tag. Any other line is ignored (v2 passed it to the describer as a preferred term;
+    there is no describer any more)."""
 
     def __init__(self, text: str = ""):
         self.renames: dict[str, str] = {}
-        self.terms: list[str] = []
         for line in (text or "").splitlines():
             line = line.strip()
-            if not line:
-                continue
             arrow = "->" if "->" in line else ("→" if "→" in line else "")
             if not arrow:
-                self.terms.append(line)
                 continue
             old, new = (norm_tag(part) for part in line.split(arrow, 1))
             if old and new and old != new:
                 self.renames[old] = new
-                if new not in self.terms:
-                    self.terms.append(new)
 
     def rename(self, tag: str) -> str:
         return self.renames.get(tag, tag)
 
 
+# ---------------------------------------------------------------- the taggers (the registry)
+
+@dataclasses.dataclass(frozen=True)
+class TaggerKind:
+    """One image tagger of the tagger container. Its ``key`` is the key of its answer in ``/tag``, its name in the
+    request's ``models`` list, and the stem of its two settings ``use_<key>`` and ``<key>_strictness``."""
+
+    key: str                                     # lowercase letters and digits: "wd", "pixai"
+    label: str                                   # the model's name, shown in the status and the apps
+    categories: tuple[str, ...]                  # the tag categories it answers with (the rating is separate)
+    character_categories: tuple[str, ...] = ()   # those of them that the ``character_tags`` setting switches off
+    has_rating: bool = True                      # whether it answers with a ``rating`` (probability per rating name)
+    default_on: bool = True                      # the default of ``use_<key>``
+
+    def __post_init__(self):
+        if not re.fullmatch(r"[a-z][a-z0-9]*", self.key):
+            raise ValueError(f"tagger key {self.key!r}: lowercase letters and digits only")
+        if not self.categories or not set(self.character_categories) <= set(self.categories):
+            raise ValueError(f"tagger {self.key}: character_categories must be among its categories")
+
+
+# The ordered registry. Everything that used to be hard-wired to two taggers loops over it: detection and merging
+# (the highest score wins, ``source`` is the tagger's key), the rating (the mean of the enabled taggers that report
+# one), the explicit-tag check, the settings (generated below), the status labels, the preview and the ``models`` the
+# panel asks the tagger service for. Tie-breaks go to the earlier entry.
+TAGGERS: list[TaggerKind] = [
+    TaggerKind("wd", "wd-eva02-large-tagger-v3", ("general", "character"), ("character",)),
+    TaggerKind("pixai", "pixai-tagger-v1.0", ("general", "character", "copyright"), ("character", "copyright")),
+    # >>> THE THIRD TAGGER GOES HERE: one more TaggerKind(key, label, categories, character_categories, has_rating) <<<
+    # (its key must be the key the tagger service answers /tag with; see docs/AI-TAGGER.md, "Adding a tagger")
+]
+
+
+def enabled_kinds(settings: dict) -> list[TaggerKind]:
+    """The taggers switched on, in registry order."""
+    return [kind for kind in TAGGERS if settings["use_" + kind.key]]
+
+
+def model_labels() -> dict[str, str]:
+    """``{key: label}`` for the status (every registered tagger, in registry order)."""
+    return {kind.key: kind.label for kind in TAGGERS}
+
+
 # ---------------------------------------------------------------- settings
 
-DEFAULTS = {
-    "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vlm_parallel": 16,
-    "vram_gb": VRAM_GB_DEFAULT,
-    "describe": True, "use_wd": True, "use_pixai": True, "wd_strictness": 0.5, "pixai_strictness": 0.5,
-    "character_tags": True, "rating_tag": True, "max_tags": 30, "instructions": "", "vocabulary": "",
-    "blocked": [], "rules": [], "write_tags": False, "language": "English",
+# What is not a tagger. The per-tagger settings ``use_<key>`` / ``<key>_strictness`` are generated from ``TAGGERS``
+# by ``configure_taggers`` (below), together with the tables that mention them.
+FIXED_DEFAULTS = {
+    "indexing": False, "keep_updated": True, "video_frames": 6, "batch_size": 8, "vram_gb": VRAM_GB_DEFAULT,
+    "character_tags": True, "rating_tag": True, "max_tags": 30, "vocabulary": "", "blocked": [], "rules": [],
+    "write_tags": False,
 }
-LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vlm_parallel": (1, 32), "vram_gb": VRAM_GB_LIMITS,
-          "wd_strictness": (0.05, 0.95), "pixai_strictness": (0.05, 0.95), "max_tags": (5, 100)}
-TEXT_LIMITS = {"instructions": 4000, "vocabulary": 4000, "language": 40}
+FIXED_LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vram_gb": VRAM_GB_LIMITS, "max_tags": (5, 100)}
+STRICTNESS = (0.05, 0.95)           # the limits of every ``<key>_strictness`` (calibrated: 0.5 = the model's own threshold)
+TEXT_LIMITS = {"vocabulary": 4000}
 MAX_BLOCKED, MAX_RULES, MAX_RULE_TAGS = 500, 100, 50
 RULE_KEYS = ("if_all", "if_any", "unless", "add", "remove")
 
+# Generated from the registry (in place, so a reference to them stays valid when the registry changes).
+DEFAULTS: dict = {}
+LIMITS: dict = {}
 # settings that change what an asset's result looks like (a change makes older results "outdated")
-CONTENT = ("video_frames", "describe", "use_wd", "use_pixai", "wd_strictness", "pixai_strictness", "character_tags",
-           "rating_tag", "max_tags", "instructions", "vocabulary", "blocked", "rules", "write_tags", "language")
+CONTENT: tuple = ()
 # the cheapest way to bring results up to date after a change (the strongest of the changed keys wins)
-REPROCESS = {
-    "full": ("video_frames", "use_wd", "use_pixai"),
-    "describe": ("describe", "instructions", "vocabulary", "language"),
-    "retag": ("wd_strictness", "pixai_strictness", "character_tags", "rating_tag", "max_tags", "blocked", "rules",
-              "write_tags"),
-}
+REPROCESS: dict = {}
 _SETTINGS_LOCK = threading.Lock()
+
+
+def configure_taggers(kinds=None) -> None:
+    """Make ``kinds`` the registry (or, with None, just rebuild the tables from ``TAGGERS``) and generate from it:
+    the ``use_<key>`` / ``<key>_strictness`` settings with ``DEFAULTS``, ``LIMITS``, ``CONTENT`` and ``REPROCESS``
+    (``use_*`` need a ``full`` reprocess, ``*_strictness`` a ``retag``). The panel calls this once, at import; tests use
+    it to add a fake third tagger."""
+    global CONTENT
+    if kinds is not None:
+        kinds = list(kinds)
+        if len({k.key for k in kinds}) != len(kinds):
+            raise ValueError("two taggers with the same key")
+        TAGGERS[:] = kinds
+    use = [f"use_{kind.key}" for kind in TAGGERS]
+    strict = [f"{kind.key}_strictness" for kind in TAGGERS]
+    fixed = FIXED_DEFAULTS
+    DEFAULTS.clear()
+    DEFAULTS.update({k: fixed[k] for k in ("indexing", "keep_updated", "video_frames", "batch_size", "vram_gb")})
+    DEFAULTS.update({f"use_{kind.key}": kind.default_on for kind in TAGGERS})
+    DEFAULTS.update({key: 0.5 for key in strict})
+    DEFAULTS.update({k: fixed[k] for k in ("character_tags", "rating_tag", "max_tags", "vocabulary", "blocked", "rules",
+                                           "write_tags")})
+    LIMITS.clear()
+    LIMITS.update(FIXED_LIMITS)
+    LIMITS.update({key: STRICTNESS for key in strict})
+    CONTENT = ("video_frames", *use, *strict, "character_tags", "rating_tag", "max_tags", "vocabulary", "blocked",
+               "rules", "write_tags")
+    REPROCESS.clear()
+    REPROCESS.update({"full": ("video_frames", *use),
+                      "retag": (*strict, "character_tags", "rating_tag", "max_tags", "vocabulary", "blocked", "rules",
+                                "write_tags")})
+
+
+configure_taggers()
 
 
 def settings_path() -> Path:
@@ -253,10 +317,6 @@ def validate_setting(key: str, value):
         if not isinstance(value, str):
             raise ValueError(f"{key} must be text")
         value = value.replace("\r\n", "\n").replace("\r", "\n")
-        if key == "language":
-            value = value.strip()
-            if not value:
-                raise ValueError("language can't be empty")
         if len(value) > TEXT_LIMITS[key]:
             raise ValueError(f"{key} must be at most {TEXT_LIMITS[key]} characters")
         return value
@@ -276,6 +336,8 @@ def validate_setting(key: str, value):
 
 
 def load_settings() -> dict:
+    """The saved settings. A key this version does not know (the v2 describer's ``describe``, ``instructions``,
+    ``language`` and ``vlm_parallel``, v1's ``use_ram``) is ignored, a bad value falls back to the default."""
     try:
         data = json.loads(settings_path().read_text("utf-8"))
     except (OSError, ValueError):
@@ -322,10 +384,19 @@ def save_settings(changes: dict, store: "Store | None" = None) -> dict:
 
 def suggest_mode(changed: list[str]) -> str:
     """The cheapest reprocess mode that brings old results in line with the changed settings."""
-    for mode in ("full", "describe", "retag"):
+    for mode in ("full", "retag"):
         if any(key in REPROCESS[mode] for key in changed):
             return mode
     return "none"
+
+
+def normalize_mode(mode) -> str:
+    """"retag" or "full". The v2 mode "describe" (a stored queue row, or a request from an old app) counts as
+    "retag". ValueError for anything else."""
+    mode = LEGACY_MODES.get(mode, mode) if isinstance(mode, str) else mode
+    if not isinstance(mode, str) or mode not in RANK:
+        raise ValueError("mode must be retag or full")
+    return mode
 
 
 # ---------------------------------------------------------------- tags: scores -> tags -> rules
@@ -359,22 +430,25 @@ def _merged(data: dict, categories: tuple[str, ...]) -> dict[str, float]:
     return out
 
 
-def has_pixai(raw: dict | None) -> bool:
-    """Whether stored tagger scores include PixAI's. Scores made by the v1 service (RAM++) do not."""
-    return any((cap or {}).get("pixai") is not None for cap in (raw or {}).get("scores") or [])
+def has_kind(raw: dict | None, key: str) -> bool:
+    """Whether stored tagger scores include this tagger's. Scores made while it was off, or by an older service
+    (v1: RAM++ instead of PixAI), do not."""
+    return any((cap or {}).get(key) is not None for cap in (raw or {}).get("scores") or [])
 
 
-def needs_vlm(settings: dict) -> bool:
-    """The describer only has tags to go on, so it is used only when a tagger is on."""
-    return bool(settings["describe"] and (settings["use_wd"] or settings["use_pixai"]))
+def missing_kinds(raw: dict | None, settings: dict) -> list[str]:
+    """The enabled taggers whose scores the stored ``raw`` lacks. Any of them means the asset needs a ``full``
+    reprocess: its tags can't be made from what is stored."""
+    return [kind.key for kind in enabled_kinds(settings) if not has_kind(raw, kind.key)]
 
 
 def detect(raw: dict, settings: dict) -> dict:
-    """Steps 3-4: stored tagger scores -> tags with scores (before the VLM and the rules)."""
+    """Steps 3-4: stored tagger scores -> tags with scores (before the rules)."""
     vocab = Vocabulary(settings["vocabulary"])
     blocked = set(settings["blocked"])
     candidates: list[tuple[str, float, str]] = []
-    display: dict = {"wd": [], "pixai": [], "rating": {}}
+    display: dict = {kind.key: [] for kind in TAGGERS}
+    display["rating"] = {}
 
     def show(model: str, scores: dict, strictness: float) -> None:
         shown = {}
@@ -392,24 +466,21 @@ def detect(raw: dict, settings: dict) -> dict:
         display[model] = sorted(shown.values(), key=lambda t: (-t["score"], t["tag"]))[:80]
 
     caps = raw.get("scores") or []
-    # `character_tags` gates the names of characters (WD and PixAI) and PixAI's series ("copyright") tags
-    wanted = {"wd": ("general", "character") if settings["character_tags"] else ("general",),
-              "pixai": ("general", "character", "copyright") if settings["character_tags"] else ("general",)}
-    for model in ("wd", "pixai"):
-        if not settings["use_" + model]:
-            continue
-        series = [_merged(cap[model], wanted[model]) for cap in caps if cap and cap.get(model) is not None]
+    for kind in enabled_kinds(settings):
+        # `character_tags` gates what a tagger names as characters and series (its character categories)
+        wanted = tuple(c for c in kind.categories if settings["character_tags"] or c not in kind.character_categories)
+        series = [_merged(cap[kind.key], wanted) for cap in caps if cap and cap.get(kind.key) is not None]
         if series:
-            show(model, _per_tag(series), settings[model + "_strictness"])
-    # The rating: each model's probabilities averaged over the captures, then the mean of the models that are on
-    # (one model alone if only one is), then the best. The tag's source is the model surest of the winner.
+            show(kind.key, _per_tag(series), settings[kind.key + "_strictness"])
+    # The rating: each tagger's probabilities averaged over the captures, then the mean of the enabled taggers that
+    # report one (one alone if only one does), then the best. The tag's source is the tagger surest of the winner.
     ratings = [r for r in raw.get("ratings") or [] if isinstance(r, dict)]
     parts: dict[str, dict[str, float]] = {}
-    for model in ("wd", "pixai"):
-        if settings["use_" + model]:
-            per_capture = [r[model] for r in ratings if isinstance(r.get(model), dict) and r[model]]
+    for kind in enabled_kinds(settings):
+        if kind.has_rating:
+            per_capture = [r[kind.key] for r in ratings if isinstance(r.get(kind.key), dict) and r[kind.key]]
             if per_capture:
-                parts[model] = _mean_scores(per_capture)
+                parts[kind.key] = _mean_scores(per_capture)
     best = None
     if parts:
         names = set().union(*parts.values())
@@ -417,7 +488,7 @@ def detect(raw: dict, settings: dict) -> dict:
         display["rating"] = {name: round(p, 3) for name, p in mean.items()}
         best = max(sorted(mean), key=lambda name: mean[name])
         if settings["rating_tag"]:
-            source = max(parts, key=lambda model: parts[model].get(best, 0.0))       # a tie goes to WD
+            source = max(parts, key=lambda model: parts[model].get(best, 0.0))       # a tie goes to the earlier tagger
             candidates.append((RATING_PREFIX + best, mean[best], source))
     tags: dict[str, tuple[float, str]] = {}
     kept_by: dict[str, set] = {}
@@ -434,14 +505,15 @@ def detect(raw: dict, settings: dict) -> dict:
             explicit.add(name)
         if name not in tags or score > tags[name][0]:
             tags[name] = (score, source)
-    # A sexual tag on a picture both ratings call general/sensitive must be confirmed by both taggers.
+    # A sexual tag on a picture the combined rating calls general/sensitive must be confirmed by at least two of the
+    # enabled taggers (with one tagger on, none can be).
     if best in ("general", "sensitive"):
         doubtful = sorted(n for n in explicit if n in tags and len(kept_by.get(n, ())) < 2)
         for name in doubtful:
             del tags[name]
         if doubtful:
             display["dropped"] = doubtful
-    return {"tags": tags, "display": display, "terms": vocab.terms}
+    return {"tags": tags, "display": display}
 
 
 def rule_matches(have: set, rule: dict) -> bool:
@@ -477,26 +549,9 @@ def apply_rules(tags: dict, rules: list[dict]) -> tuple[dict, list[dict]]:
     return tags, [fired[i] for i in sorted(fired) if fired[i]["added"] or fired[i]["removed"]]
 
 
-def finalize(tags: dict, vlm: dict | None, settings: dict) -> tuple[list[dict], list[dict]]:
-    """Steps 5-6: what the VLM added / removed, the rules, ``blocked`` and the ``max_tags`` cap."""
-    vocab = Vocabulary(settings["vocabulary"])
+def finalize(tags: dict, settings: dict) -> tuple[list[dict], list[dict]]:
+    """Step 5: the rules, ``blocked`` and the ``max_tags`` cap."""
     blocked = set(settings["blocked"])
-    tags = dict(tags)
-    if settings["describe"] and vlm:
-        # Measured on the library: the VLM sometimes drops tags the taggers are certain of, and sometimes lists
-        # the same tag under both add and remove. So a tag named both ways is ignored, a sure tagger tag (and the
-        # rating) can't be removed by it, and a tag only it saw ranks below the taggers' confident ones.
-        added = {vocab.rename(norm_tag(t)) for t in vlm.get("add_tags") or []} - {""}
-        removed = {norm_tag(t) for t in vlm.get("remove_tags") or []} - {""}
-        removed |= {vocab.rename(t) for t in removed}
-        contested = added & removed
-        for name in added - contested:
-            if name not in blocked:
-                old = tags.get(name)
-                tags[name] = (max(old[0], VLM_ADD_SCORE), old[1]) if old else (VLM_ADD_SCORE, "vlm")
-        for name in removed - contested:
-            if name in tags and tags[name][0] < VLM_PROTECT and not name.startswith(RATING_PREFIX):
-                del tags[name]
     tags = {t: v for t, v in tags.items() if t not in blocked}
     tags, trace = apply_rules(tags, settings["rules"])
     tags = {t: v for t, v in tags.items() if t not in blocked}
@@ -506,29 +561,21 @@ def finalize(tags: dict, vlm: dict | None, settings: dict) -> tuple[list[dict], 
     return [{"tag": t, "score": round(tags[t][0], 3), "source": tags[t][1]} for t in keep], trace
 
 
-def build(raw: dict, vlm: dict | None, settings: dict) -> dict:
-    """Everything the pipeline decides for one asset from the stored scores and the VLM's answer."""
+def build(raw: dict, settings: dict) -> dict:
+    """Everything the pipeline decides for one asset from the stored scores."""
     found = detect(raw, settings)
-    tags, trace = finalize(found["tags"], vlm, settings)
-    description = (vlm or {}).get("description", "") if settings["describe"] else ""
-    return {"tags": tags, "models": found["display"], "rules": trace, "description": description,
-            "block": compose_block([t["tag"] for t in tags], description)}
+    tags, trace = finalize(found["tags"], settings)
+    return {"tags": tags, "models": found["display"], "rules": trace, "block": compose_block([t["tag"] for t in tags])}
 
 
 # ---------------------------------------------------------------- the block in the description
 
-def compose_block(tags: list[str], description: str) -> str:
-    """The managed text; "" when there is nothing to say."""
+def compose_block(tags: list[str]) -> str:
+    """The managed text, ``[AI Tagger]``, ``Tags: a, b, c``, ``[/AI Tagger]`` on three lines; "" when there are no tags."""
     def clean(text: str) -> str:
         return " ".join(str(text).replace(OPEN, "").replace(CLOSE, "").split())
 
-    lines = []
-    if tags:
-        lines.append("Tags: " + ", ".join(clean(t) for t in tags))
-    description = clean(description)
-    if description:
-        lines.append("Description: " + description)
-    return "\n".join([OPEN] + lines + [CLOSE]) if lines else ""
+    return "\n".join([OPEN, "Tags: " + ", ".join(clean(t) for t in tags), CLOSE]) if tags else ""
 
 
 def block_spans(text: str) -> list[tuple[int, int]]:
@@ -630,14 +677,14 @@ def data_url(jpeg: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()
 
 
-# ---------------------------------------------------------------- the two model servers
+# ---------------------------------------------------------------- the model server
 
 def _is_oom(text: str) -> bool:
     return "out of memory" in (text or "").lower()
 
 
 class Tagger:
-    """HTTP client of the tagger container (WD + PixAI)."""
+    """HTTP client of the tagger container (every registered tagger runs in it)."""
 
     def __init__(self, url: str = TAGGER_URL, timeout: float = 600):
         self.url, self.timeout = url.rstrip("/"), timeout
@@ -649,11 +696,14 @@ class Tagger:
         except (OSError, ValueError):
             return None
 
-    def tag(self, images: list[bytes], floor: float = FLOOR) -> tuple[list, list]:
-        """(one result per picture or None, one error per picture or None). Raises GpuOOM / ServiceDown."""
+    def tag(self, images: list[bytes], floor: float = FLOOR, models: list[str] | None = None) -> tuple[list, list]:
+        """(one result per picture or None, one error per picture or None). ``models`` are the tagger keys to run (the
+        enabled ones); the answer then has only those. Raises GpuOOM / ServiceDown."""
         if len(images) > MAX_IMAGES_PER_REQUEST:
             raise ValueError(f"at most {MAX_IMAGES_PER_REQUEST} pictures per request")
         body = {"images": [base64.b64encode(b).decode() for b in images], "floor": floor}
+        if models is not None:
+            body["models"] = list(models)
         req = urllib.request.Request(self.url + "/tag", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         try:
@@ -677,138 +727,6 @@ class Tagger:
         if any(_is_oom(e) for e in errors if e):
             raise GpuOOM(next(e for e in errors if e and _is_oom(e)))
         return results, errors
-
-
-VLM_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["description", "add_tags", "remove_tags"],
-              "properties": {"description": {"type": "string"},
-                             "add_tags": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
-                             "remove_tags": {"type": "array", "items": {"type": "string"}, "maxItems": 12}}}
-VLM_SYSTEM = (
-    "You are the cataloguer of a private, personal photo archive that only its owner can see. You never see the "
-    "pictures: you are given the tags that image taggers found in one picture, each with a confidence, and you turn "
-    "them into a short description. Treat every tag neutrally and factually, including nudity, sexual or violent "
-    "content, in plain language, without judging, warning or moralising. You never refuse: if the tags say little, "
-    "say little. Never invent details the tags do not support. Answer only with the JSON object that is asked for.")
-_REFUSAL = re.compile(r"^\s*(i['’]?m sorry|i am sorry|sorry[,.]|i can(?:'|’)?t|i cannot|i['’]?m (?:not able|unable)|"
-                      r"i am (?:not able|unable)|i won['’]?t|as an ai|unable to (?:describe|assist|help))", re.I)
-
-
-class VLMRejected(Exception):
-    """The language model refused, or did not answer in the asked-for format."""
-
-
-def vlm_prompt(tags: list[dict], rating: dict, settings: dict, terms: list[str], kind: str = "IMAGE") -> str:
-    """What the text-only describer is told: the final tags with their scores, the rating, and the owner's
-    instructions, preferred terms and language. There is no picture."""
-    what = "video" if kind == "VIDEO" else "picture"
-    shown = ", ".join(f"{t['tag']} {t['score']:.2f}" for t in tags[:60]) or "(none)"
-    lines = [f"Tags found by two image taggers in one {what}"
-             + (" (several frames of it, combined)" if kind == "VIDEO" else "")
-             + f", with a 0-1 confidence: {shown}"]
-    if rating:
-        lines.append("Content rating estimate: " + ", ".join(f"{k} {v:.2f}" for k, v in sorted(rating.items())))
-    if settings["instructions"].strip():
-        lines.append("Instructions from the archive's owner:\n" + settings["instructions"].strip())
-    if terms:
-        lines.append("Preferred terms (use these words when they fit): " + "; ".join(terms[:80]))
-    lines.append(
-        f"Write the description in {settings['language']}: 1-2 sentences saying what the {what} shows, as far as the "
-        "tags imply it, following the instructions. Use only what the tags say: do not add a place, setting, "
-        "lighting, time of day, weather, mood or story unless a tag names it. "
-        "add_tags and remove_tags may hold at most 8 entries each and normally stay empty: add a tag only when the "
-        "owner's instructions ask for it, and remove one only when it directly contradicts other tags. "
-        "add_tags are short lowercase English tags; remove_tags are tags from the list above, spelled exactly the same. "
-        'Answer with a JSON object {"description": "...", "add_tags": [...], "remove_tags": [...]}.')
-    return "\n".join(lines)
-
-
-def parse_vlm_answer(content) -> dict:
-    """The VLM's JSON answer as {"description", "add_tags", "remove_tags"}, or VLMRejected."""
-    if not isinstance(content, str) or not content.strip():
-        raise VLMRejected("empty answer")
-    text = content.strip()
-    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.S)
-    if fence:
-        text = fence.group(1)
-    try:
-        data = json.loads(text)
-    except ValueError as exc:
-        raise VLMRejected(f"not valid JSON ({exc})") from None
-    if not isinstance(data, dict) or not isinstance(data.get("description"), str):
-        raise VLMRejected("the JSON has no description")
-    out = {"description": " ".join(data["description"].split())[:1500]}
-    for key in ("add_tags", "remove_tags"):
-        value = data.get(key, [])
-        if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
-            raise VLMRejected(f"{key} is not a list of text")
-        out[key] = value[:60]
-    if out["description"] and _REFUSAL.match(out["description"]):
-        raise VLMRejected("the model refused")
-    return out
-
-
-class VLM:
-    """HTTP client of the language model container (vLLM, OpenAI-compatible). It is sent text only, never a picture."""
-
-    def __init__(self, url: str = VLM_URL, model: str = VLM_MODEL, timeout: float = 300):
-        self.url, self.model, self.timeout = url.rstrip("/"), model, timeout
-
-    def health(self, timeout: float = 3) -> bool:
-        try:
-            with urllib.request.urlopen(self.url + "/health", timeout=timeout) as resp:
-                return resp.status == 200
-        except OSError:
-            return False
-
-    def _post(self, body: dict) -> dict:
-        req = urllib.request.Request(self.url + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-            if exc.code >= 500 or exc.code == 429:
-                raise ServiceDown(f"the language model answered {exc.code}: {detail}") from exc
-            raise VLMRejected(f"the language model answered {exc.code}: {detail}") from exc
-        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
-            raise ServiceDown(str(exc)) from exc
-        except ValueError as exc:
-            raise ServiceDown(f"the language model sent something unreadable: {exc}") from exc
-
-    def ask(self, prompt: str) -> str:
-        """One round trip; the answer's text. Raises ServiceDown / VLMRejected."""
-        data = self._post({
-            "model": self.model, "temperature": 0.2, "max_tokens": 400, "presence_penalty": 1.0,
-            "chat_template_kwargs": {"enable_thinking": False},
-            "response_format": {"type": "json_schema",
-                                "json_schema": {"name": "tagger_answer", "strict": True, "schema": VLM_SCHEMA}},
-            "messages": [{"role": "system", "content": VLM_SYSTEM}, {"role": "user", "content": prompt}]})
-        try:
-            choice = data["choices"][0]
-            message = choice.get("message") or {}
-        except (KeyError, IndexError, TypeError, AttributeError):
-            raise VLMRejected("no answer in the response") from None
-        if message.get("refusal"):
-            raise VLMRejected("the model refused")
-        if choice.get("finish_reason") == "length":
-            raise VLMRejected("the answer was cut short")
-        return message.get("content")
-
-    def describe(self, tags: list[dict], rating: dict, settings: dict, kind: str = "IMAGE",
-                 terms: list[str] | None = None) -> dict:
-        """{"description", "add_tags", "remove_tags", "note"}. A refusal or a bad answer is tried once more, then
-        stored as an empty description with a note - that is not the asset's failure."""
-        prompt = vlm_prompt(tags, rating, settings, terms or [], kind)
-        problem = ""
-        for _ in range(2):
-            try:
-                answer = parse_vlm_answer(self.ask(prompt))
-            except VLMRejected as exc:
-                problem = str(exc)
-                continue
-            return {**answer, "note": ""}
-        return {"description": "", "add_tags": [], "remove_tags": [], "note": f"no description: {problem}"}
 
 
 # ---------------------------------------------------------------- the model containers
@@ -883,43 +801,29 @@ class ComposeService:
         return True
 
 
-class Services:
-    """The two model containers and the HTTP clients that talk to them (what the Indexer and the routes use)."""
+TAGGER_ENV_KEYS = ("AITAGGER_VRAM_GB",)      # what a start of the tagger container depends on (a change recreates it)
 
-    def __init__(self, tagger: Tagger | None = None, vlm: VLM | None = None, *, runner=run_command,
-                 store: "Store | None" = None, settings_fn=None, clock=time.monotonic, sleep=time.sleep,
-                 search_stop=None):
-        self.tagger, self.vlm = tagger or Tagger(), vlm or VLM()
+
+class Services:
+    """The tagger container and the HTTP client that talks to it (what the Indexer and the routes use). Only the
+    ``tagger`` compose service is ever started or stopped here. The container stops itself after a quiet spell."""
+
+    def __init__(self, tagger: Tagger | None = None, *, runner=run_command, store: "Store | None" = None,
+                 settings_fn=None, clock=time.monotonic, sleep=time.sleep, search_stop=None):
+        self.tagger = tagger or Tagger()
         self.runner, self.store, self.clock, self.sleep = runner, store, clock, sleep
         self.settings_fn = settings_fn or load_settings
         self.tagger_box = ComposeService(TAGGER_CONTAINER, TAGGER_SERVICE, runner, clock=clock)
-        self.vlm_box = ComposeService(VLM_CONTAINER, VLM_SERVICE, runner, clock=clock)
         self.search_box = ComposeService(searchplus.CONTAINER, "", runner, clock=clock)
         self.search_stop = search_stop or (lambda: searchplus.Service().stop())
-        self.last_used = clock()
         self._lock = threading.RLock()
         self._memory: dict[str, str] = {}
         self._gpu: tuple[float, dict] | None = None
         self._total_gb: float | None = None
 
-    # ---- the clients (every call counts as "in use")
-    def touch(self) -> None:
-        self.last_used = self.clock()
-
-    def tag(self, images: list[bytes]) -> tuple[list, list]:
-        self.touch()
-        try:
-            return self.tagger.tag(images)
-        finally:
-            self.touch()
-
-    def describe(self, tags: list[dict], rating: dict, settings: dict, kind: str = "IMAGE",
-                 terms: list[str] | None = None) -> dict:
-        self.touch()
-        try:
-            return self.vlm.describe(tags, rating, settings, kind, terms)
-        finally:
-            self.touch()
+    # ---- the client
+    def tag(self, images: list[bytes], models: list[str] | None = None) -> tuple[list, list]:
+        return self.tagger.tag(images, models=models)
 
     # ---- the graphics card
     def gpu(self) -> dict:
@@ -946,11 +850,9 @@ class Services:
         return info
 
     def env(self, settings: dict | None = None) -> dict:
-        """What the compose file needs: ``vram_gb`` is the taggers' cap, the describer's share is the constant
-        ``VLM_UTIL`` (not derived from ``vram_gb``), and ``vlm_parallel`` is its number of concurrent requests."""
+        """What the compose file needs: ``vram_gb`` is the taggers' memory cap."""
         settings = settings or self.settings_fn()
-        return {"AITAGGER_VRAM_GB": str(int(settings["vram_gb"])), "AITAGGER_VLM_UTIL": str(VLM_UTIL),
-                "AITAGGER_VLM_SEQS": str(int(settings["vlm_parallel"]))}
+        return {"AITAGGER_VRAM_GB": str(int(settings["vram_gb"]))}
 
     # ---- starting and stopping
     def _remembered(self) -> dict:
@@ -966,18 +868,14 @@ class Services:
         else:
             self._memory["env"] = _dumps(data)
 
-    def load(self, need_tagger: bool = True, need_vlm: bool = True) -> list[str]:
-        """Start the containers that are not running (Search+ is stopped first, while ``searchplus.AITAGGER_EXCLUSIVE``
-        says they may not share the card).
-        Returns the names it started. A container whose derived env changed since its last start is recreated."""
+    def load(self) -> list[str]:
+        """Start the tagger container if it is not running (Search+ is stopped first, while
+        ``searchplus.AITAGGER_EXCLUSIVE`` says they may not share the card). Returns the names it started. A container
+        whose derived env changed since its last start is recreated."""
         with self._lock:
-            self.touch()
-            wanted = [(box, keys) for box, keys, needed in (
-                (self.tagger_box, ("AITAGGER_VRAM_GB",), need_tagger),
-                (self.vlm_box, ("AITAGGER_VLM_UTIL", "AITAGGER_VLM_SEQS"), need_vlm)) if needed]
-            todo = [(box, keys, box.container_state(fresh=True)) for box, keys in wanted]
-            todo = [t for t in todo if t[2] != "running"]
-            if not todo:
+            box = self.tagger_box
+            state = box.container_state(fresh=True)
+            if state == "running":
                 return []
             if searchplus.AITAGGER_EXCLUSIVE and self.search_box.container_state(fresh=True) == "running":
                 try:
@@ -987,90 +885,60 @@ class Services:
                 self.search_box.invalidate()
             env = self.env()
             remembered = self._remembered()
-            started = []
-            for box, keys, state in todo:
-                wanted_env = {k: env[k] for k in keys}
-                recreate = state != "missing" and remembered.get(box.container) != wanted_env
-                try:
-                    box.up(env, recreate=recreate)
-                except RuntimeError as exc:
-                    raise ServiceDown(str(exc)) from exc
-                remembered[box.container] = wanted_env
-                self._remember(remembered)
-                started.append(box.container)
-            return started
+            wanted_env = {k: env[k] for k in TAGGER_ENV_KEYS}
+            recreate = state != "missing" and remembered.get(box.container) != wanted_env
+            try:
+                box.up(env, recreate=recreate)
+            except RuntimeError as exc:
+                raise ServiceDown(str(exc)) from exc
+            remembered[box.container] = wanted_env
+            self._remember(remembered)
+            return [box.container]
 
-    def _ready(self, need_tagger: bool, need_vlm: bool) -> bool:
-        if need_tagger:
-            health = self.tagger.health()
-            if not (health and health.get("status") == "ok"):
-                return False
-        return not need_vlm or bool(self.vlm.health())
-
-    def ensure_ready(self, need_tagger: bool = True, need_vlm: bool = True, wait: float = 3600, progress=None,
+    def ensure_ready(self, need_tagger: bool = True, wait: float = 3600, progress=None,
                      stop: threading.Event | None = None) -> None:
-        """Start what is needed and wait until it answers. ServiceDown when it is still loading after ``wait``."""
-        self.touch()
-        if self._ready(need_tagger, need_vlm):
+        """Start the tagger if needed and wait until it answers. ServiceDown when it is still loading after ``wait``.
+        ``need_tagger`` False (no tagger is switched on) needs nothing."""
+        if not need_tagger:
             return
-        self.load(need_tagger, need_vlm)
+        health = self.tagger.health()
+        if health and health.get("status") == "ok":
+            return
+        self.load()
         started = self.clock()
         deadline = started + wait
         while True:
             if stop is not None and stop.is_set():
                 raise ServiceDown("stopped")
-            health = self.tagger.health() if need_tagger else None
+            health = self.tagger.health()
             if health and health.get("status") == "error":
                 raise RuntimeError(f"the AI Tagger model failed to load: {health.get('error')}")
-            if self._ready(need_tagger, need_vlm):
-                self.touch()
+            if health and health.get("status") == "ok":
                 return
-            self.touch()                        # waiting for the models is using them
             if progress:
-                waiting = [name for name, needed, ok in (
-                    ("tagger", need_tagger, bool(health and health.get("status") == "ok")),
-                    ("language model", need_vlm, bool(need_vlm and self.vlm.health()))) if needed and not ok]
-                progress("loading the " + " and the ".join(waiting) + " into the graphics card "
+                progress("loading the tagger into the graphics card "
                          "(the very first time, the models are downloaded first)")
             if self.clock() >= deadline:
                 raise ServiceDown("the AI Tagger models are still loading")
-            if self.clock() - started > 30:
-                for box, needed in ((self.tagger_box, need_tagger), (self.vlm_box, need_vlm)):
-                    if needed and box.container_state(fresh=True) == "stopped":
-                        raise RuntimeError(f"{box.container} stopped while loading; see `docker logs {box.container}`")
+            if self.clock() - started > 30 and self.tagger_box.container_state(fresh=True) == "stopped":
+                raise RuntimeError(f"{self.tagger_box.container} stopped while loading; "
+                                   f"see `docker logs {self.tagger_box.container}`")
             self.sleep(2)
 
     def unload(self) -> list[str]:
-        """Stop both containers (frees the card)."""
+        """Stop the tagger container (frees the card)."""
         with self._lock:
-            return [box.container for box in (self.vlm_box, self.tagger_box) if box.stop()]
-
-    def idle_check(self, now: float | None = None) -> bool:
-        """Stop the VLM container when nothing has used the models for ``IDLE_EXIT_MINUTES`` (three times as long
-        while it is still loading: the very first start downloads the model)."""
-        now = self.clock() if now is None else now
-        idle = now - self.last_used
-        if idle < IDLE_EXIT_MINUTES * 60:
-            return False
-        with self._lock:
-            if self.vlm_box.container_state(fresh=True) != "running":
-                return False
-            if idle < 3 * IDLE_EXIT_MINUTES * 60 and not self.vlm.health(timeout=1.5):
-                return False
-            return self.vlm_box.stop()
+            return [box.container for box in (self.tagger_box,) if box.stop()]
 
     def status(self) -> dict:
-        tagger_state, vlm_state = self.tagger_box.container_state(), self.vlm_box.container_state()
-        th = self.tagger.health(timeout=1.5) if tagger_state == "running" else None
-        vh = self.vlm.health(timeout=1.5) if vlm_state == "running" else False
-        tagger = {"container": tagger_state, "status": "down", "error": None}
-        if th:
-            tagger.update(status=th.get("status") or "loading", error=th.get("error"))
-        elif tagger_state == "running":
+        state = self.tagger_box.container_state()
+        health = self.tagger.health(timeout=1.5) if state == "running" else None
+        tagger = {"container": state, "status": "down", "error": None}
+        if health:
+            tagger.update(status=health.get("status") or "loading", error=health.get("error"))
+        elif state == "running":
             tagger["status"] = "loading"
-        vlm = {"container": vlm_state, "status": "ok" if vh else ("loading" if vlm_state == "running" else "down"),
-               "error": None}
-        return {"tagger": tagger, "vlm": vlm, "gpu": self.gpu(),
+        return {"tagger": tagger, "gpu": self.gpu(),
                 "searchplusRunning": self.search_box.container_state() == "running"}
 
 
@@ -1086,8 +954,7 @@ create table if not exists raw (
   id text primary key, captures integer, scores_json text, rating_json text, tagged_at text, models text
 );
 create table if not exists results (
-  id text primary key, tags_json text, vlm_json text, description text, block text, settings_version integer,
-  processed_at text, written_at text, note text
+  id text primary key, tags_json text, block text, settings_version integer, processed_at text, written_at text
 );
 create index if not exists results_version on results(settings_version);
 create table if not exists history (id text, at text, old_description text, new_description text);
@@ -1100,6 +967,8 @@ create table if not exists asset_tags (id text, tag text, primary key (id, tag))
 create index if not exists asset_tags_tag on asset_tags(tag);
 """
 RAW_FORMAT = "2"        # meta.raw_format; 1 (no entry) = stored tagger scores with RAM++, 2 = with PixAI
+BLOCK_FORMAT = "3"      # meta.block_format; before v3 (no entry) a block could hold a "Description:" line
+LEGACY_TAGGERS = ("wd", "pixai")        # the registry as it was before it was remembered (meta.taggers)
 _ITEM = "a.id, a.type, a.preview, a.original, a.duration_ms, a.taken, a.name"
 _ITEM_KEYS = ("id", "type", "preview", "original", "duration_ms", "taken", "name")
 _NOT_EXCLUDED = " and not exists (select 1 from excluded e where e.id=a.id)"
@@ -1126,14 +995,36 @@ class Store:
         self._migrate()
 
     def _migrate(self) -> None:
-        """Stored scores made by the v1 service (RAM++, no PixAI entry) cannot give a v2 result. The first time a
-        store holding such scores is opened, ``settings_version`` goes up once, so every result made from them counts
-        as "outdated"; the Indexer redoes them as ``full`` whenever a reprocess (of any mode) reaches them."""
-        if self.meta("raw_format") == RAW_FORMAT:
-            return
-        if self.conn.execute("select 1 from raw where models not like '%pixai%' limit 1").fetchone():
+        """One-time changes when a store made by an older version is opened. Three things make every stored result
+        "outdated" (``settings_version`` goes up once, for all of them together, and the fact is remembered in
+        ``meta`` so it never happens twice):
+        * stored scores made by the v1 service (RAM++, no PixAI entry) cannot give a v2 result (``raw_format``);
+        * a stored block that still has v2's ``Description:`` line: a retag rewrites it without (``block_format``);
+        * a tagger that is on by default was added to the registry since the store was last opened
+          (``meta.taggers``): the results lack its tags.
+        The Indexer redoes the assets whose stored scores lack an enabled tagger as ``full``. A queued v2 "describe"
+        becomes "retag"."""
+        bump = False
+        if self.meta("raw_format") != RAW_FORMAT:
+            if self.conn.execute("select 1 from raw where models not like '%pixai%' limit 1").fetchone():
+                bump = True
+            self.set_meta("raw_format", RAW_FORMAT)
+        if self.meta("block_format") != BLOCK_FORMAT:
+            if self.conn.execute("select 1 from results where instr(block, ?) > 0 limit 1",
+                                 ("\nDescription: ",)).fetchone():
+                bump = True
+            self.set_meta("block_format", BLOCK_FORMAT)
+        seen = [k for k in self.meta("taggers").split(",") if k] or list(LEGACY_TAGGERS)
+        registered = ",".join(kind.key for kind in TAGGERS)
+        if any(kind.default_on and kind.key not in seen for kind in TAGGERS) \
+                and self.conn.execute("select 1 from results limit 1").fetchone():
+            bump = True
+        if self.meta("taggers") != registered:
+            self.set_meta("taggers", registered)
+        if bump:
             self.bump_settings_version()
-        self.set_meta("raw_format", RAW_FORMAT)
+        with self.lock, self.conn:
+            self.conn.execute("update queue set mode='retag' where mode='describe'")
 
     # ---- meta (kept in memory too: read from many threads, written rarely)
     def meta(self, key: str, default: str = "") -> str:
@@ -1227,14 +1118,12 @@ class Store:
                 "models": [m for m in (row[3] or "").split(",") if m]}
 
     # ---- results
-    def save_result(self, asset_id: str, *, tags: list[dict], vlm: dict | None, description: str, block: str,
-                    version: int, note: str = "", written: bool = False) -> None:
+    def save_result(self, asset_id: str, *, tags: list[dict], block: str, version: int, written: bool = False) -> None:
         now = _now()
         with self.lock, self.conn:
             self.conn.execute(
-                "insert or replace into results values (?,?,?,?,?,?,?,?,?)",
-                (asset_id, _dumps(tags), _dumps(vlm) if vlm is not None else None, description, block, version, now,
-                 now if written else None, note))
+                "insert or replace into results (id, tags_json, block, settings_version, processed_at, written_at)"
+                " values (?,?,?,?,?,?)", (asset_id, _dumps(tags), block, version, now, now if written else None))
             self.conn.execute("delete from asset_tags where id=?", (asset_id,))
             self.conn.executemany("insert or ignore into asset_tags values (?,?)", [(asset_id, t["tag"]) for t in tags])
             self._changes += 1
@@ -1242,13 +1131,12 @@ class Store:
     def result(self, asset_id: str) -> dict | None:
         with self.lock:
             row = self.conn.execute(
-                "select tags_json, vlm_json, description, block, settings_version, processed_at, written_at, note"
-                " from results where id=?", (asset_id,)).fetchone()
+                "select tags_json, block, settings_version, processed_at, written_at from results where id=?",
+                (asset_id,)).fetchone()
         if not row:
             return None
-        return {"tags": json.loads(row[0]), "vlm": json.loads(row[1]) if row[1] else None, "description": row[2],
-                "block": row[3], "settings_version": row[4], "processed_at": row[5], "written_at": row[6],
-                "note": row[7] or ""}
+        return {"tags": json.loads(row[0]), "block": row[1], "settings_version": row[2], "processed_at": row[3],
+                "written_at": row[4]}
 
     def mark_written(self, asset_id: str) -> None:
         with self.lock, self.conn:
@@ -1308,8 +1196,7 @@ class Store:
     def enqueue(self, ids: list[str], mode: str) -> int:
         """Ask for ``mode`` on these assets; a stronger mode replaces a weaker one already waiting.
         Asking is explicit, so earlier failures and an "exclude" are forgotten. Returns how many ids."""
-        if mode not in RANK:
-            raise ValueError("mode must be retag, describe or full")
+        mode = normalize_mode(mode)
         ids = list(dict.fromkeys(ids))
         if not ids:
             return 0
@@ -1317,8 +1204,8 @@ class Store:
         with self.lock, self.conn:
             self.conn.executemany(
                 "insert into queue (id, mode, at) values (?,?,?) on conflict(id) do update set mode=excluded.mode,"
-                " at=excluded.at where (case excluded.mode when 'full' then 3 when 'describe' then 2 else 1 end)"
-                " > (case queue.mode when 'full' then 3 when 'describe' then 2 else 1 end)",
+                " at=excluded.at where (case excluded.mode when 'full' then 2 else 1 end)"
+                " > (case queue.mode when 'full' then 2 else 1 end)",
                 [(i, mode, now) for i in ids])
             self.conn.executemany("delete from failed where id=?", [(i,) for i in ids])
             self.conn.executemany("delete from excluded where id=?", [(i,) for i in ids])
@@ -1333,7 +1220,7 @@ class Store:
         """Take an asset off the queue when what was just done is at least what was asked for."""
         with self.lock, self.conn:
             row = self.conn.execute("select mode from queue where id=?", (asset_id,)).fetchone()
-            if row and RANK[row[0]] <= RANK[done_mode]:
+            if row and RANK[normalize_mode(row[0])] <= RANK[normalize_mode(done_mode)]:
                 self.conn.execute("delete from queue where id=?", (asset_id,))
 
     def scope_ids(self, scope: str, ids=None, tag: str = "") -> list[str]:
@@ -1406,9 +1293,9 @@ class Store:
             args.append(norm_tag(tag))
         if q:
             like = _like(q.lower())
-            where.append("(lower(a.name) like ? escape '\\' or lower(r.description) like ? escape '\\' or exists"
+            where.append("(lower(a.name) like ? escape '\\' or exists"
                          " (select 1 from asset_tags t where t.id=a.id and t.tag like ? escape '\\'))")
-            args += [like, like, like]
+            args += [like, like]
         if outdated:
             where.append("r.settings_version < ?")
             args.append(self.settings_version)
@@ -1417,50 +1304,48 @@ class Store:
         with self.lock:
             total = self.conn.execute(f"select count(*) {join} where {clause}", args).fetchone()[0]
             rows = self.conn.execute(
-                f"select a.id, a.name, a.type, a.taken, r.tags_json, r.description, r.settings_version, r.processed_at"
+                f"select a.id, a.name, a.type, a.taken, r.tags_json, r.settings_version, r.processed_at"
                 f" {join} where {clause} order by a.taken desc, a.id limit ? offset ?",
                 (*args, size, (page - 1) * size)).fetchall()
         items = [{"id": r[0], "name": r[1], "type": r[2], "taken": r[3], "tags": [t["tag"] for t in json.loads(r[4])],
-                  "description": r[5] or "", "settingsVersion": r[6], "processedAt": r[7]} for r in rows]
+                  "settingsVersion": r[5], "processedAt": r[6]} for r in rows]
         return {"items": items, "total": total, "page": page, "tags": self.top_tags()}
 
 
 # ---------------------------------------------------------------- one asset, start to finish
 
 def synthetic_raw(captures: int) -> dict:
-    """Stand-in for tagger scores when neither tagger is used (then there are no tags, so nothing to describe either)."""
-    return {"captures": captures, "scores": [{"wd": None, "pixai": None}] * captures, "ratings": [None] * captures,
-            "models": []}
+    """Stand-in for tagger scores when no tagger is used (then there are no tags either)."""
+    return {"captures": captures, "scores": [{kind.key: None for kind in TAGGERS}] * captures,
+            "ratings": [None] * captures, "models": []}
 
 
 def raw_from_results(results: list, errors: list) -> dict | str:
     """The tagger's answers for one asset's captures as a stored ``raw`` payload, or the error text.
 
-    ``scores[i]`` holds capture i's calibrated tag scores per model (WD: general, character; PixAI: general,
-    character, copyright), ``ratings[i]`` its raw rating probabilities as ``{"wd": {...}, "pixai": {...}}``.
+    ``scores[i]`` holds capture i's calibrated tag scores per tagger (``{key: {category: {tag: score}} | None}``, the
+    categories of its registry entry; ``None`` when it did not answer), ``ratings[i]`` its raw rating probabilities as
+    ``{key: {rating: probability} | None}`` (``None`` for a tagger without a rating).
     """
     good = [r for r in results if r]
     if not good:
         return next((e for e in errors if e), "the tagger could not read this picture")
     scores, ratings, models = [], [], set()
     for r in good:
-        wd, pixai = r.get("wd"), r.get("pixai")
-        if wd is not None:
-            models.add("wd")
-        if pixai is not None:
-            models.add("pixai")
-        scores.append({
-            "wd": None if wd is None else {"general": wd.get("general") or {}, "character": wd.get("character") or {}},
-            "pixai": None if pixai is None else {"general": pixai.get("general") or {},
-                                                 "character": pixai.get("character") or {},
-                                                 "copyright": pixai.get("copyright") or {}}})
-        rating = {"wd": (wd or {}).get("rating") or None, "pixai": (pixai or {}).get("rating") or None}
+        entry, rating = {}, {}
+        for kind in TAGGERS:
+            data = r.get(kind.key)
+            if data is not None:
+                models.add(kind.key)
+            entry[kind.key] = None if data is None else {c: data.get(c) or {} for c in kind.categories}
+            rating[kind.key] = ((data or {}).get("rating") or None) if kind.has_rating else None
+        scores.append(entry)
         ratings.append(rating if any(rating.values()) else None)
     return {"captures": len(good), "scores": scores, "ratings": ratings, "models": sorted(models)}
 
 
 class Pipeline:
-    """What is done to an asset: captures, tagging, VLM, tags, write-back. Used by the Indexer and the Test card."""
+    """What is done to an asset: captures, tagging, tags, write-back. Used by the Indexer and the Test card."""
 
     def __init__(self, store: Store, services, client_fn, frames=prepare_captures):
         self.store, self.services, self.client_fn, self.frames = store, services, client_fn, frames
@@ -1480,37 +1365,15 @@ class Pipeline:
         return version, load_settings()
 
     # ---- tagging
-    def tag_batch(self, batch: list[tuple[dict, list[bytes]]]) -> dict:
-        """{asset id: stored-raw payload, or an error text} for assets whose captures go in one request."""
-        results, errors = self.services.tag([f for _, frames in batch for f in frames])
+    def tag_batch(self, batch: list[tuple[dict, list[bytes]]], models: list[str] | None = None) -> dict:
+        """{asset id: stored-raw payload, or an error text} for assets whose captures go in one request. ``models``
+        are the keys of the taggers to run (the enabled ones)."""
+        results, errors = self.services.tag([f for _, frames in batch for f in frames], models=models)
         out, i = {}, 0
         for item, frames in batch:
             out[item["id"]] = raw_from_results(results[i:i + len(frames)], errors[i:i + len(frames)])
             i += len(frames)
         return out
-
-    # ---- the VLM (text only: it is given the tags, never a picture)
-    def run_vlm(self, item: dict, found: dict, settings: dict) -> dict:
-        tags = sorted(({"tag": t, "score": round(v[0], 3)} for t, v in found["tags"].items()),
-                      key=lambda t: (-t["score"], t["tag"]))
-        if not tags:                # nothing to describe from: a text model would only make something up
-            return {"description": "", "add_tags": [], "remove_tags": [],
-                    "note": "no description: the taggers found no tags to describe from"}
-        rating = found["display"].get("rating") or {}
-        answer = self.services.describe(tags, rating, settings, item["type"], found["terms"])
-        return {"description": answer.get("description", ""), "add_tags": list(answer.get("add_tags") or []),
-                "remove_tags": list(answer.get("remove_tags") or []), "note": answer.get("note", "")}
-
-    def decide(self, item: dict, mode: str, raw: dict, settings: dict,
-               stored_vlm: dict | None = None) -> tuple[dict, dict | None]:
-        """(the decision, the VLM answer): the VLM runs unless ``mode`` is retag (then the stored answer is used)."""
-        vlm = None
-        if settings["describe"]:
-            if mode == "retag":
-                vlm = stored_vlm
-            else:
-                vlm = self.run_vlm(item, detect(raw, settings), settings)
-        return build(raw, vlm, settings), vlm
 
     # ---- Immich
     @staticmethod
@@ -1575,23 +1438,21 @@ class Pipeline:
             self.sync_native(asset_id, asset, tags if settings["write_tags"] else [])
         return {"old": old, "new": new, "changed": new != old}
 
-    def commit(self, item: dict, mode: str, decision: dict, vlm: dict | None, version: int, settings: dict) -> dict:
+    def commit(self, item: dict, mode: str, decision: dict, version: int, settings: dict) -> dict:
         """Store the result, write it to Immich (and read it back), mark it written."""
-        self.store.save_result(item["id"], tags=decision["tags"], vlm=vlm, description=decision["description"],
-                               block=decision["block"], version=version, note=(vlm or {}).get("note", ""))
+        self.store.save_result(item["id"], tags=decision["tags"], block=decision["block"], version=version)
         written = self.write_back(item["id"], decision["block"], [t["tag"] for t in decision["tags"]], settings)
         self.store.mark_written(item["id"])
         self.store.dequeue(item["id"], mode)
         return written
 
     # ---- the whole thing for one asset (Indexer)
-    def process(self, item: dict, mode: str, raw: dict, settings: dict, version: int,
-                covers: str | None = None) -> dict:
-        """Do ``mode`` for one asset. ``covers`` is what the work counts as when taking it off the queue."""
-        previous = self.store.result(item["id"])
-        decision, vlm = self.decide(item, mode, raw, settings, (previous or {}).get("vlm"))
-        written = self.commit(item, covers or mode, decision, vlm, version, settings)
-        return {"decision": decision, "vlm": vlm, "write": written}
+    def process(self, item: dict, mode: str, raw: dict, settings: dict, version: int) -> dict:
+        """Do ``mode`` for one asset (``raw`` is the stored scores, or what the taggers just said). ``mode`` is also
+        what the work counts as when taking it off the queue."""
+        decision = build(raw, settings)
+        written = self.commit(item, mode, decision, version, settings)
+        return {"decision": decision, "write": written}
 
     def lookup(self, asset_id: str, refresh=None) -> dict:
         item = self.store.asset(asset_id)
@@ -1606,32 +1467,30 @@ class Pipeline:
         """The Test card: run the whole pipeline on one asset; store and write only when ``write``."""
         item = self.lookup(asset_id, refresh)
         version, settings = self.snapshot()
-        tagger_used = settings["use_wd"] or settings["use_pixai"]
-        self.services.ensure_ready(need_tagger=tagger_used, need_vlm=needs_vlm(settings), wait=PREVIEW_WAIT)
+        wanted = [kind.key for kind in enabled_kinds(settings)]
+        tagger_used = bool(wanted)
+        self.services.ensure_ready(need_tagger=tagger_used, wait=PREVIEW_WAIT)
         try:
             frames, _kind = self.frames(item, settings["video_frames"])
         except (OSError, ValueError) as exc:
             raise ValueError(f"Could not read this {item['type'].lower()}: {exc}") from exc
         if tagger_used:
-            raw = self.tag_batch([(item, frames)])[item["id"]]
+            raw = self.tag_batch([(item, frames)], wanted)[item["id"]]
             if isinstance(raw, str):
                 raise ValueError(f"The tagger could not read this picture: {raw}")
         else:
             raw = synthetic_raw(len(frames))
-        decision, vlm = self.decide(item, "full", raw, settings)
+        decision = build(raw, settings)
         current, _asset = self.current(asset_id)
         out = {"id": item["id"], "name": item["name"], "type": item["type"], "captures": len(frames),
                "frames": [data_url(_shrunk(f, PREVIEW_SIDE)) for f in frames],
-               "models": decision["models"],
-               "vlm": {"description": (vlm or {}).get("description", ""), "add_tags": (vlm or {}).get("add_tags", []),
-                       "remove_tags": (vlm or {}).get("remove_tags", []), "note": (vlm or {}).get("note", "")},
-               "rules": decision["rules"], "tags": decision["tags"], "description": decision["description"],
+               "models": decision["models"], "rules": decision["rules"], "tags": decision["tags"],
                "block": decision["block"], "currentDescription": current,
                "newDescription": merge_description(current, decision["block"]), "written": False}
         if write:
             if tagger_used:
                 self.store.save_raw(item["id"], raw)
-            self.commit(item, "full", decision, vlm, version, settings)
+            self.commit(item, "full", decision, version, settings)
             out["written"] = True
         return out
 
@@ -1665,9 +1524,8 @@ def _shrunk(jpeg: bytes, side: int) -> bytes:
 
 
 def reprocess(store: Store, scope: str, mode: str, ids=None, tag: str = "") -> int:
-    """Queue assets for a reprocess; returns how many."""
-    if mode not in RANK:
-        raise ValueError("mode must be retag, describe or full")
+    """Queue assets for a reprocess; returns how many. The v2 mode "describe" counts as "retag"."""
+    mode = normalize_mode(mode)
     if scope == "ids":
         if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
             raise ValueError("ids must be a list of asset ids")
@@ -1682,17 +1540,18 @@ def reprocess(store: Store, scope: str, mode: str, ids=None, tag: str = "") -> i
 # ---------------------------------------------------------------- the background worker
 
 class Indexer:
-    """Background thread that tags and describes the assets; stop / start at will, it resumes where it was.
+    """Background thread that tags the assets; stop / start at will, it resumes where it was.
 
     Work order: the queue (asked-for reprocessing) first, then the assets with no written result, newest first.
     Pictures are prepared by ``WORKERS`` threads, at most ``TAG_REQUESTS`` tagger requests are in flight, and
-    ``vlm_parallel`` assets are in the VLM / write-back stage at once.
+    ``WRITERS`` assets are in the write-back stage (Immich) at once.
     """
 
     CATALOG_EVERY = 600         # re-read the library list this often (and look for new photos)
     WORKERS = 6                 # threads reading previews / cutting video frames
     TAG_REQUESTS = 2            # tagger requests in flight
-    IDLE_POLL = 60              # seconds between looks at the idle clock while there is nothing to do
+    WRITERS = 8                 # assets being written to Immich (and read back) at once
+    IDLE_POLL = 60              # seconds between looks for new work while there is nothing to do
     DROP_WAIT = 10              # seconds to wait (times the number of drops in a row) after a server went away
 
     def __init__(self, store: Store, services, *, client=None, catalog=fetch_catalog, frames=prepare_captures,
@@ -1714,8 +1573,7 @@ class Indexer:
         self._inflight: set[str] = set()
         self._pending: set = set()
         self._done = 0                          # assets finished in this process (progress, for the drop counter)
-        self._vlm_limit = DEFAULTS["vlm_parallel"]
-        self._prep = self._tagpool = self._vlmpool = None
+        self._prep = self._tagpool = self._writepool = None
 
     @property
     def frames(self):
@@ -1779,11 +1637,9 @@ class Indexer:
     def _run(self, stop: threading.Event) -> None:
         drops, last_done = 0, self._done
         try:
-            settings = load_settings()
-            self._vlm_limit = max(1, int(settings["vlm_parallel"]))
             self._prep = ThreadPoolExecutor(self.WORKERS, thread_name_prefix="aitagger-prep")
             self._tagpool = ThreadPoolExecutor(self.TAG_REQUESTS, thread_name_prefix="aitagger-tag")
-            self._vlmpool = ThreadPoolExecutor(self._vlm_limit, thread_name_prefix="aitagger-vlm")
+            self._writepool = ThreadPoolExecutor(self.WRITERS, thread_name_prefix="aitagger-write")
             while not stop.is_set():
                 try:
                     outcome = self._step(stop)
@@ -1809,12 +1665,12 @@ class Indexer:
             self.state, self.detail, self.error = "error", f"{type(exc).__name__}: {exc}", f"{type(exc).__name__}: {exc}"
         finally:
             self._drain()
-            for pool in (self._tagpool, self._vlmpool):
+            for pool in (self._tagpool, self._writepool):
                 if pool:
                     pool.shutdown(wait=True, cancel_futures=True)
             if self._prep:                      # one slow video (a huge file) must not hold up pausing
                 self._prep.shutdown(wait=False, cancel_futures=True)
-            self._prep = self._tagpool = self._vlmpool = None
+            self._prep = self._tagpool = self._writepool = None
 
     def _step(self, stop: threading.Event) -> str:
         """One look for work and one round of it: "over" when the run is finished, "idle" when there was nothing
@@ -1826,19 +1682,18 @@ class Indexer:
         items = self.store.work(self.batch_size(settings), skip=self._flying())
         if not items:
             if self._pending:
-                self._reap(0, stop)             # earlier assets are still being described / written
+                self._reap(0, stop)             # earlier assets are still being written
                 return "busy"
             if not settings["keep_updated"]:
                 self.state, self.detail = "done", "everything is tagged"
                 return "over"
             self.state, self.detail = "done", "everything is tagged; looks for new photos every 10 minutes"
-            self.services.idle_check()
             self._wake.wait(min(self.IDLE_POLL, max(self.CATALOG_EVERY - (self.clock() - self.last_sync), 1)))
             self._wake.clear()
             return "idle"
         self.state, self.detail = "running", "tagging"
         self._round(items, settings, version, stop)
-        self._reap(self._vlm_limit, stop)       # never more than a pool-full waiting for the VLM
+        self._reap(self.WRITERS, stop)          # never more than a pool-full waiting to be written
         return "busy"
 
     # ---- who is being worked on
@@ -1868,23 +1723,14 @@ class Indexer:
         try:
             local, captured = [], []
             for item in items:
-                item["asked"] = item["mode"]
-                mode, raw = item["mode"], None
-                if mode == "describe" and not settings["describe"]:
-                    mode = "retag"              # nothing to ask the VLM: the stored scores are all there is
-                if mode in ("retag", "describe"):
+                mode, raw = normalize_mode(item["mode"]), None
+                if mode == "retag":
                     raw = self.store.raw(item["id"])
-                    if raw is None or (settings["use_pixai"] and not has_pixai(raw)):
-                        mode = "full"           # nothing stored to work from, or only the v1 service's scores (no PixAI)
+                    if raw is None or missing_kinds(raw, settings):
+                        mode = "full"           # nothing stored to work from, or no scores of an enabled tagger
                 item["mode"], item["raw"] = mode, raw
                 (captured if mode == "full" else local).append(item)
-            # No pictures are needed for these: the stored scores and, for "retag", the stored answer. A "describe"
-            # asks the (text-only) language model again, so only that one has to be up.
-            if needs_vlm(settings) and any(i["mode"] == "describe" for i in local):
-                self.state, self.detail = "starting", "waiting for the language model"
-                self.services.ensure_ready(need_tagger=False, need_vlm=True, wait=3600, stop=stop,
-                                           progress=lambda d: setattr(self, "detail", d))
-                self.state, self.detail = "running", "describing"
+            # No pictures and no GPU are needed for these: the stored scores are all there is.
             for item in local:
                 self._submit_finish(item, settings, version)
             if captured:
@@ -1895,9 +1741,10 @@ class Indexer:
                     self._release(item["id"])
 
     def _capture_and_tag(self, items: list[dict], settings: dict, version: int, stop: threading.Event) -> None:
-        need_tagger = settings["use_wd"] or settings["use_pixai"]
+        wanted = [kind.key for kind in enabled_kinds(settings)]
+        need_tagger = bool(wanted)
         self.state, self.detail = "starting", "waiting for the models"
-        self.services.ensure_ready(need_tagger=need_tagger, need_vlm=needs_vlm(settings), wait=3600, stop=stop,
+        self.services.ensure_ready(need_tagger=need_tagger, wait=3600, stop=stop,
                                    progress=lambda d: setattr(self, "detail", d))
         self.state, self.detail = "running", "tagging"
         futures = {self._prep.submit(self.pipe.frames, item, settings["video_frames"]): item for item in items}
@@ -1913,7 +1760,7 @@ class Indexer:
                 except Exception as exc:  # noqa: BLE001 - unreadable file: note it and go on
                     self._fail(item, exc)
                     continue
-                if not need_tagger:             # no tagger is on: the describer has no tags to go on
+                if not need_tagger:             # no tagger is on: there are no tags to make
                     item["raw"] = synthetic_raw(len(frames))
                     self._submit_finish(item, settings, version)
                     continue
@@ -1949,7 +1796,7 @@ class Indexer:
 
     def _tag_stage(self, batch: list, settings: dict, version: int) -> None:
         try:
-            results = self._tag_halving(batch)
+            results = self._tag_halving(batch, [kind.key for kind in enabled_kinds(settings)])
         except BaseException:
             for item, _ in batch:
                 self._release(item["id"])
@@ -1964,32 +1811,30 @@ class Indexer:
             item["raw"] = res
             self._submit_finish(item, settings, version)
 
-    def _tag_halving(self, batch: list) -> dict:
+    def _tag_halving(self, batch: list, models: list[str]) -> dict:
         """Tag a batch; when the card is out of memory, halve the batch size (for this session) and retry."""
         try:
-            return self.pipe.tag_batch(batch)
+            return self.pipe.tag_batch(batch, models)
         except GpuOOM as exc:
             half = max(1, len(batch) // 2)
             self.batch_cap, self._cap_for = half if len(batch) > 1 else 1, self._round_batch
             if len(batch) == 1:
                 return {batch[0][0]["id"]: f"out of graphics memory, even for this one picture ({exc})"[:300]}
             self.detail = f"the graphics card is full: now {half} assets at a time"
-            out = self._tag_halving(batch[:half])
-            out.update(self._tag_halving(batch[half:]))
+            out = self._tag_halving(batch[:half], models)
+            out.update(self._tag_halving(batch[half:], models))
             return out
 
-    # ---- the VLM / write-back stage
+    # ---- the write-back stage
     def _submit_finish(self, item: dict, settings: dict, version: int) -> None:
         item["_handed"] = True
-        fut = self._vlmpool.submit(self._finish, item, settings, version)
+        fut = self._writepool.submit(self._finish, item, settings, version)
         with self._flight_lock:
             self._pending.add(fut)
 
     def _finish(self, item: dict, settings: dict, version: int) -> None:
         try:
-            # "describe" with describe switched off was done as a retag: that is all there is to do, so it is done
-            covers = item["asked"] if item["asked"] == "describe" and item["mode"] == "retag" else item["mode"]
-            self.pipe.process(item, item["mode"], item["raw"], settings, version, covers)
+            self.pipe.process(item, item["mode"], item["raw"], settings, version)
             self.done_times.append((self.clock(), 1))
             with self._flight_lock:
                 self._done += 1
@@ -2001,7 +1846,7 @@ class Indexer:
             self._release(item["id"])
 
     def _reap(self, limit: int, stop: threading.Event | None = None) -> None:
-        """Wait until at most ``limit`` assets are in the VLM stage; re-raise the first failure that matters."""
+        """Wait until at most ``limit`` assets are in the write-back stage; re-raise the first failure that matters."""
         while True:
             with self._flight_lock:
                 done = {f for f in self._pending if f.done()}
@@ -2015,7 +1860,7 @@ class Indexer:
             wait(waiting, timeout=1, return_when=FIRST_COMPLETED)
 
     def _drain(self) -> None:
-        """Wait for everything in the VLM stage to finish (their outcome is already recorded or doesn't matter)."""
+        """Wait for everything in the write-back stage to finish (their outcome is already recorded or doesn't matter)."""
         with self._flight_lock:
             pending = list(self._pending)
         if pending:
@@ -2037,28 +1882,14 @@ _LOCK = threading.Lock()
 _INSTANCE: dict = {}
 
 
-def _watch(services, every: float = 60) -> None:
-    """Stops the VLM container when nothing has used it for ``IDLE_EXIT_MINUTES`` (also while tagging is paused)."""
-    def loop() -> None:
-        while True:
-            time.sleep(every)
-            try:
-                services.idle_check()
-            except Exception:  # noqa: BLE001
-                pass
-
-    threading.Thread(target=loop, name="aitagger-idle", daemon=True).start()
-
-
 def instance(client=None) -> tuple[Store, Services, Indexer]:
-    """The panel's store / model containers / indexer (created on first use; ``client`` is the Immich client)."""
+    """The panel's store / tagger container / indexer (created on first use; ``client`` is the Immich client)."""
     with _LOCK:
         key = str(home())
         if key not in _INSTANCE:
             store = Store()
             services = Services(store=store)
             _INSTANCE[key] = (store, services, Indexer(store, services, client=client))
-            _watch(services)
         parts = _INSTANCE[key]
         if client is not None and parts[2].client is None:
             parts[2].client = client
@@ -2066,7 +1897,7 @@ def instance(client=None) -> tuple[Store, Services, Indexer]:
 
 
 def autostart(client=None) -> None:
-    """Resume tagging after a panel restart if it was on (and start watching the idle clock either way)."""
+    """Resume tagging after a panel restart if it was on."""
     try:
         parts = instance(client)
         if load_settings().get("indexing"):

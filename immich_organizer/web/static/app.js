@@ -1763,11 +1763,13 @@
   });
 
   // -------------------------------------------------------------- AI Tagger
-  // Two image taggers plus a small text model write tags and a description into the Immich description
-  // (see aitagger.py and docs/AI-TAGGER.md). Same shape as Search+: status polled every 5 s while the tab shows.
+  // Image taggers write their tags into the Immich description (see aitagger.py and docs/AI-TAGGER.md). Which taggers
+  // there are comes from the status (`models`): the form has an enable box and a strictness slider for each of them.
+  // Same shape as Search+: status polled every 5 s while the tab shows.
 
   const tagState = {
     data: null, timer: null, failKey: "",
+    taggerKeys: [], taggerSig: "",   // the registered taggers the form was built for
     base: {},              // form values as last loaded or saved: tells which keys the person changed
     seen: {},              // the server value each form field was last filled from
     rules: [],             // the rule rows being edited
@@ -1785,53 +1787,42 @@
   const tgScore = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(2) : "");
   const TG_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-  // Every setting the form edits. `kind` says how to read and write it.
+  // Every setting the form edits. `kind` says how to read and write it. The per-tagger ones (`use_<key>`,
+  // `<key>_strictness`) are added by tgBuildTaggers from the status, so a newly registered tagger shows up without
+  // editing this file.
   const TG_FIELDS = {
-    instructions:   { id: "tg-instructions", kind: "text" },
     vocabulary:     { id: "tg-vocabulary", kind: "text" },
     blocked:        { id: "tg-blocked", kind: "list" },
-    language:       { id: "tg-language", kind: "line" },
-    describe:       { id: "tg-describe", kind: "bool" },
-    use_wd:         { id: "tg-use-wd", kind: "bool" },
-    use_pixai:      { id: "tg-use-pixai", kind: "bool" },
     character_tags: { id: "tg-character", kind: "bool" },
     rating_tag:     { id: "tg-rating", kind: "bool" },
     write_tags:     { id: "tg-write-tags", kind: "bool" },
-    wd_strictness:  { id: "tg-wd", kind: "float" },
-    pixai_strictness: { id: "tg-pixai", kind: "float" },
     max_tags:       { id: "tg-max", kind: "int" },
     video_frames:   { kind: "frames" },
     batch_size:     { id: "tg-batch", kind: "int" },
-    vlm_parallel:   { id: "tg-parallel", kind: "int" },
     vram_gb:        { id: "tg-vram", kind: "int" },
   };
   const TG_LABELS = {
-    instructions: "Instructions", vocabulary: "Vocabulary", blocked: "Blocked tags", language: "Language",
-    describe: "Short description from the tags", use_wd: "WD tagger", use_pixai: "PixAI tagger", character_tags: "Character names",
-    rating_tag: "Rating tag", write_tags: "Immich tags", wd_strictness: "WD strictness", pixai_strictness: "PixAI strictness",
-    max_tags: "Most tags per photo", rules: "Rules", video_frames: "Captures per video", batch_size: "Assets per round",
-    vlm_parallel: "Parallel descriptions", vram_gb: "GPU memory",
+    vocabulary: "Vocabulary", blocked: "Blocked tags", character_tags: "Character names", rating_tag: "Rating tag",
+    write_tags: "Immich tags", max_tags: "Most tags per photo", rules: "Rules", video_frames: "Captures per video",
+    batch_size: "Assets per round", vram_gb: "GPU memory",
   };
-  // Which settings change what is written, and the lightest reprocess mode that applies them.
+  // Which settings change what is written, and the lightest reprocess mode that applies them. The server says which
+  // (`reprocessKeys` in the status, see tgSetModes); the tagger keys follow the same rule: switching one on or off
+  // runs the taggers again ("full"), its strictness only re-applies the stored scores ("retag").
   const TG_MODE_OF = {
-    wd_strictness: "retag", pixai_strictness: "retag", rules: "retag", blocked: "retag", max_tags: "retag",
-    write_tags: "retag", character_tags: "retag", rating_tag: "retag",
-    instructions: "describe", vocabulary: "describe", language: "describe", describe: "describe",
-    video_frames: "full", use_wd: "full", use_pixai: "full",
+    rules: "retag", blocked: "retag", max_tags: "retag", write_tags: "retag", character_tags: "retag", rating_tag: "retag",
+    vocabulary: "retag", video_frames: "full",
   };
   const TG_MODES = [
     ["retag", "Re-tag", "quick, re-applies the stored results, no GPU needed"],
-    ["describe", "Re-describe", "asks the description model again"],
-    ["full", "Full re-process", "runs the taggers and the description model again, slowest"],
+    ["full", "Full re-process", "runs the taggers again, slowest"],
   ];
   const TG_GROUPS = {
-    how: ["instructions", "vocabulary", "blocked", "language", "describe", "use_wd", "use_pixai", "character_tags",
-      "rating_tag", "write_tags", "wd_strictness", "pixai_strictness", "max_tags"],
-    rules: ["rules"],
-    speed: ["video_frames", "batch_size", "vlm_parallel", "vram_gb"],
+    how: () => ["vocabulary", "blocked", ...tagState.taggerKeys.flatMap((k) => [`use_${k}`, `${k}_strictness`]),
+      "character_tags", "rating_tag", "write_tags", "max_tags"],
+    rules: () => ["rules"],
+    speed: () => ["video_frames", "batch_size", "vram_gb"],
   };
-  const TG_LIMIT_IDS = { wd_strictness: "tg-wd", pixai_strictness: "tg-pixai", max_tags: "tg-max", batch_size: "tg-batch",
-    vlm_parallel: "tg-parallel", vram_gb: "tg-vram" };
   const TG_RULE_KEYS = ["if_all", "if_any", "unless", "add", "remove"];
 
   const tgFrames = segmented("tg-frames");
@@ -1874,18 +1865,67 @@
   }
 
   function tgShowSliders() {
-    $("tg-wd-v").textContent = tgScore($("tg-wd").value);
-    $("tg-pixai-v").textContent = tgScore($("tg-pixai").value);
+    tagState.taggerKeys.forEach((k) => {
+      const slider = $(`tg-${k}`), out = $(`tg-${k}-v`);
+      if (slider && out) out.textContent = tgScore(slider.value);
+    });
     $("tg-vram-v").textContent = `${$("tg-vram").value} GB`;
   }
-  ["tg-wd", "tg-pixai", "tg-vram"].forEach((id) => $(id).addEventListener("input", tgShowSliders));
+  $("tg-vram").addEventListener("input", tgShowSliders);
+
+  // One enable box and one strictness slider per tagger the panel has registered (the status' `models`, key ->
+  // model name), in its order. Rebuilt only when that list changes.
+  function tgBuildTaggers(models) {
+    const keys = Object.keys(models || {});
+    const sig = keys.map((k) => `${k}=${models[k]}`).join("|");
+    if (sig === tagState.taggerSig) return;
+    tagState.taggerSig = sig;
+    tagState.taggerKeys.forEach((k) => {
+      [`use_${k}`, `${k}_strictness`].forEach((key) => {
+        delete TG_FIELDS[key]; delete TG_LABELS[key]; delete TG_MODE_OF[key];
+        delete tagState.base[key]; delete tagState.seen[key];
+      });
+    });
+    tagState.taggerKeys = keys;
+    const box = $("tg-taggers");
+    box.textContent = "";
+    keys.forEach((k) => {
+      const name = models[k] || k;
+      const use = tgEl("label", "check");
+      const enable = document.createElement("input");
+      enable.type = "checkbox"; enable.id = `tg-use-${k}`;
+      use.append(enable, tgEl("span", "", `Use ${name}`));
+      const field = tgEl("label", "field");
+      const head = tgEl("span", "", `${name} strictness: `);
+      const value = tgEl("b", ""); value.id = `tg-${k}-v`;
+      head.appendChild(value);
+      const slider = document.createElement("input");
+      slider.type = "range"; slider.className = "slider"; slider.step = "0.01"; slider.id = `tg-${k}`;
+      slider.addEventListener("input", tgShowSliders);
+      field.append(head, slider);
+      box.append(use, field);
+      TG_FIELDS[`use_${k}`] = { id: enable.id, kind: "bool" };
+      TG_FIELDS[`${k}_strictness`] = { id: slider.id, kind: "float" };
+      TG_LABELS[`use_${k}`] = name;
+      TG_LABELS[`${k}_strictness`] = `${name} strictness`;
+      TG_MODE_OF[`use_${k}`] = "full";
+      TG_MODE_OF[`${k}_strictness`] = "retag";
+    });
+  }
+
+  // The server's own list of which settings need which reprocess mode wins over the pattern above.
+  function tgSetModes(reprocessKeys) {
+    Object.entries(reprocessKeys || {}).forEach(([mode, keys]) => {
+      (Array.isArray(keys) ? keys : []).forEach((key) => { if (key in TG_FIELDS || key === "rules") TG_MODE_OF[key] = mode; });
+    });
+  }
 
   // The ranges come from the server (`limits`), never from here. Set them before filling in values.
   function tgApplyLimits(limits) {
-    Object.entries(TG_LIMIT_IDS).forEach(([key, id]) => {
-      const range = limits && limits[key];
-      if (!range) return;
-      const el = $(id);
+    Object.entries(limits || {}).forEach(([key, range]) => {
+      const field = TG_FIELDS[key];
+      const el = field && field.id ? $(field.id) : null;
+      if (!el || !Array.isArray(range)) return;
       el.min = String(range[0]);
       el.max = String(range[1]);
       if (el.type !== "number") return;
@@ -1954,7 +1994,7 @@
   function renderTagger(data) {
     tagState.data = data;
     const c = data.counts || {}, ix = data.indexer || {}, sv = data.service || {}, cfg = data.settings || {};
-    const tg = sv.tagger || {}, vl = sv.vlm || {}, gpu = sv.gpu || {}, models = data.models || {};
+    const tg = sv.tagger || {}, gpu = sv.gpu || {}, models = data.models || {};
     const processed = c.processed || 0, total = c.assets || 0;
 
     let text, cls = "";
@@ -1989,20 +2029,20 @@
       box.appendChild(d);
     });
 
-    const lines = [`Taggers: ${tgServiceWord(tg)} · Description model: ${tgServiceWord(vl)}`
+    const lines = [`Taggers: ${tgServiceWord(tg)}`
       + (gpu.totalGb ? ` · GPU ${gpu.usedGb != null ? gpu.usedGb : "?"} of ${gpu.totalGb} GB in use` : "")];
     const exclusive = sv.exclusive !== false;      // the panel says whether Search+ and the tagger take turns on the GPU
     $("tg-exclusive-note").classList.toggle("is-hidden", !exclusive);
     if (exclusive && sv.searchplusRunning) lines.push("Search+ is using the GPU right now; it is stopped when the tagger starts.");
-    const names = [models.wd, models.pixai, models.vlm].filter(Boolean);
+    const names = Object.entries(models).filter(([k, name]) => name && cfg[`use_${k}`] !== false).map(([, name]) => name);
     if (names.length) lines.push(`Models: ${names.join(" · ")}`);
     $("tg-service").textContent = lines.join("\n");
 
     const toggle = $("tg-toggle");
     toggle.textContent = cfg.indexing ? "Pause" : (processed ? "Resume tagging" : "Start tagging");
     toggle.classList.toggle("btn-primary", !cfg.indexing);
-    $("tg-load").disabled = tg.status === "ok" && vl.status === "ok";
-    $("tg-unload").disabled = ![tg, vl].some((s) => s.container === "running") && !cfg.indexing;
+    $("tg-load").disabled = tg.status === "ok";
+    $("tg-unload").disabled = tg.container !== "running" && !cfg.indexing;
 
     const fails = data.failures || [];
     $("tg-fail-box").classList.toggle("is-hidden", !c.failed && !fails.length);
@@ -2027,6 +2067,8 @@
     $("tg-outdated-row").classList.toggle("is-hidden", !c.outdated);
     $("tg-outdated-text").textContent = `${plural(c.outdated || 0, "tagged asset")} still ${c.outdated === 1 ? "has" : "have"} tags from older settings.`;
 
+    tgBuildTaggers(models);
+    tgSetModes(data.reprocessKeys);
     tgApplyLimits(data.limits);
     tgSync(cfg);
     if (tagState.list.loaded && tagState.list.version !== data.settingsVersion) tgRenderAssets();
@@ -2071,8 +2113,8 @@
   }
 
   const tgSuggestMode = (keys) => keys.reduce((best, k) => {
-    const rank = { retag: 1, describe: 2, full: 3 };
-    return rank[TG_MODE_OF[k]] > rank[best] ? TG_MODE_OF[k] : best;
+    const rank = { retag: 1, full: 2 };
+    return (rank[TG_MODE_OF[k]] || 0) > rank[best] ? TG_MODE_OF[k] : best;
   }, "retag");
 
   // "New assets only" or "also update the N already-tagged assets" (and how). Gives "none" or a mode.
@@ -2236,9 +2278,9 @@
       if (reprocess !== "none" || content.length) tgLoadAssets();
     } catch (err) { tagError(err); } finally { busy(false); }
   }
-  $("tg-save-how").addEventListener("click", () => tgSave(TG_GROUPS.how));
-  $("tg-save-rules").addEventListener("click", () => tgSave(TG_GROUPS.rules));
-  $("tg-save-speed").addEventListener("click", () => tgSave(TG_GROUPS.speed));
+  $("tg-save-how").addEventListener("click", () => tgSave(TG_GROUPS.how()));
+  $("tg-save-rules").addEventListener("click", () => tgSave(TG_GROUPS.rules()));
+  $("tg-save-speed").addEventListener("click", () => tgSave(TG_GROUPS.speed()));
   $("tg-keep").addEventListener("change", () => tagCall("settings", { changes: { keep_updated: $("tg-keep").checked } }));
 
   // ----------------------------------------------------------------- buttons
@@ -2293,7 +2335,7 @@
     const id = tgTestId();
     if (!id) return toast("Pick a photo or video: paste its ID, or press Random photo / Random video.", true);
     const d = tagState.data, sv = (d && d.service) || {};
-    const ready = sv.tagger && sv.tagger.status === "ok" && (!d.settings.describe || (sv.vlm && sv.vlm.status === "ok"));
+    const ready = sv.tagger && sv.tagger.status === "ok";
     busy(true, ready ? (path === "apply" ? "Tagging and writing…" : "Tagging…")
       : "Loading the models (can take a few minutes the first time), then tagging…");
     try {
@@ -2312,7 +2354,7 @@
     const sorted = list.slice().sort((a, b) => (b.score || 0) - (a.score || 0));
     sorted.slice(0, 60).forEach((t) => {
       const chip = tgEl("span", `tg-tag ${cls}`.trim(), t.tag);
-      if (t.score != null && t.source !== "vlm" && t.source !== "rule") chip.appendChild(tgEl("small", "", tgScore(t.score)));
+      if (t.score != null && t.source !== "rule") chip.appendChild(tgEl("small", "", tgScore(t.score)));
       if (t.source) chip.appendChild(tgEl("span", "badge", t.source));
       row.appendChild(chip);
     });
@@ -2338,9 +2380,16 @@
       out.appendChild(strip);
     }
 
-    const m = p.models || {};
-    if (m.wd) { heading(`Illustration / people tagger (WD) · ${m.wd.length}`); tgChips(out, m.wd); }
-    if (m.pixai) { heading(`Anime / illustration, characters and series tagger (PixAI) · ${m.pixai.length}`); tgChips(out, m.pixai); }
+    const m = p.models || {}, cfg = (tagState.data && tagState.data.settings) || {};
+    const labels = (tagState.data && tagState.data.models) || {};
+    Object.keys(labels).forEach((k) => {         // one list per tagger that is switched on, in the panel's order
+      if (cfg[`use_${k}`] === false || !Array.isArray(m[k])) return;
+      heading(`${labels[k]} · ${m[k].length}`);
+      tgChips(out, m[k]);
+    });
+    if (Array.isArray(m.dropped) && m.dropped.length) {
+      out.appendChild(tgEl("p", "hint", `Left out because only one tagger found them: ${m.dropped.join(", ")}.`));
+    }
     if (m.rating) {
       const ratings = Object.entries(m.rating).sort((a, b) => b[1] - a[1]);
       if (ratings.length) {
@@ -2353,23 +2402,6 @@
         });
         out.appendChild(line);
       }
-    }
-
-    const v = p.vlm;
-    heading("Description model");
-    if (!v || (!v.description && !(v.add_tags || []).length && !(v.remove_tags || []).length)) {
-      out.appendChild(tgEl("p", "hint", (v && v.note) || "It was not used for this one."));
-    } else {
-      if (v.description) out.appendChild(tgEl("p", "", v.description));
-      if ((v.add_tags || []).length) {
-        out.appendChild(tgEl("small", "hint", "Added"));
-        tgChips(out, v.add_tags.map((tag) => ({ tag: `+ ${tag}` })), "add");
-      }
-      if ((v.remove_tags || []).length) {
-        out.appendChild(tgEl("small", "hint", "Removed"));
-        tgChips(out, v.remove_tags.map((tag) => ({ tag })), "remove");
-      }
-      if (v.note) out.appendChild(tgEl("p", "hint", v.note));
     }
 
     heading("Rules that fired");
@@ -2385,9 +2417,7 @@
     heading(`Final tags · ${(p.tags || []).length}`);
     tgChips(out, p.tags || [], "final");
 
-    heading("Description to write");
-    out.appendChild(tgEl("p", "", p.description || "(none)"));
-
+    heading("Description before and after");
     const ba = tgEl("div", "tg-ba");
     [["Before", p.currentDescription], ["After", p.newDescription]].forEach(([label, text]) => {
       const col = tgEl("div", "");
@@ -2510,7 +2540,6 @@
       const date = (a.taken || "").slice(0, 10);
       if (date) text.appendChild(tgEl("small", "", date));
       if ((a.tags || []).length) text.appendChild(tgEl("small", "tg-tagline", a.tags.join(", ")));
-      if (a.description) text.appendChild(tgEl("p", "tg-desc", a.description));
       text.addEventListener("click", () => row.classList.toggle("is-open"));
       row.append(box, thumb, text);
       frag.appendChild(row);
@@ -2555,7 +2584,6 @@
     tgLoadAssets();
   }
   $("tg-act-retag").addEventListener("click", () => tgReprocess("retag"));
-  $("tg-act-describe").addEventListener("click", () => tgReprocess("describe"));
   $("tg-act-full").addEventListener("click", () => tgReprocess("full"));
 
   $("tg-act-remove").addEventListener("click", async () => {
@@ -2587,8 +2615,8 @@
     const n = (tagState.data && tagState.data.counts.outdated) || 0;
     const mode = await tgModal(`Update ${plural(n, "asset")}?`, "Update", (box) => {
       box.appendChild(tgEl("p", "hint", "These were tagged before your latest settings change. Re-tag is enough for strictness, "
-        + "rules, blocked tags and the like; pick Re-describe after changing the instructions, and a full re-process after "
-        + "changing the captures or the taggers."));
+        + "rules, renames, blocked tags and the like; pick a full re-process after changing the captures or which "
+        + "taggers are on."));
       const select = tgModeSelect(box, "retag", "retag");
       return () => select.value;
     });

@@ -651,10 +651,9 @@
       <div class="results-head">
         <h2>AI Tagger <span class="badge">experimental</span></h2>
       </div>
-      <p class="hint" id="tg-about">Two AI taggers find the objects, people, characters and scenes in every photo and
-        video, then a small text model turns the tags into a short description that follows your instructions (it never
-        sees the picture, only the tags). The result goes into the photo's description in Immich, inside a block marked
-        <code>[AI Tagger]</code>. Your own text is never changed.</p>
+      <p class="hint" id="tg-about">AI taggers find the objects, people, characters and scenes in every photo and
+        video. The tags go into the photo's description in Immich, inside a block marked <code>[AI Tagger]</code>.
+        Your own text is never changed.</p>
       <p class="d-state" id="tg-state">…</p>
       <div class="meter" aria-hidden="true"><div class="meter-fill" id="tg-meter"></div></div>
       <p class="hint" id="tg-progress"></p>
@@ -682,43 +681,24 @@
     <div class="card" id="tg-how">
       <h2>How to tag</h2>
       <label class="field">
-        <span>Instructions</span>
-        <textarea id="tg-instructions" rows="4" maxlength="4000"
-          placeholder="Describe people by what they do and wear. Name places only when they are obvious. Keep it to one or two sentences."></textarea>
-        <small>Plain words, like briefing a person. They steer the description and the tags the model adds or removes.</small>
-      </label>
-      <label class="field">
         <span>Vocabulary</span>
         <textarea id="tg-vocabulary" rows="4" maxlength="4000" spellcheck="false"
-          placeholder="1girl -> woman&#10;Mia&#10;the lake house"></textarea>
-        <small>One entry per line. <code>old -&gt; new</code> renames a tag everywhere (for example
-          <code>1girl -&gt; woman</code>). Any other line is a preferred term: a name, place or spelling the model should
-          use whenever it fits.</small>
+          placeholder="1girl -> woman&#10;solo -> alone"></textarea>
+        <small>One rename per line: <code>old -&gt; new</code> renames a tag everywhere (for example
+          <code>1girl -&gt; woman</code>). Lines without an arrow are ignored.</small>
       </label>
       <label class="field">
         <span>Blocked tags (comma separated)</span>
         <input id="tg-blocked" type="text" placeholder="watermark, text, signature" autocomplete="off" spellcheck="false">
         <small>These tags are never written, whatever the models say.</small>
       </label>
-      <label class="field">
-        <span>Language of the descriptions</span>
-        <input id="tg-language" type="text" maxlength="40" placeholder="English" autocomplete="off">
-      </label>
-      <label class="check"><input id="tg-describe" type="checkbox"><span>Short description from the tags (small text model)</span></label>
-      <label class="check"><input id="tg-use-wd" type="checkbox"><span>Use the illustration / people tagger (WD)</span></label>
-      <label class="check"><input id="tg-use-pixai" type="checkbox"><span>PixAI (anime/illustration, characters, series)</span></label>
+      <div id="tg-taggers"></div>
       <label class="check"><input id="tg-character" type="checkbox"><span>Add character and series names (for example cartoon characters)</span></label>
       <label class="check"><input id="tg-rating" type="checkbox"><span>Add a rating tag (rating: general, sensitive, …)</span></label>
       <label class="check"><input id="tg-write-tags" type="checkbox"><span>Also add the tags to Immich as real tags, under “AI/”</span></label>
-      <label class="field">
-        <span>WD strictness: <b id="tg-wd-v"></b></span>
-        <input class="slider" id="tg-wd" type="range" step="0.01">
-      </label>
-      <label class="field">
-        <span>PixAI strictness: <b id="tg-pixai-v"></b></span>
-        <input class="slider" id="tg-pixai" type="range" step="0.01">
-        <small>Higher means fewer, surer tags. At 0.50 each model uses the cut-off its authors recommend.</small>
-      </label>
+      <p class="hint" id="tg-taggers-hint">Strictness: higher means fewer, surer tags. At 0.50 each tagger uses the cut-off
+        its authors recommend. On a picture rated general or sensitive, a sexual tag is kept only when at least two of the
+        switched-on taggers found it.</p>
       <label class="field">
         <span>Most tags per photo</span>
         <input id="tg-max" type="number" step="1" inputmode="numeric">
@@ -749,21 +729,14 @@
         </div>
         <small id="tg-frames-note">Pictures taken along the clip and tagged together. Photos always use one.</small>
       </div>
-      <div class="grid-2">
-        <label class="field">
-          <span>Assets per round</span>
-          <input id="tg-batch" type="number" step="1" inputmode="numeric">
-        </label>
-        <label class="field">
-          <span>Parallel descriptions</span>
-          <input id="tg-parallel" type="number" step="1" inputmode="numeric">
-        </label>
-      </div>
+      <label class="field">
+        <span>Assets per round</span>
+        <input id="tg-batch" type="number" step="1" inputmode="numeric">
+      </label>
       <label class="field">
         <span>GPU memory: <b id="tg-vram-v"></b></span>
         <input class="slider" id="tg-vram" type="range" step="1">
-        <small>Memory for the two taggers; the description model uses about 3 GB on its own. Parallel descriptions
-          and GPU memory take effect the next time the models start.</small>
+        <small>Memory for the taggers together. It takes effect the next time the models start.</small>
       </label>
       <button class="btn btn-primary" id="tg-save-speed" type="button">Save</button>
       <label class="check" style="margin-top:14px"><input id="tg-keep" type="checkbox"><span>Keep it up to date: tag new uploads
@@ -813,7 +786,6 @@
       <div class="bulkbar is-hidden" id="tg-bulk">
         <strong id="tg-bulk-count">0 selected</strong>
         <button class="btn btn-quiet" id="tg-act-retag" type="button">Re-tag</button>
-        <button class="btn btn-quiet" id="tg-act-describe" type="button">Re-describe</button>
         <button class="btn btn-quiet" id="tg-act-full" type="button">Full re-process</button>
         <button class="btn btn-quiet danger-text" id="tg-act-remove" type="button">Remove AI text</button>
       </div>
@@ -827,9 +799,9 @@
         <span id="tg-page"></span>
         <button class="btn btn-quiet" id="tg-next" type="button">Next →</button>
       </div>
-      <p class="hint" style="margin-top:12px"><b>Re-tag</b> applies your current strictness, rules and blocked tags to what
-        the models already found (quick, no GPU). <b>Re-describe</b> asks the description model again.
-        <b>Full re-process</b> runs the taggers and the description model again. Tap a picture to see it full size.</p>
+      <p class="hint" style="margin-top:12px"><b>Re-tag</b> applies your current strictness, rules, renames and blocked tags
+        to what the taggers already found (quick, no GPU). <b>Full re-process</b> runs the taggers again. Tap a picture
+        to see it full size.</p>
     </div>
 
     <dialog class="tg-dialog" id="tg-dialog" aria-labelledby="tg-dialog-title">

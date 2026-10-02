@@ -416,7 +416,7 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             "limits": {k: list(v) for k, v in aitagger_mod.LIMITS.items()},
             "settingsVersion": store.settings_version, "counts": counts, "indexer": indexer.status(counts),
             "service": {**service.status(), "exclusive": searchplus_mod.AITAGGER_EXCLUSIVE},
-            "models": dict(aitagger_mod.MODEL_LABELS), "failures": store.failures(),
+            "models": aitagger_mod.model_labels(), "failures": store.failures(),
             "reprocessKeys": {mode: list(keys) for mode, keys in aitagger_mod.REPROCESS.items()},
         }
 
@@ -457,8 +457,11 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             if not isinstance(changes, dict) or not changes:
                 raise ValueError("Nothing to change.")
             mode, scope = body.get("reprocess", "none"), body.get("scope", "outdated")
-            if mode not in ("none",) + aitagger_mod.MODES:
-                raise ValueError("reprocess must be none, retag, describe or full")
+            if mode != "none":
+                try:
+                    mode = aitagger_mod.normalize_mode(mode)         # the v2 "describe" counts as "retag"
+                except ValueError:
+                    raise ValueError("reprocess must be none, retag or full") from None
             if scope not in ("outdated", "all"):
                 raise ValueError("scope must be outdated or all")
             settings, changed = aitagger_mod.apply_settings({k: v for k, v in changes.items() if k != "indexing"}, store)

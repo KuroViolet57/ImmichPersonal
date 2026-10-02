@@ -103,25 +103,33 @@ import java.net.URLEncoder
 /** One rule as the user edits it: comma-separated tag lists. */
 data class RuleDraft(val ifAll: String = "", val ifAny: String = "", val unless: String = "", val add: String = "", val remove: String = "")
 
-/** The "How to tag" settings being edited, kept apart from the server's copy until saved. */
+/**
+ * The "How to tag" settings being edited, kept apart from the server's copy until saved. The taggers are generic: the
+ * panel lists them in the status' `models` (key to model name) and has `use_<key>` and `<key>_strictness` for each,
+ * so a tagger it registers later shows up here without a change to this file.
+ */
 data class TagDraft(
-    val instructions: String = "", val vocabulary: String = "", val blocked: String = "", val language: String = "English",
-    val describe: Boolean = true, val characterTags: Boolean = true, val ratingTag: Boolean = true, val writeTags: Boolean = false,
-    val useWd: Boolean = true, val usePixai: Boolean = true,
-    val wdStrictness: Float = 0.5f, val pixaiStrictness: Float = 0.5f, val maxTags: Int = 30,
-    val videoFrames: Int = 6, val batchSize: Int = 8, val vlmParallel: Int = 8, val vramGb: Int = 8, val keepUpdated: Boolean = true,
+    val vocabulary: String = "", val blocked: String = "",
+    val characterTags: Boolean = true, val ratingTag: Boolean = true, val writeTags: Boolean = false,
+    val use: Map<String, Boolean> = emptyMap(), val strictness: Map<String, Float> = emptyMap(), val maxTags: Int = 30,
+    val videoFrames: Int = 6, val batchSize: Int = 8, val vramGb: Int = 8, val keepUpdated: Boolean = true,
     val rules: List<RuleDraft> = emptyList(),
 ) {
-    /** The settings as the panel stores them. */
-    fun toSettings(): Map<String, JsonElement> = mapOf(
-        "instructions" to JsonPrimitive(instructions), "vocabulary" to JsonPrimitive(vocabulary),
-        "blocked" to JsonArray(splitTags(blocked).map { JsonPrimitive(it) }), "language" to JsonPrimitive(language.ifBlank { "English" }),
-        "describe" to JsonPrimitive(describe), "character_tags" to JsonPrimitive(characterTags), "rating_tag" to JsonPrimitive(ratingTag),
-        "write_tags" to JsonPrimitive(writeTags), "use_wd" to JsonPrimitive(useWd), "use_pixai" to JsonPrimitive(usePixai),
-        "wd_strictness" to JsonPrimitive(round2(wdStrictness)), "pixai_strictness" to JsonPrimitive(round2(pixaiStrictness)),
-        "max_tags" to JsonPrimitive(maxTags), "video_frames" to JsonPrimitive(videoFrames), "batch_size" to JsonPrimitive(batchSize),
-        "vlm_parallel" to JsonPrimitive(vlmParallel), "vram_gb" to JsonPrimitive(vramGb), "keep_updated" to JsonPrimitive(keepUpdated),
-        "rules" to JsonArray(rules.filter { it.isUsable() }.map { r ->
+    /** The settings as the panel stores them (the tagger ones under their `use_<key>` / `<key>_strictness` keys). */
+    fun toSettings(): Map<String, JsonElement> = buildMap {
+        put("vocabulary", JsonPrimitive(vocabulary))
+        put("blocked", JsonArray(splitTags(blocked).map { JsonPrimitive(it) }))
+        put("character_tags", JsonPrimitive(characterTags))
+        put("rating_tag", JsonPrimitive(ratingTag))
+        put("write_tags", JsonPrimitive(writeTags))
+        use.forEach { (key, on) -> put("use_$key", JsonPrimitive(on)) }
+        strictness.forEach { (key, value) -> put("${key}_strictness", JsonPrimitive(round2(value))) }
+        put("max_tags", JsonPrimitive(maxTags))
+        put("video_frames", JsonPrimitive(videoFrames))
+        put("batch_size", JsonPrimitive(batchSize))
+        put("vram_gb", JsonPrimitive(vramGb))
+        put("keep_updated", JsonPrimitive(keepUpdated))
+        put("rules", JsonArray(rules.filter { it.isUsable() }.map { r ->
             buildJsonObject {
                 putJsonArray("if_all") { splitTags(r.ifAll).forEach { add(it) } }
                 putJsonArray("if_any") { splitTags(r.ifAny).forEach { add(it) } }
@@ -129,23 +137,27 @@ data class TagDraft(
                 putJsonArray("add") { splitTags(r.add).forEach { add(it) } }
                 putJsonArray("remove") { splitTags(r.remove).forEach { add(it) } }
             }
-        }),
-    )
+        }))
+    }
 
     companion object {
-        fun from(s: JsonObject) = TagDraft(
-            instructions = s.str("instructions"), vocabulary = s.str("vocabulary"),
-            blocked = s.a("blocked").strings().joinToString(", "), language = s.str("language", "English"),
-            describe = s.b("describe") ?: true, characterTags = s.b("character_tags") ?: true, ratingTag = s.b("rating_tag") ?: true,
-            writeTags = s.b("write_tags") ?: false, useWd = s.b("use_wd") ?: true, usePixai = s.b("use_pixai") ?: true,
-            wdStrictness = (s.d("wd_strictness") ?: 0.5).toFloat(), pixaiStrictness = (s.d("pixai_strictness") ?: 0.5).toFloat(),
-            maxTags = s.i("max_tags") ?: 30, videoFrames = s.i("video_frames") ?: 6, batchSize = s.i("batch_size") ?: 8,
-            vlmParallel = s.i("vlm_parallel") ?: 8, vramGb = s.i("vram_gb") ?: 8, keepUpdated = s.b("keep_updated") ?: true,
-            rules = s.a("rules").objects().map { r ->
-                RuleDraft(r.a("if_all").strings().joinToString(", "), r.a("if_any").strings().joinToString(", "),
-                    r.a("unless").strings().joinToString(", "), r.a("add").strings().joinToString(", "), r.a("remove").strings().joinToString(", "))
-            },
-        )
+        /** `taggers` are the keys of the status' `models`; only those the panel has settings for are taken. */
+        fun from(s: JsonObject, taggers: Collection<String>): TagDraft {
+            val known = taggers.filter { s.containsKey("use_$it") && s.containsKey("${it}_strictness") }
+            return TagDraft(
+                vocabulary = s.str("vocabulary"), blocked = s.a("blocked").strings().joinToString(", "),
+                characterTags = s.b("character_tags") ?: true, ratingTag = s.b("rating_tag") ?: true,
+                writeTags = s.b("write_tags") ?: false,
+                use = known.associateWith { s.b("use_$it") ?: true },
+                strictness = known.associateWith { (s.d("${it}_strictness") ?: 0.5).toFloat() },
+                maxTags = s.i("max_tags") ?: 30, videoFrames = s.i("video_frames") ?: 6, batchSize = s.i("batch_size") ?: 8,
+                vramGb = s.i("vram_gb") ?: 8, keepUpdated = s.b("keep_updated") ?: true,
+                rules = s.a("rules").objects().map { r ->
+                    RuleDraft(r.a("if_all").strings().joinToString(", "), r.a("if_any").strings().joinToString(", "),
+                        r.a("unless").strings().joinToString(", "), r.a("add").strings().joinToString(", "), r.a("remove").strings().joinToString(", "))
+                },
+            )
+        }
 
         fun splitTags(text: String): List<String> = text.split(',').map { it.trim() }.filter { it.isNotEmpty() }
         private fun round2(f: Float): Double = Math.round(f * 100) / 100.0
@@ -156,10 +168,20 @@ private fun RuleDraft.isUsable() =
     (TagDraft.splitTags(ifAll).isNotEmpty() || TagDraft.splitTags(ifAny).isNotEmpty()) &&
         (TagDraft.splitTags(add).isNotEmpty() || TagDraft.splitTags(remove).isNotEmpty())
 
-/** Which re-processing a change calls for (see docs/AI-TAGGER.md, "Reprocess modes"). */
-private val FULL_KEYS = setOf("video_frames", "use_wd", "use_pixai")
-private val DESCRIBE_KEYS = setOf("instructions", "vocabulary", "language", "describe")
-private val RETAG_KEYS = setOf("wd_strictness", "pixai_strictness", "rules", "blocked", "max_tags", "write_tags", "character_tags", "rating_tag")
+/**
+ * Which re-processing a change calls for (see docs/AI-TAGGER.md, "Reprocess modes"). The panel lists the keys of each
+ * mode in the status (`reprocessKeys`); the rest follows its rule: a tagger switched on or off runs the taggers again
+ * ("full"), a strictness only re-applies the stored scores ("retag").
+ */
+private val RETAG_KEYS = setOf("rules", "blocked", "max_tags", "write_tags", "character_tags", "rating_tag", "vocabulary")
+
+private fun modeOf(key: String, reprocessKeys: JsonObject): String? = when {
+    key in reprocessKeys.a("full").strings() -> "full"
+    key in reprocessKeys.a("retag").strings() -> "retag"
+    key == "video_frames" || key.startsWith("use_") -> "full"
+    key.endsWith("_strictness") || key in RETAG_KEYS -> "retag"
+    else -> null
+}
 
 class TaggerVm : ViewModel() {
     var status by mutableStateOf<JsonObject?>(null)
@@ -180,13 +202,16 @@ class TaggerVm : ViewModel() {
 
     val settings: JsonObject get() = status?.o("settings") ?: JsonObject(emptyMap())
 
+    /** The registered taggers, in the panel's order: key to model name. */
+    val taggers: JsonObject get() = status?.o("models") ?: JsonObject(emptyMap())
+
     fun refresh() {
         viewModelScope.launch {
             status = runCatching { Graph.api.get("/api/aitagger").obj() }.getOrElse {
                 if (status == null) UiBus.error(it, "ai tagger status")
                 status
             }
-            if (draft == null) status?.let { draft = TagDraft.from(it.o("settings")) }
+            if (draft == null) status?.let { draft = TagDraft.from(it.o("settings"), it.o("models").keys) }
         }
     }
 
@@ -213,11 +238,13 @@ class TaggerVm : ViewModel() {
         return d.toSettings().filter { (k, v) -> now[k]?.toString() != v.toString() && !(now[k] == null && v.toString() == "\"\"") }
     }
 
-    fun suggestedMode(keys: Set<String>): String = when {
-        keys.any { it in FULL_KEYS } -> "full"
-        keys.any { it in DESCRIBE_KEYS } -> "describe"
-        keys.any { it in RETAG_KEYS } -> "retag"
-        else -> "none"
+    fun suggestedMode(keys: Set<String>): String {
+        val modes = keys.mapNotNull { modeOf(it, status?.o("reprocessKeys") ?: JsonObject(emptyMap())) }
+        return when {
+            "full" in modes -> "full"
+            "retag" in modes -> "retag"
+            else -> "none"
+        }
     }
 
     fun save(changes: Map<String, JsonElement>, reprocess: String) {
@@ -226,7 +253,7 @@ class TaggerVm : ViewModel() {
             put("reprocess", reprocess)
             put("scope", "all")
         }, if (reprocess == "none") "Saved. New settings apply to newly tagged assets." else "Saved. Already-tagged assets were queued again.") {
-            draft = TagDraft.from(it.o("settings"))
+            draft = TagDraft.from(it.o("settings"), it.o("models").keys)
         }
     }
 
@@ -244,7 +271,7 @@ class TaggerVm : ViewModel() {
     fun runPreview(write: Boolean = false) {
         val id = testId.trim()
         if (!Regex("^[0-9a-fA-F-]{36}$").matches(id)) return UiBus.error("Paste an asset ID, or pick a random photo or video.")
-        val loaded = status?.o("service")?.o("vlm")?.s("status") == "ok"
+        val loaded = status?.o("service")?.o("tagger")?.s("status") == "ok"
         action(if (write) "apply" else "preview", buildJsonObject { put("id", id) },
             if (write) "Written to the asset's description." else null,
             wait = if (loaded) "Tagging…" else "Loading the models, then tagging… (a few minutes the first time)") {
@@ -307,9 +334,9 @@ fun TaggerScreen(nav: NavController) {
         }
     }
     LaunchedEffect(vm.tab) { if (vm.tab == 2) vm.loadAssets() }
-    val models = vm.status?.o("models")
+    val models = vm.taggers
     Scaffold(topBar = {
-        ScreenTop("AI Tagger", nav, subtitle = models?.let { "${it.str("wd")} · ${it.str("pixai")} · ${it.str("vlm")}" } ?: "Tags and describes your library")
+        ScreenTop("AI Tagger", nav, subtitle = models.keys.joinToString(" · ") { models.str(it) }.ifEmpty { "Tags your library" })
     }) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             LazyVerticalGrid(
@@ -390,7 +417,7 @@ private fun StatusCard(vm: TaggerVm) {
         Hint("Still to do %,d · queued again %,d · made with older settings %,d · failed %,d · skipped %,d".format(
             c.i("pending") ?: 0, c.i("queued") ?: 0, c.i("outdated") ?: 0, c.i("failed") ?: 0, c.i("excluded") ?: 0))
         val gpu = sv.o("gpu")
-        Hint(serviceText(sv.o("tagger"), "Taggers") + " · " + serviceText(sv.o("vlm"), "Describer") +
+        Hint(serviceText(sv.o("tagger"), "Taggers") +
             (gpu.d("usedGb")?.let { " · GPU %.1f of %.0f GB in use".format(it, gpu.d("totalGb") ?: 24.0) } ?: ""))
         if (sv.b("exclusive") != false) Hint("Search+ is paused while the AI Tagger uses the GPU.")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -453,18 +480,14 @@ private fun PreviewResult(vm: TaggerVm, p: JsonObject) {
         }
     }
     val m = p.o("models")
-    TagChips("WD tagger", m.a("wd").objects().map { it.str("tag") to it.d("score") })
-    TagChips("PixAI", m.a("pixai").objects().map { it.str("tag") to it.d("score") })
+    val labels = vm.taggers
+    labels.keys.filter { vm.settings.b("use_$it") != false }.forEach { key ->      // one list per tagger that is switched on
+        TagChips(labels.str(key), m.a(key).objects().map { it.str("tag") to it.d("score") })
+    }
+    m.a("dropped").strings().takeIf { it.isNotEmpty() }?.let { Hint("Left out because only one tagger found them: ${it.joinToString(", ")}") }
     m.o("rating").takeIf { it.isNotEmpty() }?.let { r ->
         Hint("Rating: " + r.entries.sortedByDescending { (it.value as? JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0 }
             .joinToString(" · ") { "${it.key} %.2f".format((it.value as? JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0) })
-    }
-    val v = p.o("vlm")
-    if (v.isNotEmpty()) {
-        val added = v.a("add_tags").strings()
-        val removed = v.a("remove_tags").strings()
-        if (added.isNotEmpty() || removed.isNotEmpty()) Hint("Describer added: ${added.joinToString(", ").ifEmpty { "–" }} · removed: ${removed.joinToString(", ").ifEmpty { "–" }}")
-        v.s("note")?.takeIf { it.isNotBlank() }?.let { Hint("Describer: $it") }
     }
     p.a("rules").objects().filter { it.a("added").isNotEmpty() || it.a("removed").isNotEmpty() }.forEach { r ->
         Hint("Rule ${(r.i("rule") ?: 0) + 1}: +${r.a("added").strings().joinToString(", ")} −${r.a("removed").strings().joinToString(", ")}")
@@ -502,31 +525,35 @@ private fun SettingsCards(vm: TaggerVm) {
         val l = limits.a(key)
         return ((l.getOrNull(0) as? JsonPrimitive)?.content?.toDoubleOrNull()?.toInt() ?: lo)..((l.getOrNull(1) as? JsonPrimitive)?.content?.toDoubleOrNull()?.toInt() ?: hi)
     }
+    fun floatRange(key: String): ClosedFloatingPointRange<Float> {
+        val l = limits.a(key)
+        return ((l.getOrNull(0) as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0.05f)..((l.getOrNull(1) as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0.95f)
+    }
+    val taggers = vm.taggers
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionCard(title = "Instructions") {
-            OutlinedTextField(value = d.instructions, onValueChange = { vm.draft = d.copy(instructions = it) },
-                label = { Text("How to word the description and pick tags") }, minLines = 4, modifier = Modifier.fillMaxWidth())
-            Hint("Plain words for the small text model that writes the description from the tags, e.g. “Mention the setting. Call 1girl a woman.” It does not see the picture, only the tags.")
+        SectionCard(title = "Tags") {
             OutlinedTextField(value = d.vocabulary, onValueChange = { vm.draft = d.copy(vocabulary = it) },
                 label = { Text("Vocabulary") }, minLines = 3, modifier = Modifier.fillMaxWidth())
-            Hint("One per line. “old -> new” renames a tag (e.g. “1girl -> woman”); any other line is a term to prefer.")
+            Hint("One rename per line: “old -> new” renames a tag everywhere (e.g. “1girl -> woman”). Lines without an arrow are ignored.")
             OutlinedTextField(value = d.blocked, onValueChange = { vm.draft = d.copy(blocked = it) },
                 label = { Text("Never use these tags (comma separated)") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = d.language, onValueChange = { vm.draft = d.copy(language = it) },
-                label = { Text("Language of the description") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            CheckRow("Short description from the tags (small text model)", d.describe) { vm.draft = d.copy(describe = it) }
             CheckRow("Character names (anime/game)", d.characterTags) { vm.draft = d.copy(characterTags = it) }
             CheckRow("Content rating tag", d.ratingTag) { vm.draft = d.copy(ratingTag = it) }
             CheckRow("Also add real Immich tags (AI/…)", d.writeTags) { vm.draft = d.copy(writeTags = it) }
         }
         SectionCard(title = "Taggers") {
-            CheckRow("WD tagger (illustration, people, clothing)", d.useWd) { vm.draft = d.copy(useWd = it) }
-            Text("WD strictness %.2f".format(d.wdStrictness))
-            Slider(value = d.wdStrictness, onValueChange = { vm.draft = d.copy(wdStrictness = it) }, valueRange = 0.05f..0.95f)
-            CheckRow("PixAI (anime/illustration, characters, series)", d.usePixai) { vm.draft = d.copy(usePixai = it) }
-            Text("PixAI strictness %.2f".format(d.pixaiStrictness))
-            Slider(value = d.pixaiStrictness, onValueChange = { vm.draft = d.copy(pixaiStrictness = it) }, valueRange = 0.05f..0.95f)
-            Hint("0.50 is each model's own recommended cut-off. Higher keeps fewer, surer tags.")
+            taggers.keys.forEach { key ->
+                val on = d.use[key] ?: vm.settings.b("use_$key") ?: true
+                val strict = d.strictness[key] ?: (vm.settings.d("${key}_strictness") ?: 0.5).toFloat()
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(taggers.str(key), modifier = Modifier.weight(1f))
+                    Switch(checked = on, onCheckedChange = { vm.draft = d.copy(use = d.use + (key to it)) })
+                }
+                Text("Strictness %.2f".format(strict), style = MaterialTheme.typography.bodySmall)
+                Slider(value = strict, onValueChange = { vm.draft = d.copy(strictness = d.strictness + (key to it)) },
+                    valueRange = floatRange("${key}_strictness"))
+            }
+            Hint("0.50 is each tagger's own recommended cut-off. Higher keeps fewer, surer tags. On a picture rated general or sensitive, a sexual tag is kept only when at least two of the switched-on taggers found it.")
             NumberField("Most tags per asset", d.maxTags, { vm.draft = d.copy(maxTags = it) }, Modifier.fillMaxWidth(), max = range("max_tags", 5, 100).last)
         }
         SectionCard(title = "Rules") {
@@ -557,15 +584,11 @@ private fun SettingsCards(vm: TaggerVm) {
             Text("Assets per round: ${d.batchSize}")
             Slider(value = d.batchSize.toFloat(), onValueChange = { vm.draft = d.copy(batchSize = it.toInt()) },
                 valueRange = batch.first.toFloat()..batch.last.toFloat())
-            val par = range("vlm_parallel", 1, 32)
-            Text("Descriptions at the same time: ${d.vlmParallel}")
-            Slider(value = d.vlmParallel.toFloat(), onValueChange = { vm.draft = d.copy(vlmParallel = it.toInt()) },
-                valueRange = par.first.toFloat()..par.last.toFloat())
-            val vram = range("vram_gb", 4, 16)
-            Text("GPU memory for the two taggers: ${d.vramGb} GB")
+            val vram = range("vram_gb", 3, 8)
+            Text("GPU memory for the taggers: ${d.vramGb} GB")
             Slider(value = d.vramGb.toFloat(), onValueChange = { vm.draft = d.copy(vramGb = it.toInt()) },
                 valueRange = vram.first.toFloat()..vram.last.toFloat())
-            Hint("The description model uses about 3 GB on its own. Changes to memory and parallel descriptions restart the models next time they load.")
+            Hint("A change to the memory restarts the models the next time they load.")
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Keep it up to date (tag new uploads)", modifier = Modifier.weight(1f))
                 Switch(checked = d.keepUpdated, onCheckedChange = { vm.draft = d.copy(keepUpdated = it) })
@@ -580,7 +603,7 @@ private fun SettingsCards(vm: TaggerVm) {
                     else -> ask = changes
                 }
             }) { Text("Save") }
-            TextButton(onClick = { vm.draft = TagDraft.from(vm.settings) }) { Text("Undo changes") }
+            TextButton(onClick = { vm.draft = TagDraft.from(vm.settings, vm.taggers.keys) }) { Text("Undo changes") }
         }
     }
     ask?.let { changes ->
@@ -600,7 +623,6 @@ private fun ApplyDialog(vm: TaggerVm, changes: Map<String, JsonElement>, onClose
     var choice by remember { mutableStateOf("none") }
     val modeText = when (suggested) {
         "retag" -> "re-tag them (fast, no AI needed)"
-        "describe" -> "describe them again with the new instructions"
         else -> "process them again from scratch"
     }
     AlertDialog(
@@ -650,7 +672,6 @@ private fun TaggedHeader(vm: TaggerVm) {
         if (vm.selection.size > 0) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 FilledTonalButton(onClick = { vm.reprocess("retag") }) { Text("Re-tag") }
-                FilledTonalButton(onClick = { vm.reprocess("describe") }) { Text("Re-describe") }
                 FilledTonalButton(onClick = { vm.reprocess("full") }) { Text("From scratch") }
                 OutlinedButton(onClick = {
                     confirm = Confirm("Remove the AI text?", "Removes the AI Tagger part of the description from ${vm.selection.size.plural("asset")}. Your own text stays.",
