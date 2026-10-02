@@ -49,7 +49,7 @@ TAGGER_SERVICE = "tagger"      # the only compose service this module starts and
 
 # ---- graphics memory. PROVISIONAL: the v3 numbers (three taggers) are still being measured; change them here only.
 VRAM_GB_DEFAULT = 5           # setting `vram_gb`, its default: the memory cap of the taggers (AITAGGER_VRAM_GB)
-VRAM_GB_LIMITS = (3, 8)       # what `vram_gb` may be set to
+VRAM_GB_LIMITS = (4, 8)       # what `vram_gb` may be set to (three taggers don't load under ~3.5 GB)
 # ----
 
 DEFAULT_GPU_GB = 24           # when nvidia-smi can't say
@@ -173,6 +173,7 @@ class TaggerKind:
     character_categories: tuple[str, ...] = ()   # those of them that the ``character_tags`` setting switches off
     has_rating: bool = True                      # whether it answers with a ``rating`` (probability per rating name)
     default_on: bool = True                      # the default of ``use_<key>``
+    noise: frozenset = frozenset()               # its tags that say nothing on their own (normalised); never kept
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-z][a-z0-9]*", self.key):
@@ -188,7 +189,10 @@ class TaggerKind:
 TAGGERS: list[TaggerKind] = [
     TaggerKind("wd", "wd-eva02-large-tagger-v3", ("general", "character"), ("character",)),
     TaggerKind("pixai", "pixai-tagger-v1.0", ("general", "character", "copyright"), ("character", "copyright")),
-    # >>> THE THIRD TAGGER GOES HERE: one more TaggerKind(key, label, categories, character_categories, has_rating) <<<
+    # RAM++: plain-English photo tags (objects, food, places, screenshots); no rating, no characters. Chosen in v3
+    # after testing on 53 library pictures: it adds the most correct tags on real photos (docs/AI-TAGGER.md).
+    TaggerKind("ram", "RAM++ (swin-large)", ("general",), has_rating=False,
+               noise=frozenset({"image", "catch", "peak", "miss", "take", "wear", "label"})),
     # (its key must be the key the tagger service answers /tag with; see docs/AI-TAGGER.md, "Adding a tagger")
 ]
 
@@ -450,11 +454,11 @@ def detect(raw: dict, settings: dict) -> dict:
     display: dict = {kind.key: [] for kind in TAGGERS}
     display["rating"] = {}
 
-    def show(model: str, scores: dict, strictness: float) -> None:
+    def show(model: str, scores: dict, strictness: float, noise: frozenset = frozenset()) -> None:
         shown = {}
         for tag, score in scores.items():
             name = norm_tag(tag)
-            if not name:
+            if not name or name in noise:
                 continue
             name = vocab.rename(name)
             kept = score >= strictness - EPS
@@ -471,7 +475,7 @@ def detect(raw: dict, settings: dict) -> dict:
         wanted = tuple(c for c in kind.categories if settings["character_tags"] or c not in kind.character_categories)
         series = [_merged(cap[kind.key], wanted) for cap in caps if cap and cap.get(kind.key) is not None]
         if series:
-            show(kind.key, _per_tag(series), settings[kind.key + "_strictness"])
+            show(kind.key, _per_tag(series), settings[kind.key + "_strictness"], kind.noise)
     # The rating: each tagger's probabilities averaged over the captures, then the mean of the enabled taggers that
     # report one (one alone if only one does), then the best. The tag's source is the tagger surest of the winner.
     ratings = [r for r in raw.get("ratings") or [] if isinstance(r, dict)]
