@@ -378,8 +378,6 @@ button.tg-tag.is-on { background: var(--accent); color: var(--accent-fg); border
 button.tg-tag.is-on small { color: inherit; }
 .tg-tag.final { background: color-mix(in srgb, var(--accent) 16%, var(--surface));
   border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
-.tg-tag.add { color: var(--ok); border-color: currentColor; }
-.tg-tag.remove { color: var(--danger); border-color: currentColor; text-decoration: line-through; }
 .tg-frames { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 4px; }
 .tg-frames img { height: 96px; width: auto; border-radius: 8px; flex: none; background: var(--line); }
 .tg-ba { display: grid; grid-template-columns: 1fr; gap: 10px; }
@@ -400,7 +398,6 @@ button.tg-tag.is-on small { color: inherit; }
 .tg-text { flex: 1; min-width: 0; cursor: pointer; }
 .desc-row .tg-tagline { display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
 .desc-row.is-open .tg-tagline { display: block; }
-.tg-desc { overflow-wrap: anywhere; margin-top: 4px; }
 .tg-pager { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px;
   font-size: .8125rem; color: var(--muted); }
 @media (max-width: 380px) { .tg-item img { width: 64px; height: 64px; } }

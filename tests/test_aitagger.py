@@ -1,8 +1,8 @@
 import base64
-import inspect
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -21,7 +21,8 @@ from tests.fake_immich import API_KEY, FakeImmich
 # A "picture" is bytes like  b"wd:girl=0.9,beach=0.6|char:miku=0.8|pixai:beach=0.8|rating:general=0.9":
 # what the tagger would answer for it. An asset's captures are separated by ";" in the catalogue's `preview`.
 # Parts: wd (WD general), char (WD character), rating (WD rating), pixai (PixAI general), pchar (PixAI character),
-# copy (PixAI copyright), prating (PixAI rating; left out, PixAI says nothing about the rating).
+# copy (PixAI copyright), prating (PixAI rating; left out, PixAI says nothing about the rating), and for the fake
+# third tagger ``EXTRA`` below: extra (general), echar (character), erating (rating).
 
 PHOTO = ("wd:girl=0.9,beach=0.6,solo=0.8,hat=0.3|char:miku=0.8|pixai:beach=0.8,sea=0.7,wave=0.4|"
          "rating:general=0.9,sensitive=0.08,questionable=0.01,explicit=0.01")
@@ -30,21 +31,40 @@ CLIP = ";".join(["wd:dog=0.9|pixai:dog=0.9,car=0.6|rating:general=0.9",
                 "wd:dog=0.2|pixai:car=0.9|rating:general=0.9",
                 "wd:dog=0.9|pixai:car=0.3|rating:sensitive=0.9,general=0.1"])
 
+# A third tagger that exists only in the tests, to prove the registry: off by default, like a new tagger would be.
+# ``with_extra(self)`` registers it for one test; the real third entry is added to ``at.TAGGERS`` in the module.
+EXTRA = at.TaggerKind("extra", "extra-tagger-test", ("general", "character"), ("character",), default_on=False)
+EXTRA_ON = at.TaggerKind("extra", "extra-tagger-test", ("general", "character"), ("character",))      # on by default
+EXTRA_NO_RATING = at.TaggerKind("extra", "extra-tagger-test", ("general", "character"), ("character",),
+                                has_rating=False, default_on=False)
 
-def read_picture(data: bytes):
-    """(the tagger's answer for this picture, None) or (None, why)."""
+
+def with_extra(test, kind=EXTRA) -> None:
+    """Register the fake third tagger for the duration of ``test`` (call it first in setUp)."""
+    saved = list(at.TAGGERS)
+    at.configure_taggers([*saved, kind])
+    test.addCleanup(at.configure_taggers, saved)
+
+
+def read_picture(data: bytes, models=None):
+    """(the tagger's answer for this picture, None) or (None, why). ``models`` are the tagger keys that were asked for
+    (None: all of them); the real service answers only for those."""
     text = data.decode()
     if text == "broken":
         return None, "cannot identify image file"
     out = {"wd": {"general": {}, "character": {}, "rating": {}},
-           "pixai": {"general": {}, "character": {}, "copyright": {}, "rating": {}}}
+           "pixai": {"general": {}, "character": {}, "copyright": {}, "rating": {}},
+           "extra": {"general": {}, "character": {}, "rating": {}}}
     where = {"wd": ("wd", "general"), "char": ("wd", "character"), "rating": ("wd", "rating"),
              "pixai": ("pixai", "general"), "pchar": ("pixai", "character"), "copy": ("pixai", "copyright"),
-             "prating": ("pixai", "rating")}
+             "prating": ("pixai", "rating"),
+             "extra": ("extra", "general"), "echar": ("extra", "character"), "erating": ("extra", "rating")}
     for part in filter(None, text.split("|")):
         key, _, rest = part.partition(":")
         model, category = where[key]
         out[model][category] = {k: float(v) for k, v in (kv.split("=") for kv in rest.split(",") if kv)}
+    if models is not None:
+        out = {k: v for k, v in out.items() if k in models}
     return out, None
 
 
@@ -72,23 +92,20 @@ class FakeServices:
 
     def __init__(self):
         self.tag_calls: list[int] = []           # pictures per /tag request that was answered
+        self.tag_models: list = []               # the ``models`` asked for in each of those requests
         self.oom_calls: list[int] = []           # pictures per /tag request that ran out of memory
-        self.vlm_calls: list[dict] = []
         self.ready_calls: list[dict] = []
         self.loads = self.unloads = 0
-        self.down = False                        # the tagger / containers are not answering
-        self.vlm_down = False
+        self.down = False                        # the tagger / container is not answering
         self.oom_above: int | None = None        # a /tag request with more pictures than this is out of memory
-        self.answer = lambda tags, rating, settings: {"description": "A nice picture.", "add_tags": [],
-                                                      "remove_tags": [], "note": ""}
         self._lock = threading.Lock()
 
-    def ensure_ready(self, need_tagger=True, need_vlm=True, wait=0, progress=None, stop=None):
-        self.ready_calls.append({"tagger": need_tagger, "vlm": need_vlm})
+    def ensure_ready(self, need_tagger=True, wait=0, progress=None, stop=None):
+        self.ready_calls.append({"tagger": need_tagger})
         if self.down:
             raise at.ServiceDown("down")
 
-    def tag(self, images):
+    def tag(self, images, models=None):
         if self.down:
             raise at.ServiceDown("down")
         if self.oom_above is not None and len(images) > self.oom_above:
@@ -97,33 +114,20 @@ class FakeServices:
             raise at.GpuOOM("CUDA out of memory")
         with self._lock:
             self.tag_calls.append(len(images))
-        got = [read_picture(b) for b in images]
+            self.tag_models.append(None if models is None else list(models))
+        got = [read_picture(b, models) for b in images]
         return [g[0] for g in got], [g[1] for g in got]
 
-    def describe(self, tags, rating, settings, kind="IMAGE", terms=None):
-        if self.vlm_down:
-            raise at.ServiceDown("the language model is not answering")
-        with self._lock:
-            self.vlm_calls.append({"tags": tags, "rating": rating, "kind": kind, "terms": terms, "settings": settings})
-        return self.answer(tags, rating, settings)
-
-    def load(self, need_tagger=True, need_vlm=True):
+    def load(self):
         self.loads += 1
-        return ["immich_aitagger", "immich_aitagger_vlm"]
+        return ["immich_aitagger"]
 
     def unload(self):
         self.unloads += 1
-        return ["immich_aitagger_vlm", "immich_aitagger"]
-
-    def touch(self):
-        pass
-
-    def idle_check(self, now=None):
-        return False
+        return ["immich_aitagger"]
 
     def status(self):
         return {"tagger": {"container": "stopped", "status": "down", "error": None},
-                "vlm": {"container": "stopped", "status": "down", "error": None},
                 "gpu": {"totalGb": 24, "usedGb": 1.0}, "searchplusRunning": False}
 
 
@@ -144,7 +148,7 @@ def catalog_for(ids: list[str]) -> list[dict]:
 
 
 class Base(unittest.TestCase):
-    """A store in a temp folder, the fake Immich, the fake model containers and a real Indexer on top."""
+    """A store in a temp folder, the fake Immich, the fake model container and a real Indexer on top."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -194,53 +198,54 @@ class TestNames(unittest.TestCase):
         self.assertEqual(at.norm_tag("_"), "")
         self.assertLessEqual(len(at.norm_tag("x" * 200)), 60)
 
-    def test_vocabulary_renames_and_preferred_terms(self):
+    def test_vocabulary_only_renames(self):
         v = at.Vocabulary("1girl -> Girl\n  solo   -> alone \nhorse\n\n-> nothing\nbad ->\nsame -> same\nA_B -> c_d")
-        self.assertEqual(v.renames, {"1girl": "girl", "solo": "alone", "a b": "c d"})
-        self.assertEqual(v.terms, ["girl", "alone", "horse", "c d"])      # half a rename is ignored
+        self.assertEqual(v.renames, {"1girl": "girl", "solo": "alone", "a b": "c d"})      # other lines are ignored
+        self.assertFalse(hasattr(v, "terms"))                                              # no preferred terms any more
         self.assertEqual(v.rename("1girl"), "girl")
         self.assertEqual(v.rename("dog"), "dog")
         self.assertEqual(at.Vocabulary("a → b").renames, {"a": "b"})
+        self.assertEqual(at.Vocabulary("just a term\nanother").renames, {})
+        self.assertEqual(at.Vocabulary("").renames, {})
 
 
 class TestSettings(Base):
     def test_defaults_match_the_contract(self):
         s = at.load_settings()
         self.assertEqual(s, at.DEFAULTS)
-        self.assertEqual((s["video_frames"], s["batch_size"], s["vlm_parallel"], s["vram_gb"]),
-                         (6, 8, 16, at.VRAM_GB_DEFAULT))
+        self.assertEqual((s["video_frames"], s["batch_size"], s["vram_gb"]), (6, 8, at.VRAM_GB_DEFAULT))
         self.assertEqual((s["use_wd"], s["use_pixai"], s["wd_strictness"], s["pixai_strictness"]), (True, True, 0.5, 0.5))
-        self.assertNotIn("use_ram", s)
-        self.assertNotIn("ram_strictness", s)
-        self.assertEqual((s["indexing"], s["keep_updated"], s["write_tags"], s["language"]), (False, True, False, "English"))
+        for gone in ("use_ram", "ram_strictness", "describe", "instructions", "language", "vlm_parallel"):
+            self.assertNotIn(gone, s)
+        self.assertEqual((s["indexing"], s["keep_updated"], s["write_tags"], s["vocabulary"]), (False, True, False, ""))
         s["blocked"].append("x")                       # callers can't change the defaults by accident
         self.assertEqual(at.load_settings()["blocked"], [])
 
     def test_types_are_checked_explicitly(self):
-        for key, bad in [("describe", "false"), ("describe", 0), ("describe", None), ("video_frames", "6"),
-                         ("video_frames", True), ("video_frames", 2.5), ("wd_strictness", "0.5"),
-                         ("wd_strictness", True), ("wd_strictness", float("nan")), ("instructions", 5),
-                         ("language", ""), ("language", "x" * 41), ("instructions", "x" * 4001),
-                         ("vocabulary", ["a"]), ("blocked", "cat"), ("blocked", [1]), ("rules", {}), ("nope", 1)]:
+        for key, bad in [("use_wd", "false"), ("use_pixai", 0), ("use_wd", None), ("character_tags", "no"),
+                         ("video_frames", "6"), ("video_frames", True), ("video_frames", 2.5), ("wd_strictness", "0.5"),
+                         ("wd_strictness", True), ("wd_strictness", float("nan")), ("pixai_strictness", None),
+                         ("vocabulary", 5), ("vocabulary", "x" * 4001), ("vocabulary", ["a"]), ("blocked", "cat"),
+                         ("blocked", [1]), ("rules", {}), ("nope", 1)]:
             with self.assertRaises(ValueError, msg=f"{key}={bad!r}"):
                 at.save_settings({key: bad}, self.store)
         self.assertEqual(at.load_settings(), at.DEFAULTS)         # nothing was saved
-        s = at.save_settings({"video_frames": 2.0, "wd_strictness": 0.5, "pixai_strictness": 1 - 0.1, "describe": False},
+        s = at.save_settings({"video_frames": 2.0, "wd_strictness": 0.5, "pixai_strictness": 1 - 0.1, "use_pixai": False},
                              self.store)
-        self.assertEqual((s["video_frames"], s["wd_strictness"], s["pixai_strictness"], s["describe"]), (2, 0.5, 0.9, False))
+        self.assertEqual((s["video_frames"], s["wd_strictness"], s["pixai_strictness"], s["use_pixai"]), (2, 0.5, 0.9, False))
         self.assertIsInstance(s["video_frames"], int)
         self.assertEqual(at.save_settings({"wd_strictness": 1 - 0.5}, self.store)["wd_strictness"], 0.5)
 
     def test_limits(self):
-        for key, lo, hi in [("video_frames", 1, 8), ("batch_size", 1, 64), ("vlm_parallel", 1, 32),
-                            ("vram_gb", *at.VRAM_GB_LIMITS), ("max_tags", 5, 100), ("wd_strictness", 0.05, 0.95),
-                            ("pixai_strictness", 0.05, 0.95)]:
+        for key, lo, hi in [("video_frames", 1, 8), ("batch_size", 1, 64), ("vram_gb", *at.VRAM_GB_LIMITS),
+                            ("max_tags", 5, 100), ("wd_strictness", 0.05, 0.95), ("pixai_strictness", 0.05, 0.95)]:
             self.assertEqual(at.LIMITS[key], (lo, hi))
             for ok in (lo, hi):
                 self.assertEqual(at.save_settings({key: ok}, self.store)[key], ok)
             for bad in (lo - 0.5 if isinstance(lo, float) else lo - 1, hi + 1):
                 with self.assertRaises(ValueError):
                     at.save_settings({key: bad}, self.store)
+        self.assertNotIn("vlm_parallel", at.LIMITS)
 
     def test_one_bad_change_saves_nothing(self):
         with self.assertRaises(ValueError):
@@ -249,12 +254,12 @@ class TestSettings(Base):
         self.assertEqual(self.store.settings_version, 1)
 
     def test_text_is_kept_as_typed_but_newlines_are_unix(self):
-        s = at.save_settings({"instructions": "Be brief.\r\nNo names.", "language": "  German "}, self.store)
-        self.assertEqual((s["instructions"], s["language"]), ("Be brief.\nNo names.", "German"))
+        s = at.save_settings({"vocabulary": "1girl -> woman\r\nsolo -> alone\rx -> y"}, self.store)
+        self.assertEqual(s["vocabulary"], "1girl -> woman\nsolo -> alone\nx -> y")
 
     def test_the_version_goes_up_only_for_content_settings(self):
         self.assertEqual(self.store.settings_version, 1)
-        for changes in ({"indexing": True}, {"keep_updated": False}, {"batch_size": 4}, {"vlm_parallel": 4},
+        for changes in ({"indexing": True}, {"keep_updated": False}, {"batch_size": 4},
                         {"vram_gb": at.VRAM_GB_LIMITS[0] + 1}):
             self.assertEqual(self.set(**changes), [])
         self.assertEqual(self.store.settings_version, 1)
@@ -262,12 +267,12 @@ class TestSettings(Base):
         self.assertEqual(self.store.settings_version, 2)
         self.assertEqual(self.set(max_tags=12), [])                    # same value: not a change
         self.assertEqual(self.store.settings_version, 2)
-        self.assertEqual(sorted(self.set(instructions="x", language="French", describe=False)),
-                         ["describe", "instructions", "language"])
+        self.assertEqual(sorted(self.set(vocabulary="a -> b", wd_strictness=0.6, use_pixai=False)),
+                         ["use_pixai", "vocabulary", "wd_strictness"])
         self.assertEqual(self.store.settings_version, 3)               # one bump per save
-        for key, value in [("video_frames", 2), ("use_wd", False), ("use_pixai", False), ("wd_strictness", 0.6),
+        for key, value in [("video_frames", 2), ("use_wd", False), ("use_pixai", True), ("wd_strictness", 0.7),
                            ("pixai_strictness", 0.6), ("character_tags", False), ("rating_tag", False),
-                           ("vocabulary", "a -> b"), ("blocked", ["cat"]),
+                           ("vocabulary", "a -> c"), ("blocked", ["cat"]),
                            ("rules", [rule(if_all=["a"], add=["b"])]), ("write_tags", True)]:
             before = self.store.settings_version
             self.assertEqual(self.set(**{key: value}), [key])
@@ -292,18 +297,18 @@ class TestSettings(Base):
             self.assertIn(text, str(ctx.exception))
 
     def test_a_hand_edited_bad_value_falls_back_to_the_default(self):
-        at.settings_path().write_text(json.dumps({"max_tags": 9999, "describe": "no", "video_frames": 3, "zzz": 1}))
+        at.settings_path().write_text(json.dumps({"max_tags": 9999, "use_wd": "no", "video_frames": 3, "zzz": 1}))
         s = at.load_settings()
-        self.assertEqual((s["max_tags"], s["describe"], s["video_frames"]), (30, True, 3))
+        self.assertEqual((s["max_tags"], s["use_wd"], s["video_frames"]), (30, True, 3))
         at.settings_path().write_text("[1, 2]")
         self.assertEqual(at.load_settings(), at.DEFAULTS)
 
     def test_a_settings_file_from_v1_still_loads(self):
         # written by the RAM++ version: use_ram / ram_strictness are unknown now, and its vram_gb (18-21) is out of range
         at.settings_path().write_text(json.dumps({"use_ram": False, "ram_strictness": 0.9, "vram_gb": 20, "max_tags": 12,
-                                                  "use_wd": False, "instructions": "Be brief."}))
+                                                  "use_wd": False, "vocabulary": "a -> b"}))
         s = at.load_settings()
-        self.assertEqual((s["use_wd"], s["max_tags"], s["instructions"]), (False, 12, "Be brief."))     # what still fits
+        self.assertEqual((s["use_wd"], s["max_tags"], s["vocabulary"]), (False, 12, "a -> b"))     # what still fits
         self.assertEqual((s["use_pixai"], s["pixai_strictness"], s["vram_gb"]), (True, 0.5, at.VRAM_GB_DEFAULT))
         self.assertEqual(set(s), set(at.DEFAULTS))                                  # the old keys are dropped
         saved = at.save_settings({"max_tags": 13}, self.store)                       # saving works and cleans the file up
@@ -314,22 +319,137 @@ class TestSettings(Base):
                 at.save_settings({old: True}, self.store)
             self.assertIn("Unknown", str(err.exception))
 
+    def test_a_settings_file_from_v2_with_the_describer_keys_still_loads(self):
+        v2 = {"indexing": True, "keep_updated": False, "video_frames": 2, "batch_size": 4, "vlm_parallel": 8, "vram_gb": 6,
+              "describe": True, "use_wd": True, "use_pixai": False, "wd_strictness": 0.7, "pixai_strictness": 0.4,
+              "character_tags": False, "rating_tag": True, "max_tags": 12, "instructions": "Be brief.",
+              "vocabulary": "1girl -> woman\nthe lake house", "blocked": ["cat"], "rules": [], "write_tags": True,
+              "language": "German"}
+        at.settings_path().write_text(json.dumps(v2))
+        s = at.load_settings()
+        self.assertEqual(set(s), set(at.DEFAULTS))                       # the four describer keys are not there
+        for gone in ("describe", "instructions", "language", "vlm_parallel"):
+            self.assertNotIn(gone, s)
+        self.assertEqual({k: s[k] for k in s}, {**at.DEFAULTS, **{k: v for k, v in v2.items() if k in at.DEFAULTS}})
+        self.assertEqual((s["use_pixai"], s["pixai_strictness"], s["vocabulary"], s["write_tags"]),
+                         (False, 0.4, "1girl -> woman\nthe lake house", True))      # everything else is read as it was
+        saved = at.save_settings({"max_tags": 13}, self.store)           # saving cleans the file up
+        self.assertEqual(saved["max_tags"], 13)
+        self.assertEqual(set(json.loads(at.settings_path().read_text("utf-8"))), set(at.DEFAULTS))
+        for key, value in (("describe", False), ("instructions", "x"), ("language", "German"), ("vlm_parallel", 4)):
+            with self.assertRaises(ValueError, msg=key) as err:           # sending them is refused like any unknown key
+                at.save_settings({key: value}, self.store)
+            self.assertIn("Unknown", str(err.exception))
+            self.assertIn(key, str(err.exception))
+        self.assertEqual(at.load_settings()["max_tags"], 13)
+
     def test_the_cheapest_reprocess_mode_for_the_changed_keys(self):
         self.assertEqual(at.suggest_mode([]), "none")
         self.assertEqual(at.suggest_mode(["max_tags", "blocked", "rules"]), "retag")
-        self.assertEqual(at.suggest_mode(["rules", "instructions"]), "describe")
-        self.assertEqual(at.suggest_mode(["language"]), "describe")
-        self.assertEqual(at.suggest_mode(["instructions", "video_frames"]), "full")
+        self.assertEqual(at.suggest_mode(["vocabulary"]), "retag")                     # renames re-apply to the stored scores
+        self.assertEqual(at.suggest_mode(["rules", "video_frames"]), "full")
         self.assertEqual(at.suggest_mode(["use_pixai"]), "full")
         self.assertEqual(at.suggest_mode(["pixai_strictness"]), "retag")
+        self.assertEqual(at.suggest_mode(["batch_size"]), "none")
+        self.assertEqual(set(at.REPROCESS), {"retag", "full"})                           # no describe mode any more
         every = {k for keys in at.REPROCESS.values() for k in keys}
         self.assertEqual(every, set(at.CONTENT))            # every content setting has a mode
+
+    def test_describe_counts_as_retag(self):
+        self.assertEqual(at.MODES, ("retag", "full"))
+        self.assertEqual([at.normalize_mode(m) for m in ("retag", "full", "describe")], ["retag", "full", "retag"])
+        for bad in ("", "everything", None, 3, ["retag"], "Retag"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                at.normalize_mode(bad)
 
     def test_write_tags_is_remembered_so_the_native_tags_stay_in_step(self):
         self.assertEqual(self.store.meta("native_tags"), "")
         self.set(write_tags=True)
         self.set(write_tags=False)
         self.assertEqual(self.store.meta("native_tags"), "1")
+
+
+class TestTaggerRegistry(Base):
+    """The registry ``TAGGERS``: settings, limits and modes are generated from it, nothing else names a tagger."""
+
+    def test_wd_and_pixai_are_registered_as_they_always_were(self):
+        self.assertEqual([k.key for k in at.TAGGERS], ["wd", "pixai"])
+        wd, pixai = at.TAGGERS
+        self.assertEqual((wd.label, wd.categories, wd.character_categories, wd.has_rating, wd.default_on),
+                         ("wd-eva02-large-tagger-v3", ("general", "character"), ("character",), True, True))
+        self.assertEqual((pixai.label, pixai.categories, pixai.character_categories, pixai.has_rating, pixai.default_on),
+                         ("pixai-tagger-v1.0", ("general", "character", "copyright"), ("character", "copyright"), True, True))
+        self.assertEqual(at.model_labels(), {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0"})
+        self.assertEqual(list(at.model_labels()), ["wd", "pixai"])                    # in registry order
+
+    def test_every_tagger_has_generated_settings_limits_and_modes(self):
+        for kind in at.TAGGERS:
+            use, strict = f"use_{kind.key}", f"{kind.key}_strictness"
+            self.assertIs(at.DEFAULTS[use], kind.default_on)
+            self.assertEqual(at.DEFAULTS[strict], 0.5)
+            self.assertEqual(at.LIMITS[strict], (0.05, 0.95))
+            self.assertNotIn(use, at.LIMITS)
+            self.assertIn(use, at.CONTENT)
+            self.assertIn(strict, at.CONTENT)
+            self.assertIn(use, at.REPROCESS["full"])                  # which taggers run changes the scores: full
+            self.assertIn(strict, at.REPROCESS["retag"])              # a threshold re-applies to the stored scores: retag
+            self.assertNotIn(use, at.REPROCESS["retag"])
+            self.assertNotIn(strict, at.REPROCESS["full"])
+        self.assertEqual(at.suggest_mode(["use_wd", "wd_strictness"]), "full")
+
+    def test_a_third_tagger_gets_its_settings_without_any_other_change(self):
+        with_extra(self)
+        self.assertEqual([k.key for k in at.TAGGERS], ["wd", "pixai", "extra"])
+        self.assertEqual((at.DEFAULTS["use_extra"], at.DEFAULTS["extra_strictness"]), (False, 0.5))      # off by default
+        self.assertEqual(at.LIMITS["extra_strictness"], (0.05, 0.95))
+        self.assertIn("use_extra", at.CONTENT)
+        self.assertIn("extra_strictness", at.CONTENT)
+        self.assertIn("use_extra", at.REPROCESS["full"])
+        self.assertIn("extra_strictness", at.REPROCESS["retag"])
+        self.assertEqual(at.model_labels()["extra"], "extra-tagger-test")
+        self.assertEqual(list(at.model_labels()), ["wd", "pixai", "extra"])
+        s = at.load_settings()
+        self.assertEqual((s["use_extra"], s["extra_strictness"]), (False, 0.5))
+        self.assertEqual(set(s), set(at.DEFAULTS))
+        # validation is the same as for the others
+        for key, bad in [("use_extra", "yes"), ("use_extra", 1), ("extra_strictness", "0.5"), ("extra_strictness", True),
+                         ("extra_strictness", 0.04), ("extra_strictness", 0.96), ("extra_strictness", float("inf"))]:
+            with self.assertRaises(ValueError, msg=f"{key}={bad!r}"):
+                at.save_settings({key: bad}, self.store)
+        self.assertEqual(self.set(use_extra=True, extra_strictness=0.7), ["use_extra", "extra_strictness"])
+        self.assertEqual(at.suggest_mode(["use_extra"]), "full")
+        self.assertEqual(at.suggest_mode(["extra_strictness"]), "retag")
+        saved = at.load_settings()
+        self.assertEqual((saved["use_extra"], saved["extra_strictness"]), (True, 0.7))
+        self.assertEqual([k.key for k in at.enabled_kinds(saved)], ["wd", "pixai", "extra"])
+        self.assertEqual([k.key for k in at.enabled_kinds({**saved, "use_pixai": False})], ["wd", "extra"])
+        every = {k for keys in at.REPROCESS.values() for k in keys}
+        self.assertEqual(every, set(at.CONTENT))
+
+    def test_the_registry_is_restored_afterwards(self):
+        saved = list(at.TAGGERS)
+        defaults = dict(at.DEFAULTS)
+        at.configure_taggers([*saved, EXTRA])
+        at.configure_taggers(saved)
+        self.assertEqual(at.TAGGERS, saved)
+        self.assertEqual(at.DEFAULTS, defaults)
+        self.assertNotIn("extra_strictness", at.LIMITS)
+        with self.assertRaises(ValueError):
+            at.save_settings({"use_extra": True}, self.store)
+
+    def test_a_tagger_entry_is_checked(self):
+        for key in ("", "Wd", "my_tagger", "1a", "a b", "a-b"):
+            with self.assertRaises(ValueError, msg=key):
+                at.TaggerKind(key, "x", ("general",))
+        with self.assertRaises(ValueError):
+            at.TaggerKind("x", "x", ("general",), ("character",))               # character_categories not in categories
+        with self.assertRaises(ValueError):
+            at.TaggerKind("x", "x", ())
+        saved = list(at.TAGGERS)
+        with self.assertRaises(ValueError):
+            at.configure_taggers([*saved, at.TAGGERS[0]])                         # the same key twice
+        self.assertEqual(at.TAGGERS, saved)                                       # a refused registry changes nothing
+        self.assertIn("use_wd", at.DEFAULTS)
 
 
 # ---------------------------------------------------------------- scores -> tags
@@ -546,10 +666,10 @@ class TestRules(unittest.TestCase):
         self.assertEqual(self.run_rules(r, "girl")[0], ["woman"])
 
 
-# ---------------------------------------------------------------- the VLM's words, the cap, the final list
+# ---------------------------------------------------------------- the explicit-tag check, the final list
 
 class TestSexualTagsNeedAgreement(unittest.TestCase):
-    """A sexual tag on a picture rated general/sensitive is kept only when both taggers found it."""
+    """A sexual tag on a picture rated general/sensitive is kept only when at least two enabled taggers found it."""
     EVERYDAY = "wd:door=0.97,oral=0.96,loli=0.74,shirt=0.6|pixai:door=0.93,shirt=0.94,indoors=0.96|rating:general=0.9"
 
     def tags(self, *pictures, **settings):
@@ -575,6 +695,14 @@ class TestSexualTagsNeedAgreement(unittest.TestCase):
         got = self.tags(self.EVERYDAY, use_pixai=False)
         self.assertNotIn("oral", got["tags"])
         self.assertIn("door", got["tags"])
+        only_pixai = self.tags("wd:door=0.9|pixai:oral=0.9,door=0.9|prating:general=0.9", use_wd=False)
+        self.assertNotIn("oral", only_pixai["tags"])        # a single tagger can never confirm itself
+        self.assertEqual(only_pixai["display"]["dropped"], ["oral"])
+
+    def test_a_single_tagger_on_drops_it_even_when_it_is_the_only_one_that_saw_it_in_two_captures(self):
+        got = self.tags("wd:oral=0.96|pixai:a=0.6|rating:general=0.9", "wd:oral=0.96|pixai:a=0.6|rating:general=0.9",
+                        use_pixai=False)
+        self.assertNotIn("oral", got["tags"])
 
     def test_without_a_rating_nothing_is_dropped(self):
         got = self.tags("wd:oral=0.96|pixai:door=0.9")
@@ -585,68 +713,236 @@ class TestSexualTagsNeedAgreement(unittest.TestCase):
         self.assertNotIn("mouth stuff", got["tags"])
 
 
+class TestThreeTaggers(Base):
+    """Three taggers (the real two and the fake ``extra``), all enabled: agreement, the rating, the lists, the merge."""
+
+    def setUp(self):
+        with_extra(self)
+        super().setUp()
+
+    def detect(self, *pictures, **settings):
+        return at.detect(raw_of(*pictures), S(**{"use_extra": True, **settings}))
+
+    def test_extra_is_off_by_default_so_two_taggers_work_as_before(self):
+        raw = raw_of("wd:a=0.9|pixai:b=0.9|extra:c=0.9|rating:general=0.9")
+        self.assertEqual(set(at.detect(raw, S())["tags"]), {"a", "b", "rating: general"})
+        self.assertEqual(set(self.detect("wd:a=0.9|pixai:b=0.9|extra:c=0.9|rating:general=0.9")["tags"]),
+                         {"a", "b", "c", "rating: general"})
+
+    def test_a_sexual_tag_is_kept_when_any_two_of_the_three_found_it(self):
+        base = "|rating:general=0.9"
+        for pictures, kept in [
+            ("wd:oral=0.9,door=0.9|pixai:oral=0.8,door=0.9|extra:door=0.9", True),        # wd + pixai
+            ("wd:oral=0.9,door=0.9|pixai:door=0.9|extra:oral=0.9,door=0.9", True),        # wd + extra
+            ("wd:door=0.9|pixai:oral=0.9,door=0.9|extra:oral=0.8,door=0.9", True),        # pixai + extra
+            ("wd:oral=0.9,door=0.9|pixai:oral=0.9|extra:oral=0.9", True),                 # all three
+            ("wd:oral=0.9,door=0.9|pixai:door=0.9|extra:door=0.9", False),                # wd alone
+            ("wd:door=0.9|pixai:oral=0.9,door=0.9|extra:door=0.9", False),                # pixai alone
+            ("wd:door=0.9|pixai:door=0.9|extra:oral=0.9,door=0.9", False),                # extra alone
+        ]:
+            with self.subTest(pictures=pictures):
+                got = self.detect(pictures + base)
+                self.assertEqual("oral" in got["tags"], kept)
+                self.assertEqual(got["display"].get("dropped"), None if kept else ["oral"])
+                self.assertIn("door", got["tags"])
+
+    def test_found_means_it_passed_that_taggers_own_strictness(self):
+        picture = "wd:oral=0.9,door=0.9|pixai:door=0.9|extra:oral=0.3,door=0.9|rating:general=0.9|erating:general=0.9"
+        self.assertNotIn("oral", self.detect(picture)["tags"])                           # extra's 0.3 is below its 0.5
+        self.assertIn("oral", self.detect(picture, extra_strictness=0.25)["tags"])       # now extra found it too
+        self.assertNotIn("oral", self.detect(picture, extra_strictness=0.25, use_extra=False)["tags"])
+        # switching a second tagger off leaves one: dropped
+        self.assertNotIn("oral", self.detect(picture, extra_strictness=0.25, use_wd=False)["tags"])
+
+    def test_an_explicit_rating_keeps_tags_one_tagger_saw(self):
+        got = self.detect("wd:oral=0.9|pixai:a=0.9|extra:b=0.9|rating:explicit=0.9,general=0.05")
+        self.assertIn("oral", got["tags"])
+
+    def test_the_rating_is_the_mean_of_the_three_taggers_that_report_one(self):
+        # general: wd .9, pixai .3, extra .6 -> .6; explicit: wd .1, pixai .7, extra .4 -> .4
+        pictures = ("wd:a=0.9|rating:general=0.9,explicit=0.1|prating:general=0.3,explicit=0.7|extra:b=0.9|"
+                    "erating:general=0.6,explicit=0.4",)
+        got = self.detect(*pictures)
+        self.assertEqual(got["display"]["rating"], {"general": 0.6, "explicit": 0.4})
+        score, source = got["tags"]["rating: general"]
+        self.assertAlmostEqual(score, 0.6)
+        self.assertEqual(source, "wd")                                      # the one surest of the winner
+        # each tagger is averaged over the captures first, then the three are averaged
+        two = ("wd:a=0.9|rating:general=0.8|prating:general=0.2|erating:general=0.4",
+               "wd:a=0.9|rating:general=0.6|prating:general=0.4|erating:general=0.8")
+        self.assertAlmostEqual(self.detect(*two)["display"]["rating"]["general"], (0.7 + 0.3 + 0.6) / 3, places=3)
+        # the third one decides when the two others split
+        split = "wd:a=0.9|rating:general=0.6,explicit=0.4|prating:general=0.45,explicit=0.55|erating:general=0.1,explicit=0.9"
+        self.assertEqual(list(k for k in self.detect(split)["tags"] if k.startswith("rating")), ["rating: explicit"])
+        no_extra = at.detect(raw_of(split), S())                           # extra off: general .525 against explicit .475
+        self.assertEqual(no_extra["tags"]["rating: general"], (0.525, "wd"))
+        # a tagger that is off, or that gave no rating, does not take part or dilute it
+        self.assertEqual(self.detect(*pictures, use_extra=False)["display"]["rating"], {"general": 0.6, "explicit": 0.4})
+        self.assertAlmostEqual(self.detect(*pictures, use_wd=False)["display"]["rating"]["general"], 0.45)
+        silent = self.detect("wd:a=0.9|rating:general=0.9|extra:b=0.9")             # extra and pixai said nothing
+        self.assertEqual(silent["tags"]["rating: general"], (0.9, "wd"))
+        # an exact tie goes to the first registered tagger
+        tie = self.detect("wd:a=0.9|rating:general=0.6,sensitive=0.4|prating:general=0.6,sensitive=0.4|"
+                          "erating:general=0.6,sensitive=0.4")
+        self.assertAlmostEqual(tie["tags"]["rating: general"][0], 0.6)
+        self.assertEqual(tie["tags"]["rating: general"][1], "wd")
+
+    def test_a_tagger_without_a_rating_is_left_out_of_the_rating(self):
+        at.configure_taggers([*at.TAGGERS[:2], EXTRA_NO_RATING])      # this test's fake reports no rating (setUp restores)
+        self.assertFalse(at.TAGGERS[-1].has_rating)
+        raw = at.raw_from_results([read_picture(b"wd:a=0.9|rating:general=0.8|extra:b=0.9|erating:explicit=0.99")[0]], [None])
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.8}, "pixai": None, "extra": None}])   # never stored
+        got = at.detect(raw, S(use_extra=True))
+        self.assertEqual(got["display"]["rating"], {"general": 0.8})
+        self.assertEqual(got["tags"]["b"], (0.9, "extra"))                                      # its tags still count
+
+    def test_the_highest_score_wins_and_the_source_is_that_tagger(self):
+        got = self.detect("wd:smile=0.7,a=0.6|pixai:smile=0.8|extra:smile=0.9,a=0.8|rating:general=0.9")["tags"]
+        self.assertEqual((got["smile"], got["a"]), ((0.9, "extra"), (0.8, "extra")))
+        got = self.detect("wd:smile=0.95|pixai:smile=0.8|extra:smile=0.9|rating:general=0.9")["tags"]
+        self.assertEqual(got["smile"], (0.95, "wd"))
+
+    def test_character_tags_gate_the_third_taggers_character_category(self):
+        picture = "wd:girl=0.9|extra:smile=0.9|echar:hatsune_miku=0.9|rating:general=0.9"
+        self.assertIn("hatsune miku", self.detect(picture)["tags"])
+        got = self.detect(picture, character_tags=False)
+        self.assertNotIn("hatsune miku", got["tags"])
+        self.assertIn("smile", got["tags"])
+        self.assertNotIn("hatsune miku", {t["tag"] for t in got["display"]["extra"]})
+
+    def test_the_preview_has_a_list_for_every_registered_tagger(self):
+        picture = "wd:girl=0.9,hat=0.3|pixai:beach=0.8|extra:sea=0.7,wave=0.3,gone=0.1|rating:general=0.9"
+        shown = self.detect(picture)["display"]
+        self.assertEqual(set(shown), {"wd", "pixai", "extra", "rating"})
+        self.assertEqual({t["tag"]: t["kept"] for t in shown["extra"]}, {"sea": True, "wave": False})   # from 0.2 up
+        self.assertEqual([t["tag"] for t in shown["wd"]], ["girl", "hat"])
+        off = at.detect(raw_of(picture), S())["display"]                                   # extra is off: an empty list
+        self.assertEqual((off["extra"], set(off)), ([], {"wd", "pixai", "extra", "rating"}))
+
+    def test_stored_scores_keep_every_taggers_categories_and_rating(self):
+        raw = raw_of("wd:girl=0.9|char:miku=0.8|rating:general=0.9|pixai:smile=0.7|pchar:rin=0.6|copy:vocaloid=0.8|"
+                     "prating:general=0.8|extra:sea=0.7|echar:luka=0.6|erating:general=0.7,explicit=0.2")
+        self.assertEqual(raw["scores"], [{"wd": {"general": {"girl": 0.9}, "character": {"miku": 0.8}},
+                                          "pixai": {"general": {"smile": 0.7}, "character": {"rin": 0.6},
+                                                    "copyright": {"vocaloid": 0.8}},
+                                          "extra": {"general": {"sea": 0.7}, "character": {"luka": 0.6}}}])
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9}, "pixai": {"general": 0.8},
+                                           "extra": {"general": 0.7, "explicit": 0.2}}])
+        self.assertEqual(raw["models"], ["extra", "pixai", "wd"])
+        self.store.save_raw("a", raw)
+        self.assertEqual(self.store.raw("a"), raw)
+        self.assertTrue(at.has_kind(raw, "extra"))
+
+    def test_a_stored_raw_row_lacking_an_enabled_tagger_is_incomplete(self):
+        old = raw_of("wd:a=0.9|pixai:b=0.9|rating:general=0.9")
+        old["scores"] = [{k: v for k, v in cap.items() if k != "extra"} for cap in old["scores"]]     # made before extra
+        self.assertEqual(at.missing_kinds(old, S()), [])                                     # extra is off: nothing missing
+        self.assertEqual(at.missing_kinds(old, S(use_extra=True)), ["extra"])
+        self.assertEqual(at.missing_kinds(old, S(use_extra=True, use_wd=False, use_pixai=False)), ["extra"])
+        self.assertEqual(at.missing_kinds(None, S()), ["wd", "pixai"])
+        self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9|extra:b=0.9"), S(use_extra=True)), [])
+        self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9"), S(use_wd=False, use_pixai=False)), [])
+
+    def test_only_the_enabled_taggers_are_asked_for_and_stored(self):
+        self.set(use_extra=True)
+        self.run_indexer()
+        self.assertEqual(set(map(tuple, self.services.tag_models)), {("wd", "pixai", "extra")})
+        self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), "extra"))
+        self.services.tag_models.clear()
+        self.store.enqueue(self.ids[:2], "full")
+        self.run_indexer(use_pixai=False, use_extra=False)
+        self.assertEqual(set(map(tuple, self.services.tag_models)), {("wd",)})
+        self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), "pixai"))
+        self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), "extra"))
+
+    EXTRA_PHOTO = PHOTO + "|extra:lake=0.9,sea=0.95|erating:general=0.9"
+
+    def test_the_third_tagger_takes_part_end_to_end(self):
+        self.catalog[0]["preview"] = self.EXTRA_PHOTO
+        self.run_indexer(use_extra=True)
+        self.assertEqual(self.description(0),
+                         "[AI Tagger]\nTags: sea, girl, lake, beach, miku, solo, rating: general\n[/AI Tagger]")
+        by = {t["tag"]: t for t in self.store.result(self.ids[0])["tags"]}
+        self.assertEqual((by["sea"]["source"], by["lake"]["source"], by["girl"]["source"], by["beach"]["source"]),
+                         ("extra", "extra", "wd", "pixai"))
+        self.assertEqual(by["sea"]["score"], 0.95)                          # the highest of pixai's .7 and extra's .95
+        self.assertEqual(self.store.raw(self.ids[0])["models"], ["extra", "pixai", "wd"])
+        self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\n[/AI Tagger]")
+
+    def test_enabling_it_later_makes_a_retag_a_full_reprocess(self):
+        self.run_indexer()                                                  # extra is off
+        self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), "extra"))
+        self.services.tag_calls.clear()
+        self.services.tag_models.clear()
+        self.assertEqual(self.set(use_extra=True), ["use_extra"])
+        self.assertEqual(at.reprocess(self.store, "outdated", "retag"), 3)  # only a retag was asked for ...
+        self.run_indexer()
+        self.assertEqual(sum(self.services.tag_calls), 1 + 1 + 3)           # ... but the stored scores lack an enabled tagger
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd", "pixai", "extra")})
+        self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), "extra"))
+        self.services.tag_calls.clear()
+        self.assertEqual(self.set(extra_strictness=0.6), ["extra_strictness"])
+        at.reprocess(self.store, "outdated", "retag")
+        self.run_indexer()
+        self.assertEqual(self.services.tag_calls, [])                       # complete now: a retag is cheap again
+
+    def test_a_retag_with_all_three_stored_needs_no_gpu(self):
+        self.catalog[0]["preview"] = self.EXTRA_PHOTO
+        self.run_indexer(use_extra=True)
+        self.services.tag_calls.clear()
+        self.set(extra_strictness=0.95)
+        at.reprocess(self.store, "outdated", "retag")
+        self.run_indexer()
+        self.assertEqual(self.services.tag_calls, [])
+        names = {t["tag"]: t["source"] for t in self.store.result(self.ids[0])["tags"]}
+        self.assertNotIn("lake", names)                                     # extra's .9 is below its .95 now
+        self.assertEqual(names["sea"], "extra")                             # its .95 still passes
+        self.set(extra_strictness=0.5, use_extra=False)
+        at.reprocess(self.store, "outdated", "retag")
+        self.run_indexer()
+        self.assertEqual(self.services.tag_calls, [])                       # switching it off applies to the stored scores too
+        names = {t["tag"]: t["source"] for t in self.store.result(self.ids[0])["tags"]}
+        self.assertEqual((names.get("lake"), names["sea"]), (None, "pixai"))
+
+    def test_agreement_by_any_two_of_three_end_to_end(self):
+        picture = "wd:door=0.9,oral=0.9|pixai:door=0.9|extra:oral=0.9|rating:general=0.9|erating:general=0.9"
+        self.catalog = [{**self.catalog[0], "preview": picture}]
+        self.run_indexer(use_extra=True)
+        self.assertIn("oral", self.description(0))                          # WD and extra agree
+        self.set(use_extra=False)
+        at.reprocess(self.store, "outdated", "retag")
+        calls = list(self.services.tag_calls)
+        self.run_indexer()
+        self.assertNotIn("oral", self.description(0))                       # only WD is left that saw it
+        self.assertEqual(self.services.tag_calls, calls)                    # (the stored scores were enough)
+
+    def test_the_preview_lists_all_three_taggers(self):
+        self.catalog[0]["preview"] = self.EXTRA_PHOTO.replace("lake=0.9", "lake=0.9,wave=0.3")
+        self.set(use_extra=True)
+        got = self.indexer.test(self.ids[0])
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "extra", "rating"})
+        self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["extra"]}, {"sea": True, "lake": True, "wave": False})
+        self.assertEqual(self.services.tag_models, [["wd", "pixai", "extra"]])
+        self.assertEqual((got["models"]["rating"]["general"], got["models"]["rating"]["sensitive"]), (0.9, 0.04))
+        self.assertEqual(self.services.ready_calls[0], {"tagger": True})
+        self.assertIn("sea", {t["tag"] for t in got["tags"]})
+
+
 class TestFinalTags(unittest.TestCase):
-    def build(self, vlm=None, pictures=(PHOTO,), **settings):
-        return at.build(raw_of(*pictures), vlm, S(**settings))
+    def build(self, pictures=(PHOTO,), **settings):
+        return at.build(raw_of(*pictures), S(**settings))
 
-    def test_vlm_adds_and_removes(self):
-        vlm = {"description": "A girl.", "add_tags": ["Smile", "Sea Shore"], "remove_tags": ["solo", "nothing"]}
-        got = self.build(vlm)
-        by = {t["tag"]: t for t in got["tags"]}
-        self.assertEqual(by["smile"], {"tag": "smile", "score": 0.7, "source": "vlm"})
-        self.assertEqual(by["sea shore"]["score"], 0.7)
-        self.assertNotIn("solo", by)
-        self.assertEqual(by["girl"]["source"], "wd")
-        self.assertEqual(got["description"], "A girl.")
-
-    def test_a_tag_the_vlm_adds_that_was_found_already_keeps_its_source_and_score(self):
-        got = self.build({"description": "", "add_tags": ["sea", "girl"], "remove_tags": []})
-        by = {t["tag"]: t for t in got["tags"]}
-        self.assertEqual(by["sea"], {"tag": "sea", "score": 0.7, "source": "pixai"})
-        self.assertEqual(by["girl"], {"tag": "girl", "score": 0.9, "source": "wd"})       # never lowered
-
-    def test_a_tag_the_vlm_both_adds_and_removes_is_ignored(self):
-        got = self.build({"description": "", "add_tags": ["smile", "solo"], "remove_tags": ["smile", "solo"]})
-        names = tags_of(got)
-        self.assertNotIn("smile", names)                    # not added
-        self.assertIn("solo", names)                        # not removed either
-
-    def test_the_vlm_cannot_remove_a_sure_tag_or_the_rating(self):
-        vlm = {"description": "", "add_tags": [], "remove_tags": ["girl", "beach", "rating: general"]}
-        names = tags_of(self.build(vlm))
-        self.assertIn("girl", names)                        # 0.9: a tagger is sure
-        self.assertNotIn("beach", names)                    # 0.8: the VLM may overrule it
-        self.assertIn("rating: general", names)
-
-    def test_vlm_tags_are_renamed_and_blocked_too(self):
-        vlm = {"description": "", "add_tags": ["1girl", "cat", "Hair_Bow"], "remove_tags": ["sea"]}
-        got = self.build(vlm, vocabulary="1girl -> woman\nhair bow -> bow", blocked=["cat"])
-        names = tags_of(got)
-        self.assertIn("woman", names)
-        self.assertIn("bow", names)
-        self.assertNotIn("cat", names)
-        self.assertNotIn("sea", names)
-        # the VLM may name a tag the way the panel showed it (already renamed)
-        got = self.build({"description": "", "add_tags": [], "remove_tags": ["woman"]}, vocabulary="girl -> woman",
-                         pictures=("wd:girl=0.6",))
-        self.assertEqual(tags_of(got), [r for r in tags_of(got) if r.startswith("rating")])
-
-    def test_without_describe_the_vlm_is_ignored(self):
-        got = self.build({"description": "A girl.", "add_tags": ["smile"], "remove_tags": ["girl"]}, describe=False)
-        self.assertIn("girl", tags_of(got))
-        self.assertNotIn("smile", tags_of(got))
-        self.assertEqual(got["description"], "")
-        self.assertNotIn("Description:", got["block"])
-
-    def test_rules_see_what_the_vlm_did_and_blocked_wins_over_everything(self):
-        rules = [rule(if_all=["smile"], add=["happy", "cat"]), rule(if_all=["happy"], remove=["solo"])]
-        got = self.build({"description": "", "add_tags": ["smile"], "remove_tags": []}, rules=rules, blocked=["cat"])
+    def test_the_rules_run_on_the_detected_tags_and_blocked_wins_over_everything(self):
+        rules = [rule(if_all=["girl"], add=["happy", "cat"]), rule(if_all=["happy"], remove=["solo"])]
+        got = self.build(rules=rules, blocked=["cat"])
         names = tags_of(got)
         self.assertIn("happy", names)
         self.assertNotIn("cat", names)                           # added by a rule, blocked afterwards
         self.assertNotIn("solo", names)
         self.assertEqual(got["rules"], [{"rule": 0, "added": ["happy", "cat"], "removed": []},     # what the rule did, before "blocked"
                                         {"rule": 1, "added": [], "removed": ["solo"]}])
+        by = {t["tag"]: t for t in got["tags"]}
+        self.assertEqual(by["happy"], {"tag": "happy", "score": 1.0, "source": "rule"})
 
     def test_the_cap_keeps_the_best_and_always_the_rating(self):
         pic = "wd:" + ",".join(f"t{i:02d}={0.99 - i * 0.01:.2f}" for i in range(20)) + "|rating:general=0.6,sensitive=0.4"
@@ -654,34 +950,40 @@ class TestFinalTags(unittest.TestCase):
         names = tags_of(got)
         self.assertEqual(names, ["t00", "t01", "t02", "t03", "rating: general"])         # 4 + the pinned rating
         self.assertEqual(len(self.build(pictures=(pic,), max_tags=5, rating_tag=False)["tags"]), 5)
-        got = self.build({"description": "", "add_tags": ["zzz"], "remove_tags": []}, pictures=(pic,), max_tags=5)
-        self.assertNotIn("zzz", tags_of(got))           # a tag only the VLM saw (0.7) ranks below the taggers' sure ones
-        self.assertEqual(len(got["tags"]), 5)
 
     def test_order_is_by_score_then_name_with_the_rating_last(self):
         got = self.build()
         self.assertEqual(tags_of(got), ["girl", "beach", "miku", "solo", "sea", "rating: general"])
         self.assertEqual([t["score"] for t in got["tags"]], [0.9, 0.8, 0.8, 0.8, 0.7, 0.9])
+
+    def test_the_block_is_tags_only(self):
+        got = self.build()
         self.assertEqual(got["block"], "[AI Tagger]\nTags: girl, beach, miku, solo, sea, rating: general\n[/AI Tagger]")
+        self.assertEqual(set(got), {"tags", "models", "rules", "block"})            # no description, no describer answer
+        self.assertNotIn("Description", got["block"])
+        self.assertEqual(self.build(pictures=("wd:dull=0.1",), rating_tag=False)["block"], "")     # nothing to say
+        self.assertEqual(at.finalize({}, S())[0], [])
+        self.assertFalse(hasattr(at, "VLM_ADD_SCORE") or hasattr(at, "VLM_PROTECT"))
 
 
 # ---------------------------------------------------------------- the block in the description
 
-BLOCK = "[AI Tagger]\nTags: girl, beach\nDescription: A girl on a beach.\n[/AI Tagger]"
+BLOCK = "[AI Tagger]\nTags: girl, beach\n[/AI Tagger]"
 BLOCK2 = "[AI Tagger]\nTags: dog\n[/AI Tagger]"
+V2_BLOCK = "[AI Tagger]\nTags: girl, beach\nDescription: A girl on a beach.\n[/AI Tagger]"       # what v2 wrote
 
 
 class TestBlock(unittest.TestCase):
     def test_compose(self):
-        self.assertEqual(at.compose_block(["girl", "beach", "rating: general"], "A girl on a beach."),
-                         "[AI Tagger]\nTags: girl, beach, rating: general\nDescription: A girl on a beach.\n[/AI Tagger]")
-        self.assertEqual(at.compose_block(["dog"], ""), BLOCK2)
-        self.assertEqual(at.compose_block([], "Only words."), "[AI Tagger]\nDescription: Only words.\n[/AI Tagger]")
-        self.assertEqual(at.compose_block([], ""), "")
-        self.assertEqual(at.compose_block(["a"], "Two\nlines   here."), "[AI Tagger]\nTags: a\nDescription: Two lines here.\n[/AI Tagger]")
+        self.assertEqual(at.compose_block(["girl", "beach", "rating: general"]),
+                         "[AI Tagger]\nTags: girl, beach, rating: general\n[/AI Tagger]")
+        self.assertEqual(at.compose_block(["dog"]), BLOCK2)
+        self.assertEqual(at.compose_block([]), "")
+        self.assertEqual(at.compose_block(["a", "b   c"]), "[AI Tagger]\nTags: a, b c\n[/AI Tagger]")
+        self.assertEqual(len(at.compose_block(["a", "b"]).splitlines()), 3)             # no Description line
 
-    def test_the_description_cannot_forge_the_markers(self):
-        block = at.compose_block(["a"], "x [/AI Tagger] and [AI Tagger] y")
+    def test_a_tag_cannot_forge_the_markers(self):
+        block = at.compose_block(["a", "x [/AI Tagger] and [AI Tagger] y"])
         self.assertEqual(block.count("[AI Tagger]"), 1)
         self.assertEqual(block.count("[/AI Tagger]"), 1)
 
@@ -699,6 +1001,11 @@ class TestBlock(unittest.TestCase):
         self.assertEqual(at.merge_description("Mine\n\n" + BLOCK, BLOCK2), "Mine\n\n" + BLOCK2)
         self.assertEqual(at.merge_description(BLOCK, BLOCK2), BLOCK2)
         self.assertEqual(at.merge_description("Mine\n\n" + BLOCK, BLOCK), "Mine\n\n" + BLOCK)        # same again: no change
+
+    def test_a_v2_block_with_a_description_line_is_rewritten_without_it(self):
+        self.assertEqual(at.merge_description("Mine\n\n" + V2_BLOCK, BLOCK), "Mine\n\n" + BLOCK)
+        self.assertEqual(at.merge_description(V2_BLOCK + "\nAfter.", BLOCK), BLOCK + "\nAfter.")
+        self.assertEqual(at.strip_block("Mine\n\n" + V2_BLOCK), "Mine")                  # and it is still taken out cleanly
 
     def test_user_text_around_an_old_block_is_kept(self):
         old = "Before it.\n\n" + BLOCK + "\nAfter it, with 'quotes' and é."
@@ -880,7 +1187,15 @@ class TestTaggerClient(unittest.TestCase):
         (_, path, body), = [r for r in server.requests if r[1] == "/tag"]
         self.assertEqual([base64.b64decode(i) for i in body["images"]], [b"one", b"two"])
         self.assertEqual(body["floor"], 0.05)
+        self.assertNotIn("models", body)                                 # no list given: the service runs all of them
         self.assertEqual(client.health()["status"], "ok")
+
+    def test_the_models_to_run_are_sent_when_given(self):
+        server = self.serve({("POST", "/tag"): lambda b: (200, {"results": [{"wd": {"general": {}, "character": {}}}],
+                                                                "errors": [None], "tookMs": 1})})
+        at.Tagger(server.url).tag([b"x"], models=["wd", "extra"])
+        (_, _, body), = [r for r in server.requests if r[1] == "/tag"]
+        self.assertEqual(body["models"], ["wd", "extra"])
 
     def test_at_most_64_pictures_per_request(self):
         with self.assertRaises(ValueError):
@@ -909,117 +1224,35 @@ class TestTaggerClient(unittest.TestCase):
             at.Tagger(server.url).tag([b"x"])
 
 
-class TestVlmClient(unittest.TestCase):
-    def answer(self, content, **extra):
-        return {"choices": [{"message": {"content": content, **extra}, "finish_reason": "stop"}]}
+class TestTheDescriberIsGone(unittest.TestCase):
+    """v3 removed the describer: no client, prompt, schema, guards, settings, container or status section."""
 
-    def serve(self, replies):
-        """A VLM server that answers with the next of ``replies`` (a dict = 200, a tuple = (status, body))."""
-        replies = list(replies)
+    def test_nothing_of_it_is_left_in_the_module(self):
+        for name in ("VLM", "VLMRejected", "VLM_SCHEMA", "VLM_SYSTEM", "VLM_UTIL", "VLM_ADD_SCORE", "VLM_PROTECT", "VLM_URL",
+                     "VLM_MODEL", "VLM_CONTAINER", "VLM_SERVICE", "vlm_prompt", "parse_vlm_answer", "needs_vlm",
+                     "has_pixai", "MODEL_LABELS", "IDLE_EXIT_MINUTES", "_watch"):
+            self.assertFalse(hasattr(at, name), name)
+        self.assertFalse(hasattr(sp, "AITAGGER_VLM_CONTAINER"))
+        for gone in ("describe", "instructions", "language", "vlm_parallel"):
+            self.assertNotIn(gone, at.DEFAULTS)
+            self.assertNotIn(gone, at.LIMITS)
+            self.assertNotIn(gone, at.CONTENT)
+        self.assertNotIn("describe", at.REPROCESS)
+        for method in ("describe", "run_vlm", "decide"):
+            self.assertFalse(hasattr(at.Pipeline, method), method)
+        self.assertFalse(hasattr(at.Services, "describe"))
+        self.assertFalse(hasattr(at.Services, "idle_check"))
 
-        def chat(body):
-            reply = replies.pop(0) if len(replies) > 1 else replies[0]
-            return reply if isinstance(reply, tuple) else (200, reply)
-
-        server = StubServer({("POST", "/v1/chat/completions"): chat, ("GET", "/health"): lambda b: (200, {})})
-        self.addCleanup(server.close)
-        return server
-
-    GOOD = json.dumps({"description": "A dog on grass.", "add_tags": ["puppy"], "remove_tags": ["cat"]})
-
-    def test_the_request_has_the_shape_vllm_wants(self):
-        server = self.serve([self.answer(self.GOOD)])
-        vlm = at.VLM(server.url)
-        got = vlm.describe([{"tag": "dog", "score": 0.9}], {"general": 0.95},
-                           S(instructions="Name the breed.", language="German"), "IMAGE", ["puppy"])
-        self.assertEqual(got, {"description": "A dog on grass.", "add_tags": ["puppy"], "remove_tags": ["cat"], "note": ""})
-        (_, _, body), = [r for r in server.requests if r[1] == "/v1/chat/completions"]
-        self.assertEqual(body["model"], "tagger-vlm")
-        self.assertEqual((body["temperature"], body["max_tokens"]), (0.2, 400))
-        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
-        rf = body["response_format"]
-        self.assertEqual(rf["type"], "json_schema")
-        self.assertEqual(rf["json_schema"]["schema"]["required"], ["description", "add_tags", "remove_tags"])
-        for key in ("add_tags", "remove_tags"):
-            self.assertEqual(rf["json_schema"]["schema"]["properties"][key]["maxItems"], 12)
-        system, user = body["messages"]
-        self.assertEqual(system["role"], "system")
-        for word in ("private", "neutral", "nudity", "never refuse", "never see the pictures"):
-            self.assertIn(word, system["content"])
-        self.assertEqual(user["role"], "user")
-        text = user["content"]
-        self.assertIsInstance(text, str)                  # plain text: no parts, so no picture can be in it
-        for needle in ("dog 0.90", "general 0.95", "Name the breed.", "puppy", "German", "JSON"):
-            self.assertIn(needle, text)
-        self.assertTrue(vlm.health())
-        self.assertFalse(at.VLM("http://127.0.0.1:1").health())
-
-    def test_the_request_never_holds_a_picture(self):
-        server = self.serve([self.answer(self.GOOD)])
-        at.VLM(server.url).describe([{"tag": "dog", "score": 0.9}], {"general": 0.95}, S(), "VIDEO", [])
-        (_, _, body), = [r for r in server.requests if r[1] == "/v1/chat/completions"]
-        wire = json.dumps(body)
-        for forbidden in ("image_url", "data:image", "base64", '"type": "image'):
-            self.assertNotIn(forbidden, wire)
-        self.assertTrue(all(isinstance(m["content"], str) for m in body["messages"]))
-        self.assertFalse(hasattr(at, "VLM_SIDE"))         # the picture-shrinking for the VLM is gone
-        self.assertEqual(list(inspect.signature(at.VLM.describe).parameters)[1:3], ["tags", "rating"])
-
-    def test_a_refusal_is_asked_once_more(self):
-        refusal = json.dumps({"description": "I'm sorry, but I can't describe this image.", "add_tags": [], "remove_tags": []})
-        server = self.serve([self.answer(refusal), self.answer(self.GOOD)])
-        got = at.VLM(server.url).describe([], {}, S())
-        self.assertEqual(got["description"], "A dog on grass.")
-        self.assertEqual(got["note"], "")
-        self.assertEqual(len([r for r in server.requests if r[0] == "POST"]), 2)
-
-    def test_two_bad_answers_give_an_empty_description_with_a_note_not_an_error(self):
-        for replies, expect in [([self.answer("this is not json")], "not valid JSON"),
-                                ([self.answer("", refusal="I cannot help")], "refused"),
-                                ([self.answer('{"description": 3}')], "no description"),
-                                ([self.answer(self.GOOD, **{})["choices"] and {"choices": [{"message": {"content": "{"}, "finish_reason": "length"}]}], "cut short"),
-                                ([(400, {"error": "image too large"})], "400")]:
-            server = self.serve(replies)
-            got = at.VLM(server.url).describe([], {}, S())
-            self.assertEqual((got["description"], got["add_tags"], got["remove_tags"]), ("", [], []))
-            self.assertIn("no description", got["note"])
-            self.assertIn(expect, got["note"])
-            self.assertEqual(len([r for r in server.requests if r[0] == "POST"]), 2)         # tried twice
-
-    def test_unreachable_or_broken_server_is_service_down_not_a_note(self):
-        with self.assertRaises(sp.ServiceDown):
-            at.VLM("http://127.0.0.1:1").describe([], {}, S())
-        server = self.serve([(503, {"error": "loading"})])
-        with self.assertRaises(sp.ServiceDown):
-            at.VLM(server.url).describe([], {}, S())
-        server = self.serve([(500, {"error": "engine dead"})])
-        with self.assertRaises(sp.ServiceDown):
-            at.VLM(server.url).describe([], {}, S())
-
-    def test_parse_vlm_answer(self):
-        self.assertEqual(at.parse_vlm_answer(self.GOOD)["add_tags"], ["puppy"])
-        self.assertEqual(at.parse_vlm_answer("```json\n" + self.GOOD + "\n```")["description"], "A dog on grass.")
-        self.assertEqual(at.parse_vlm_answer('{"description": "  Two\\nlines  "}'),
-                         {"description": "Two lines", "add_tags": [], "remove_tags": []})
-        for bad in (None, "", "  ", "[]", '{"description": 1}', '{"description": "x", "add_tags": "a"}',
-                    '{"description": "x", "remove_tags": [1]}', '{"description": "I cannot assist with that."}',
-                    '{"description": "As an AI model, I do not describe"}'):
-            with self.assertRaises(at.VLMRejected, msg=bad):
-                at.parse_vlm_answer(bad)
-        self.assertEqual(at.parse_vlm_answer('{"description": ""}')["description"], "")        # empty is allowed
-
-    def test_the_prompt_lists_tags_rating_instructions_and_terms(self):
-        text = at.vlm_prompt([{"tag": "dog", "score": 0.91}, {"tag": "grass", "score": 0.7}], {"general": 0.9, "explicit": 0.02},
-                             S(instructions="  Be brief.  ", language="Dutch"), ["puppy", "garden"], "VIDEO")
-        for needle in ("in one video", "dog 0.91, grass 0.70", "explicit 0.02, general 0.90", "Be brief.",
-                       "puppy; garden", "in Dutch", "1-2 sentences", "at most 8", "do not add a place", "instructions ask for it"):
-            self.assertIn(needle, text)
-        self.assertNotIn("image(s)", text)               # there is no picture to refer to
-        bare = at.vlm_prompt([], {}, S(), [], "IMAGE")
-        self.assertIn("(none)", bare)
-        self.assertIn("in one picture", bare)
-        self.assertNotIn("Instructions", bare)
-        self.assertNotIn("Preferred", bare)
+    def test_a_result_has_no_description_or_describer_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = at.Store(Path(tmp))
+            try:
+                store.save_result("a", tags=[{"tag": "dog", "score": 0.9, "source": "wd"}], block=BLOCK2, version=1)
+                self.assertEqual(set(store.result("a")), {"tags", "block", "settings_version", "processed_at", "written_at"})
+                self.assertEqual({r[1] for r in store.conn.execute("pragma table_info(results)")},
+                                 {"id", "tags_json", "block", "settings_version", "processed_at", "written_at"})
+            finally:
+                store.conn.close()
 
 
 # ---------------------------------------------------------------- the store
@@ -1040,34 +1273,61 @@ class TestStore(Base):
 
     def test_queue_order_is_first_asked_first_done(self):
         self.store.sync_catalog(self.catalog)
-        self.store.enqueue([self.ids[4]], "describe")
+        self.store.enqueue([self.ids[4]], "retag")
         self.store.enqueue([self.ids[2]], "full")
         self.assertEqual([w["id"] for w in self.store.work(2)], [self.ids[4], self.ids[2]])
 
     def test_a_stronger_mode_replaces_a_weaker_one_for_the_same_asset(self):
         a = self.ids[0]
         self.store.enqueue([a], "retag")
-        self.store.enqueue([a], "describe")
-        self.assertEqual(self.store.queue()[0]["mode"], "describe")
-        self.store.enqueue([a], "retag")                               # weaker: ignored
-        self.assertEqual(self.store.queue()[0]["mode"], "describe")
         self.store.enqueue([a], "full")
         self.assertEqual([q["mode"] for q in self.store.queue()], ["full"])
-        self.store.enqueue([a], "describe")
+        self.store.enqueue([a], "retag")                               # weaker: ignored
         self.assertEqual([q["mode"] for q in self.store.queue()], ["full"])
         self.assertEqual(self.store.enqueue([self.ids[1], self.ids[1], self.ids[2]], "retag"), 2)
-        with self.assertRaises(ValueError):
-            self.store.enqueue([a], "everything")
+        for bad in ("everything", "", None):
+            with self.assertRaises(ValueError):
+                self.store.enqueue([a], bad)
+
+    def test_describe_is_a_retag_in_the_queue(self):
+        a, b = self.ids[0], self.ids[1]
+        self.assertEqual(self.store.enqueue([a], "describe"), 1)         # an old app asks for it: it is a retag
+        self.assertEqual(self.store.queue()[0]["mode"], "retag")
+        self.store.enqueue([a], "full")
+        self.store.enqueue([a], "describe")                              # a weaker request never lowers a full one
+        self.assertEqual([q["mode"] for q in self.store.queue()], ["full"])
+        self.store.sync_catalog(self.catalog)
+        self.store.save_result(b, tags=[], block="", version=1, written=True)
+        self.assertEqual(at.reprocess(self.store, "ids", "describe", ids=[b]), 1)
+        self.assertEqual({q["id"]: q["mode"] for q in self.store.queue()}[b], "retag")
+        self.assertEqual(at.reprocess(self.store, "all", "describe"), 1)
+
+    def test_a_describe_row_left_in_the_queue_by_v2_becomes_a_retag(self):
+        folder = Path(self.tmp.name) / "v2queue"
+        old = at.Store(folder)
+        old.conn.execute("insert into queue values (?,?,?)", (self.ids[0], "describe", "2026-09-30T10:00:00+00:00"))
+        old.conn.execute("insert into queue values (?,?,?)", (self.ids[1], "full", "2026-09-30T10:00:01+00:00"))
+        old.conn.commit()
+        old.conn.close()
+        store = at.Store(folder)                                          # opening it fixes the row
+        self.addCleanup(store.conn.close)
+        self.assertEqual({q["id"]: q["mode"] for q in store.queue()}, {self.ids[0]: "retag", self.ids[1]: "full"})
+        store.conn.execute("insert or replace into queue values (?,?,?)", (self.ids[2], "describe", "2026-09-30T10:00:02+00:00"))
+        store.conn.commit()
+        store.sync_catalog(self.catalog)
+        self.assertEqual(store.queue()[-1]["mode"], "describe")           # one that got in some other way ...
+        store.dequeue(self.ids[2], "retag")                               # ... is still understood: a retag covers it
+        self.assertNotIn(self.ids[2], [q["id"] for q in store.queue()])
 
     def test_dequeue_only_when_the_work_done_covers_what_was_asked(self):
         a = self.ids[0]
         self.store.enqueue([a], "full")
-        self.store.dequeue(a, "describe")
+        self.store.dequeue(a, "retag")
         self.assertEqual(len(self.store.queue()), 1)
         self.store.dequeue(a, "full")
         self.assertEqual(self.store.queue(), [])
         self.store.enqueue([a], "retag")
-        self.store.dequeue(a, "describe")
+        self.store.dequeue(a, "full")
         self.assertEqual(self.store.queue(), [])
 
     def test_asking_again_forgets_earlier_failures_and_an_exclude(self):
@@ -1135,10 +1395,11 @@ class TestStore(Base):
         self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9}, "pixai": {"general": 0.8, "explicit": 0.2}}])
         self.store.save_raw("a", raw)
         self.assertEqual(self.store.raw("a"), raw)
-        self.assertTrue(at.has_pixai(raw))
-        self.assertFalse(at.has_pixai(self.store.raw("nothing")))
+        self.assertTrue(at.has_kind(raw, "pixai"))
+        self.assertFalse(at.has_kind(self.store.raw("nothing"), "pixai"))
         only_wd = at.raw_from_results([{"wd": {"general": {"a": 0.9}, "character": {}, "rating": {"general": 1.0}}}], [None])
-        self.assertEqual((only_wd["models"], at.has_pixai(only_wd)), (["wd"], False))
+        self.assertEqual((only_wd["models"], at.has_kind(only_wd, "wd"), at.has_kind(only_wd, "pixai")), (["wd"], True, False))
+        self.assertEqual(only_wd["scores"], [{"wd": {"general": {"a": 0.9}, "character": {}}, "pixai": None}])
 
     def v1_store(self, ids):
         """A store as the RAM++ panel left it: written results with stored scores that have no PixAI entry."""
@@ -1149,8 +1410,7 @@ class TestStore(Base):
         for i in ids:
             old.conn.execute("insert into raw values (?,?,?,?,?,?)", (self.ids[i], 1, json.dumps(v1_scores),
                                                                        json.dumps([{"general": 0.9}]), "2026-09-30T10:00:00+00:00", "ram,wd"))
-            old.save_result(self.ids[i], tags=[{"tag": "girl", "score": 0.9, "source": "wd"}], vlm=None, description="x",
-                            block="B", version=1)
+            old.save_result(self.ids[i], tags=[{"tag": "girl", "score": 0.9, "source": "wd"}], block="B", version=1)
             old.mark_written(self.ids[i])
         old.conn.execute("delete from meta where key='raw_format'")           # what a store from before v2 looks like
         old.conn.commit()
@@ -1164,12 +1424,107 @@ class TestStore(Base):
         self.assertEqual(store.settings_version, 2)                         # bumped: version 1 results are older
         self.assertEqual(store.counts()["outdated"], 2)
         self.assertEqual(set(store.scope_ids("outdated")), {self.ids[0], self.ids[1]})
-        self.assertFalse(at.has_pixai(store.raw(self.ids[0])))
+        self.assertFalse(at.has_kind(store.raw(self.ids[0]), "pixai"))
         store.conn.close()
         again = at.Store(folder)                                            # opening it again does not bump it again
         self.addCleanup(again.conn.close)
         self.assertEqual(again.settings_version, 2)
         self.assertEqual(again.meta("raw_format"), at.RAW_FORMAT)
+
+    OLD_RESULTS = ("create table results (id text primary key, tags_json text, vlm_json text, description text, block text,"
+                   " settings_version integer, processed_at text, written_at text, note text)")
+
+    def v2_store(self, blocks, taggers="wd,pixai"):
+        """A store as the describer version left it: results with the old columns, whose blocks are ``blocks``."""
+        folder = Path(self.tmp.name) / "v2"
+        folder.mkdir()
+        conn = sqlite3.connect(str(folder / "tagger.sqlite"))
+        conn.execute(self.OLD_RESULTS)
+        conn.execute("create table meta (key text primary key, value text)")
+        conn.execute("insert into meta values ('raw_format', ?)", (at.RAW_FORMAT,))      # not from before v2
+        if taggers is not None:
+            conn.execute("insert into meta values ('taggers', ?)", (taggers,))
+        for i, block in enumerate(blocks):
+            conn.execute("insert into results values (?,?,?,?,?,?,?,?,?)",
+                         (self.ids[i], json.dumps([{"tag": "girl", "score": 0.9, "source": "wd"}]),
+                          json.dumps({"description": "A girl.", "add_tags": [], "remove_tags": []}), "A girl.", block, 1,
+                          "2026-09-30T10:00:00+00:00", "2026-09-30T10:00:01+00:00", ""))
+        conn.commit()
+        conn.close()
+        return folder
+
+    def test_results_with_a_description_line_count_as_outdated_once(self):
+        folder = self.v2_store([V2_BLOCK, BLOCK2, V2_BLOCK])
+        store = at.Store(folder)
+        self.addCleanup(store.conn.close)
+        self.assertEqual(store.settings_version, 2)                         # bumped once: the version 1 results are older
+        self.assertEqual(store.meta("block_format"), at.BLOCK_FORMAT)
+        store.sync_catalog(self.catalog)
+        self.assertEqual(store.counts()["outdated"], 3)
+        self.assertEqual(set(store.scope_ids("outdated")), set(self.ids[:3]))
+        store.conn.close()
+        again = at.Store(folder)                                            # opening it again does not bump it again
+        self.addCleanup(again.conn.close)
+        self.assertEqual((again.settings_version, again.meta("block_format")), (2, at.BLOCK_FORMAT))
+        # a result written afterwards (made with the current version) is not outdated, and the old columns do not matter
+        again.save_result(self.ids[0], tags=[{"tag": "dog", "score": 0.9, "source": "wd"}], block=BLOCK2, version=2, written=True)
+        self.assertEqual(again.result(self.ids[0])["block"], BLOCK2)
+        again.sync_catalog(self.catalog)
+        self.assertEqual(again.counts()["outdated"], 2)
+        self.assertEqual(set(again.scope_ids("outdated")), {self.ids[1], self.ids[2]})
+        self.assertEqual(again.list_assets()["items"][0]["tags"], ["dog"])
+
+    def test_a_store_without_a_description_line_anywhere_is_not_bumped(self):
+        folder = self.v2_store([BLOCK, BLOCK2, ""])                         # tags only (describe was off), or nothing to say
+        store = at.Store(folder)
+        self.addCleanup(store.conn.close)
+        self.assertEqual(store.settings_version, 1)
+        self.assertEqual(store.meta("block_format"), at.BLOCK_FORMAT)       # but the check is not repeated
+
+    def test_a_tag_that_looks_like_the_old_line_is_not_a_description_line(self):
+        # tags are lower case and on the one "Tags:" line, so the marker "\nDescription: " cannot come from a tag
+        folder = self.v2_store(["[AI Tagger]\nTags: description: x, y\n[/AI Tagger]"])
+        store = at.Store(folder)
+        self.addCleanup(store.conn.close)
+        self.assertEqual(store.settings_version, 1)
+
+    def test_a_new_store_is_not_bumped_and_remembers_the_format(self):
+        self.assertEqual(self.store.settings_version, 1)
+        self.assertEqual((self.store.meta("block_format"), self.store.meta("raw_format")), (at.BLOCK_FORMAT, at.RAW_FORMAT))
+        self.assertEqual(self.store.meta("taggers"), "wd,pixai")
+
+    def test_a_tagger_added_to_the_registry_makes_old_results_outdated_once(self):
+        folder = self.v2_store([BLOCK], taggers=None)                       # a v2 store knows no list: it had wd and pixai
+        store = at.Store(folder)                                            # same registry as then: nothing to do
+        self.assertEqual((store.settings_version, store.meta("taggers")), (1, "wd,pixai"))
+        store.conn.close()
+        with_extra(self, EXTRA_ON)                                          # a third tagger that is on by default arrives
+        store = at.Store(folder)
+        self.addCleanup(store.conn.close)
+        self.assertEqual((store.settings_version, store.meta("taggers")), (2, "wd,pixai,extra"))
+        store.sync_catalog(self.catalog)
+        self.assertEqual(store.counts()["outdated"], 1)
+        store.conn.close()
+        again = at.Store(folder)                                            # once
+        self.addCleanup(again.conn.close)
+        self.assertEqual(again.settings_version, 2)
+
+    def test_a_tagger_that_is_off_by_default_or_removed_changes_nothing(self):
+        folder = self.v2_store([BLOCK], taggers="wd,pixai")
+        with_extra(self)                                                    # EXTRA is off by default: no tags are missing
+        store = at.Store(folder)
+        self.assertEqual((store.settings_version, store.meta("taggers")), (1, "wd,pixai,extra"))
+        store.conn.close()
+        at.configure_taggers(list(at.TAGGERS[:2]))                          # and removing one is no reason either
+        again = at.Store(folder)
+        self.addCleanup(again.conn.close)
+        self.assertEqual((again.settings_version, again.meta("taggers")), (1, "wd,pixai"))
+
+    def test_an_empty_store_opened_with_a_new_tagger_is_not_bumped(self):
+        with_extra(self, EXTRA_ON)
+        store = at.Store(Path(self.tmp.name) / "fresh")
+        self.addCleanup(store.conn.close)
+        self.assertEqual(store.settings_version, 1)
 
     def test_a_new_store_or_one_with_pixai_scores_is_not_bumped(self):
         self.assertEqual(self.store.settings_version, 1)
@@ -1188,10 +1543,9 @@ class TestStore(Base):
         self.store.sync_catalog(self.catalog)
         a = self.ids[0]
         tags = [{"tag": "girl", "score": 0.9, "source": "wd"}, {"tag": "beach", "score": 0.8, "source": "pixai"}]
-        self.store.save_result(a, tags=tags, vlm={"description": "d"}, description="d", block="B", version=3, note="n")
+        self.store.save_result(a, tags=tags, block="B", version=3)
         got = self.store.result(a)
-        self.assertEqual((got["tags"], got["vlm"], got["description"], got["block"], got["settings_version"], got["note"]),
-                         (tags, {"description": "d"}, "d", "B", 3, "n"))
+        self.assertEqual((got["tags"], got["block"], got["settings_version"]), (tags, "B", 3))
         self.assertIsNone(got["written_at"])
         self.assertEqual(self.store.counts()["processed"], 0)                  # not written yet: still waiting
         self.assertEqual(self.store.work(1)[0]["mode"], "retag")               # ... and what is left is just the write
@@ -1210,8 +1564,8 @@ class TestStore(Base):
     def test_scopes(self):
         self.store.sync_catalog(self.catalog)
         for i, (version, tags) in enumerate([(1, ["girl", "beach"]), (2, ["dog"]), (2, ["girl"])]):
-            self.store.save_result(self.ids[i], tags=[{"tag": t, "score": 1.0, "source": "wd"} for t in tags], vlm=None,
-                                   description="", block="", version=version)
+            self.store.save_result(self.ids[i], tags=[{"tag": t, "score": 1.0, "source": "wd"} for t in tags], block="",
+                                   version=version)
             self.store.mark_written(self.ids[i])
         self.set(max_tags=10)                                                  # version 2
         self.set(max_tags=11)                                                  # version 3
@@ -1220,7 +1574,7 @@ class TestStore(Base):
         self.assertEqual(set(self.store.scope_ids("tag", tag="Girl")), {self.ids[0], self.ids[2]})
         self.assertEqual(self.store.scope_ids("ids", ids=["x", "y", "x"]), ["x", "y"])
         self.assertEqual(self.store.scope_ids("tag", tag="nothing"), [])
-        self.store.save_result(self.ids[0], tags=[], vlm=None, description="", block="", version=3)
+        self.store.save_result(self.ids[0], tags=[], block="", version=3)
         self.store.mark_written(self.ids[0])
         self.assertEqual(set(self.store.scope_ids("outdated")), set(self.ids[1:3]))
         with self.assertRaises(ValueError):
@@ -1237,23 +1591,22 @@ class TestStore(Base):
 
     def test_listing_and_top_tags(self):
         self.store.sync_catalog(self.catalog)
-        data = [(0, ["girl", "beach"], "A girl on a beach."), (1, ["dog", "grass"], "A dog."), (2, ["dog", "car"], "A 100%_real clip.")]
-        for i, tags, text in data:
-            self.store.save_result(self.ids[i], tags=[{"tag": t, "score": 1.0, "source": "wd"} for t in tags], vlm=None,
-                                   description=text, block="", version=1)
+        data = [(0, ["girl", "beach"]), (1, ["dog", "grass"]), (2, ["dog", "car", "100%_real"])]
+        for i, tags in data:
+            self.store.save_result(self.ids[i], tags=[{"tag": t, "score": 1.0, "source": "wd"} for t in tags], block="",
+                                   version=1)
             self.store.mark_written(self.ids[i])
         self.set(max_tags=7)
         everything = self.store.list_assets()
         self.assertEqual(everything["total"], 3)
         self.assertEqual([i["id"] for i in everything["items"]], self.ids[:3])                  # newest first
         self.assertEqual(everything["items"][0]["tags"], ["girl", "beach"])
-        self.assertEqual(everything["items"][0]["description"], "A girl on a beach.")
+        self.assertEqual(set(everything["items"][0]), {"id", "name", "type", "taken", "tags", "settingsVersion", "processedAt"})
         self.assertEqual(everything["items"][0]["settingsVersion"], 1)
         self.assertEqual(everything["tags"][0], {"tag": "dog", "count": 2})
-        self.assertEqual(len(everything["tags"]), 5)
+        self.assertEqual(len(everything["tags"]), 6)
         self.assertEqual([i["id"] for i in self.store.list_assets(tag="dog")["items"]], self.ids[1:3])
         self.assertEqual([i["id"] for i in self.store.list_assets(q="BEACH")["items"]], [self.ids[0]])     # in the tags
-        self.assertEqual([i["id"] for i in self.store.list_assets(q="a dog")["items"]], [self.ids[1]])     # in the description
         self.assertEqual([i["id"] for i in self.store.list_assets(q="IMG_0002")["items"]], [self.ids[2]])  # in the name
         self.assertEqual([i["id"] for i in self.store.list_assets(q="100%")["items"]], [self.ids[2]])      # % is not a wildcard
         self.assertEqual(self.store.list_assets(q="%")["total"], 1)
@@ -1290,7 +1643,7 @@ class TestStore(Base):
         for i in range(150):
             a = self.ids[i % 5]
             self.store.save_raw(a, raw_of(DOG))
-            self.store.save_result(a, tags=[{"tag": "dog", "score": 1.0, "source": "wd"}], vlm=None, description="", block="", version=1)
+            self.store.save_result(a, tags=[{"tag": "dog", "score": 1.0, "source": "wd"}], block="", version=1)
             self.store.mark_written(a)
             self.store.enqueue([a], "retag")
             self.store.fail(self.ids[(i + 1) % 5], "x")
@@ -1404,7 +1757,7 @@ class TestWriteBack(Base):
         self.put_description(0, "Mine.")
         self.put_description(1, BLOCK)
         for i in (0, 1):
-            self.store.save_result(self.ids[i], tags=[], vlm=None, description="", block=BLOCK, version=1)
+            self.store.save_result(self.ids[i], tags=[], block=BLOCK, version=1)
             self.store.mark_written(self.ids[i])
         self.write(0)
         self.assertEqual(self.description(0), "Mine.\n\n" + BLOCK)
@@ -1434,7 +1787,7 @@ class TestWriteBack(Base):
     def test_remove_reports_what_failed_and_keeps_those_results(self):
         a, b = self.ids[0], self.ids[1]
         for i in (a, b):
-            self.store.save_result(i, tags=[], vlm=None, description="", block="", version=1)
+            self.store.save_result(i, tags=[], block="", version=1)
         self.put_description(0, BLOCK)
         self.fake.fail_next[f"/api/assets/{a}"] = 1
         got = self.pipe.remove([a, b], exclude=True)
@@ -1446,34 +1799,40 @@ class TestWriteBack(Base):
 # ---------------------------------------------------------------- the indexer, end to end
 
 class TestIndexer(Base):
-    def test_tags_describes_and_writes_everything(self):
+    def test_tags_and_writes_everything(self):
         self.run_indexer()
         self.assertEqual(self.indexer.state, "done", self.indexer.detail)
         c = self.store.counts()
         self.assertEqual((c["assets"], c["processed"], c["pending"], c["failed"]), (5, 3, 0, 2))
-        self.assertEqual(self.description(0),
-                         "[AI Tagger]\nTags: girl, beach, miku, solo, sea, rating: general\nDescription: A nice picture.\n[/AI Tagger]")
-        self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\nDescription: A nice picture.\n[/AI Tagger]")
-        self.assertEqual(self.description(2), "[AI Tagger]\nTags: dog, car, rating: general\nDescription: A nice picture.\n[/AI Tagger]")
+        self.assertEqual(self.description(0), "[AI Tagger]\nTags: girl, beach, miku, solo, sea, rating: general\n[/AI Tagger]")
+        self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\n[/AI Tagger]")
+        self.assertEqual(self.description(2), "[AI Tagger]\nTags: dog, car, rating: general\n[/AI Tagger]")
         self.assertEqual(self.description(3), "")
+        for i in range(3):
+            self.assertNotIn("Description", self.description(i))                      # tags only
         res = self.store.result(self.ids[0])
-        self.assertEqual((res["settings_version"], res["note"]), (1, ""))
+        self.assertEqual(res["settings_version"], 1)
         self.assertIsNotNone(res["written_at"])
         self.assertEqual(res["tags"][0], {"tag": "girl", "score": 0.9, "source": "wd"})
         self.assertEqual(self.store.raw(self.ids[2])["captures"], 3)
-        self.assertEqual(self.services.ready_calls[0], {"tagger": True, "vlm": True})
+        self.assertEqual(self.services.ready_calls[0], {"tagger": True})
         self.assertEqual(sum(self.services.tag_calls), 1 + 1 + 3 + 1)                # the unreadable file never got to the tagger
-        self.assertEqual(len(self.services.vlm_calls), 3)
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd", "pixai")})     # the enabled taggers are asked for
 
-    def test_the_vlm_sees_the_detected_tags_the_rating_and_the_terms_but_no_pictures(self):
-        self.run_indexer(vocabulary="1girl -> girl\nsunny", instructions="Be brief.")
-        call = next(c for c in self.services.vlm_calls if c["kind"] == "VIDEO")
-        self.assertNotIn("images", call)                    # the describer is text only
-        self.assertEqual(len(self.services.vlm_calls), 3)
-        self.assertEqual([t["tag"] for t in call["tags"]][:2], ["dog", "car"])
-        self.assertEqual(call["rating"]["general"], round((0.9 + 0.9 + 0.1) / 3, 3))
-        self.assertEqual(call["terms"], ["girl", "sunny"])
-        self.assertEqual(call["settings"]["instructions"], "Be brief.")
+    def test_only_the_enabled_taggers_are_asked_for_and_stored(self):
+        self.run_indexer(use_pixai=False)
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd",)})
+        raw = self.store.raw(self.ids[0])
+        self.assertEqual((at.has_kind(raw, "wd"), at.has_kind(raw, "pixai")), (True, False))
+        self.assertEqual(raw["models"], ["wd"])
+        self.assertNotIn("sea", self.description(0))                                 # a PixAI-only tag
+        self.assertIn("girl", self.description(0))
+        self.services.tag_models.clear()
+        self.store.enqueue(self.ids[:1], "full")
+        self.run_indexer(use_wd=False, use_pixai=True)
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("pixai",)})
+        self.assertIn("sea", self.description(0))
+        self.assertNotIn("girl", self.description(0))
 
     def test_failures_are_noted_and_the_rest_goes_on(self):
         self.run_indexer()
@@ -1487,21 +1846,6 @@ class TestIndexer(Base):
         self.run_indexer()
         c = self.store.counts()
         self.assertEqual((c["failed"], c["retrying"]), (2, 1))
-
-    def test_a_refusal_is_not_an_asset_failure(self):
-        self.services.answer = lambda *a: {"description": "", "add_tags": [], "remove_tags": [],
-                                           "note": "no description: the model refused"}
-        self.run_indexer()
-        self.assertEqual(self.store.counts()["processed"], 3)
-        self.assertEqual(self.store.counts()["failed"], 2)                       # only the two real failures
-        self.assertEqual(self.description(0), "[AI Tagger]\nTags: girl, beach, miku, solo, sea, rating: general\n[/AI Tagger]")
-        self.assertEqual(self.store.result(self.ids[0])["note"], "no description: the model refused")
-
-    def test_describe_off_never_touches_the_vlm(self):
-        self.run_indexer(describe=False)
-        self.assertEqual(self.services.vlm_calls, [])
-        self.assertEqual(self.services.ready_calls[0], {"tagger": True, "vlm": False})
-        self.assertNotIn("Description:", self.description(0))
 
     def test_the_owners_text_is_kept_while_tagging(self):
         self.put_description(0, "Holiday in Spain.")
@@ -1535,18 +1879,6 @@ class TestIndexer(Base):
         self.assertEqual(self.indexer.state, "done", self.indexer.detail)
         self.assertEqual(self.store.counts()["processed"], 3)
 
-    def test_the_vlm_going_away_is_not_the_assets_fault_either(self):
-        self.services.vlm_down = True
-        self.run_indexer()
-        self.assertEqual(self.indexer.state, "error")
-        self.assertEqual(self.store.conn.execute("select count(*) from failed where error not like '%IMG%'").fetchone()[0], 2)
-        c = self.store.counts()
-        self.assertEqual(c["processed"], 0)
-        self.assertEqual([self.description(i) for i in range(3)], ["", "", ""])
-        self.services.vlm_down = False
-        self.run_indexer()
-        self.assertEqual(self.store.counts()["processed"], 3)
-
     def test_immich_not_answering_keeps_the_work_for_later_without_the_gpu(self):
         self.catalog = self.catalog[:1]
         self.fake.fail_next[f"/api/assets/{self.ids[0]}"] = 99
@@ -1558,10 +1890,10 @@ class TestIndexer(Base):
         c = self.store.counts()
         self.assertEqual((c["processed"], c["pending"], c["failed"]), (0, 1, 0))
         self.fake.fail_next.clear()
-        tagged, described = list(self.services.tag_calls), len(self.services.vlm_calls)
+        tagged = list(self.services.tag_calls)
         self.run_indexer()
         self.assertEqual(self.store.counts()["processed"], 1)
-        self.assertEqual((self.services.tag_calls, len(self.services.vlm_calls)), (tagged, described))   # no second GPU pass
+        self.assertEqual(self.services.tag_calls, tagged)                           # no second GPU pass
         self.assertIn("[AI Tagger]", self.description(0))
 
     def test_a_bad_api_key_is_an_error_not_a_failure_of_every_photo(self):
@@ -1613,23 +1945,21 @@ class TestIndexer(Base):
         self.run_indexer(batch_size=2)
         self.assertEqual(self.services.tag_calls, [16] * 5)
 
-    def test_no_tagger_means_no_tags_to_describe_from_so_the_vlm_is_not_used(self):
+    def test_no_tagger_means_no_tags(self):
         self.run_indexer(use_wd=False, use_pixai=False)
         self.assertEqual(self.services.tag_calls, [])
-        self.assertEqual(self.services.vlm_calls, [])
-        self.assertEqual(self.services.ready_calls[0], {"tagger": False, "vlm": False})      # not even started
+        self.assertEqual(self.services.ready_calls[0], {"tagger": False})            # the container is not even started
         self.assertEqual(self.store.counts()["processed"], 4)               # no tagger to say "broken" about the last one
         self.assertEqual(self.description(0), "")                           # nothing to say: nothing written
-        self.assertIn("no tags", self.store.result(self.ids[0])["note"])
+        self.assertEqual(self.store.result(self.ids[0])["tags"], [])
 
-    def test_a_picture_with_no_tags_is_not_sent_to_the_describer(self):
+    def test_a_picture_with_no_tags_gets_no_block(self):
         self.catalog = [{**self.catalog[0], "preview": "wd:dull=0.1", "name": "dull.jpg"}]
+        self.put_description(0, "Mine.")
         self.run_indexer(rating_tag=False)
-        self.assertEqual(self.services.vlm_calls, [])
         res = self.store.result(self.ids[0])
-        self.assertEqual((res["tags"], res["description"], res["block"]), ([], "", ""))
-        self.assertIn("no tags to describe from", res["note"])
-        self.assertEqual(self.description(0), "")
+        self.assertEqual((res["tags"], res["block"]), ([], ""))
+        self.assertEqual(self.description(0), "Mine.")                      # nothing to say: the owner's text is untouched
 
     def test_pause_stops_the_thread_and_resumes_later(self):
         gate = threading.Event()
@@ -1673,15 +2003,6 @@ class TestIndexer(Base):
         self.indexer.stop(5)
         self.assertFalse(self.indexer.running())
 
-    def test_the_idle_clock_is_checked_while_waiting(self):
-        self.services.idle_check = mock.Mock(return_value=False)
-        self.indexer.IDLE_POLL = 0.05
-        self.set(keep_updated=True)
-        self.indexer.start()
-        time.sleep(0.5)
-        self.indexer.stop(5)
-        self.assertGreaterEqual(self.services.idle_check.call_count, 2)
-
     def test_status_has_a_rate_and_a_time_left(self):
         now = [1000.0]
         self.indexer.clock = lambda: now[0]
@@ -1703,7 +2024,7 @@ class TestReprocess(Base):
         super().setUp()
         self.run_indexer()
         self.services.tag_calls.clear()
-        self.services.vlm_calls.clear()
+        self.services.tag_models.clear()
         self.services.ready_calls.clear()
 
     def test_retag_needs_no_gpu_and_no_models(self):
@@ -1711,74 +2032,59 @@ class TestReprocess(Base):
         self.assertEqual(self.store.counts()["outdated"], 3)
         self.assertEqual(at.reprocess(self.store, "outdated", "retag"), 3)
         self.run_indexer()
-        self.assertEqual((self.services.tag_calls, self.services.vlm_calls, self.services.ready_calls), ([], [], []))
+        self.assertEqual((self.services.tag_calls, self.services.ready_calls), ([], []))
         # girl .9 stays; WD's beach .6 and miku .8 are below .85, but PixAI still says beach; solo is blocked
-        self.assertEqual(self.description(0), "[AI Tagger]\nTags: girl, beach, sea, rating: general\n"
-                                              "Description: A nice picture.\n[/AI Tagger]")
+        self.assertEqual(self.description(0), "[AI Tagger]\nTags: girl, beach, sea, rating: general\n[/AI Tagger]")
         self.assertEqual(self.store.counts()["outdated"], 0)
         self.assertEqual(self.store.result(self.ids[0])["settings_version"], 2)
         self.assertEqual(self.store.queue(), [])
         self.assertEqual(len(self.store.history(self.ids[0])), 2)
 
-    def test_retag_uses_the_stored_vlm_answer(self):
-        self.services.answer = lambda *a: {"description": "SECOND", "add_tags": [], "remove_tags": [], "note": ""}
-        self.set(rules=[rule(if_all=["dog"], add=["pet"])])
-        at.reprocess(self.store, "all", "retag")
+    def test_a_vocabulary_rename_is_a_retag(self):
+        self.assertEqual(self.set(vocabulary="girl -> woman"), ["vocabulary"])
+        self.assertEqual(at.suggest_mode(["vocabulary"]), "retag")
+        at.reprocess(self.store, "outdated", "retag")
         self.run_indexer()
-        self.assertIn("pet", self.description(1))
-        self.assertIn("A nice picture.", self.description(1))                # the answer from the first run
-        self.assertNotIn("SECOND", self.description(1))
-        self.assertEqual(self.services.vlm_calls, [])
+        self.assertEqual(self.services.tag_calls, [])                         # the stored scores are enough
+        self.assertEqual(self.description(0), "[AI Tagger]\nTags: woman, beach, miku, solo, sea, rating: general\n[/AI Tagger]")
 
-    def test_retag_applies_the_stored_vlm_tag_changes_again(self):
-        self.services.answer = lambda *a: {"description": "d", "add_tags": ["smile"], "remove_tags": ["solo"], "note": ""}
-        at.reprocess(self.store, "all", "full")
+    def test_describe_is_handled_as_a_retag(self):
+        self.set(blocked=["solo"])
+        self.assertEqual(at.reprocess(self.store, "all", "describe"), 3)                 # what an old app asks for
+        self.assertEqual({q["mode"] for q in self.store.queue()}, {"retag"})
         self.run_indexer()
-        self.assertIn("smile", self.description(0))
+        self.assertEqual((self.services.tag_calls, self.services.ready_calls), ([], []))
         self.assertNotIn("solo", self.description(0))
-        self.set(blocked=["smile"])
-        at.reprocess(self.store, "all", "retag")
-        calls = len(self.services.vlm_calls)
+        self.assertEqual(self.store.queue(), [])
+        # a "describe" row that is in the queue anyway (written by v2) is run as a retag and leaves the queue
+        self.store.conn.execute("insert or replace into queue values (?,?,?)", (self.ids[1], "describe", at._now()))
+        self.store.conn.commit()
+        self.assertEqual(self.store.work(5)[0]["mode"], "describe")
+        self.set(blocked=["solo", "grass"])
         self.run_indexer()
-        self.assertNotIn("smile", self.description(0))
-        self.assertEqual(len(self.services.vlm_calls), calls)
+        self.assertEqual((self.services.tag_calls, self.services.ready_calls), ([], []))
+        self.assertEqual(self.store.queue(), [])
+        self.assertNotIn("grass", self.description(1))
 
-    def test_retag_with_describe_off_drops_the_description(self):
-        self.set(describe=False)
-        at.reprocess(self.store, "all", "retag")
+    def test_a_v2_result_is_rewritten_without_its_description_line_by_a_retag(self):
+        v2 = "[AI Tagger]\nTags: girl, beach, miku, solo, sea, rating: general\nDescription: A girl on a beach.\n[/AI Tagger]"
+        self.put_description(0, "Mine.\n\n" + v2)
+        self.store.conn.execute("update results set block=?, settings_version=0 where id=?", (v2, self.ids[0]))
+        self.store.conn.commit()
+        self.assertEqual(self.store.counts()["outdated"], 1)
+        self.assertEqual(at.reprocess(self.store, "outdated", "retag"), 1)
         self.run_indexer()
-        self.assertNotIn("Description:", self.description(0))
-        self.assertEqual(self.services.vlm_calls, [])
-        self.assertEqual(self.services.ready_calls, [])
-
-    def test_describe_runs_the_vlm_again_but_not_the_taggers(self):
-        self.services.answer = lambda *a: {"description": "Brand new words.", "add_tags": [], "remove_tags": [], "note": ""}
-        self.set(instructions="Write like a pirate.")
-        at.reprocess(self.store, "all", "describe")
-        cut = []
-        slow = self.indexer.frames
-        self.indexer.frames = lambda item, n: cut.append(item["id"]) or slow(item, n)
-        self.run_indexer()
-        self.assertEqual(cut, [])                                          # the describer needs no pictures: none were cut
-        self.assertEqual(self.services.tag_calls, [])
-        self.assertEqual(len(self.services.vlm_calls), 3)
-        self.assertEqual(self.services.ready_calls[0], {"tagger": False, "vlm": True})
-        self.assertIn("Brand new words.", self.description(0))
-        self.assertEqual(self.services.vlm_calls[0]["settings"]["instructions"], "Write like a pirate.")
-        self.assertEqual(self.store.result(self.ids[0])["vlm"]["description"], "Brand new words.")
-
-    def test_describe_with_describe_off_is_just_a_retag(self):
-        self.set(describe=False)
-        at.reprocess(self.store, "all", "describe")
-        self.run_indexer()
-        self.assertEqual((self.services.vlm_calls, self.services.ready_calls), ([], []))
+        self.assertEqual(self.description(0),
+                         "Mine.\n\n[AI Tagger]\nTags: girl, beach, miku, solo, sea, rating: general\n[/AI Tagger]")
+        self.assertEqual(self.services.tag_calls, [])                         # no GPU: the stored scores are enough
+        self.assertEqual(self.store.counts()["outdated"], 0)
 
     def test_full_runs_everything_again(self):
         self.set(video_frames=2)
         at.reprocess(self.store, "outdated", "full")
         self.run_indexer()
         self.assertEqual(sum(self.services.tag_calls), 1 + 1 + 3)          # the video's three captures
-        self.assertEqual(len(self.services.vlm_calls), 3)
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd", "pixai")})
 
     def test_without_stored_scores_retag_becomes_full(self):
         self.store.conn.execute("delete from raw where id=?", (self.ids[1],))
@@ -1793,17 +2099,16 @@ class TestReprocess(Base):
         self.store.conn.execute("update raw set scores_json=?, rating_json=?, models=? where id=?",
                                 (json.dumps(scores), json.dumps([{"general": 0.9}]), "ram,wd", self.ids[i]))
         self.store.conn.commit()
-        self.assertFalse(at.has_pixai(self.store.raw(self.ids[i])))
+        self.assertFalse(at.has_kind(self.store.raw(self.ids[i]), "pixai"))
 
-    def test_stored_scores_without_pixai_make_retag_and_describe_a_full_reprocess(self):
+    def test_stored_scores_without_an_enabled_tagger_make_a_retag_a_full_reprocess(self):
         self.make_v1(1)
         self.set(max_tags=11)
         at.reprocess(self.store, "ids", "retag", ids=[self.ids[1]])
         self.run_indexer()
         self.assertEqual(self.services.tag_calls, [1])                    # the taggers ran again for it, and only for it
-        self.assertEqual(self.services.ready_calls[0], {"tagger": True, "vlm": True})
-        self.assertEqual(len(self.services.vlm_calls), 1)
-        self.assertTrue(at.has_pixai(self.store.raw(self.ids[1])))        # the stored scores are v2 now
+        self.assertEqual(self.services.ready_calls[0], {"tagger": True})
+        self.assertTrue(at.has_kind(self.store.raw(self.ids[1]), "pixai"))        # the stored scores are complete now
         self.assertIn("grass", self.description(1))                       # PixAI's tag is in the result
         self.assertEqual(self.store.queue(), [])
         self.services.tag_calls.clear()
@@ -1811,10 +2116,10 @@ class TestReprocess(Base):
         self.run_indexer()
         self.assertEqual(self.services.tag_calls, [])
         self.make_v1(0)
-        at.reprocess(self.store, "ids", "describe", ids=[self.ids[0]])
+        at.reprocess(self.store, "ids", "describe", ids=[self.ids[0]])     # a v2 "describe" is a retag, and this one needs PixAI too
         self.run_indexer()
-        self.assertEqual(self.services.tag_calls, [1])                    # "describe" needs PixAI's scores too
-        self.assertTrue(at.has_pixai(self.store.raw(self.ids[0])))
+        self.assertEqual(self.services.tag_calls, [1])
+        self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), "pixai"))
 
     def test_a_result_that_was_never_written_is_finished_as_full_when_its_scores_are_from_v1(self):
         self.make_v1(1)
@@ -1856,24 +2161,18 @@ class TestReprocess(Base):
     def test_the_queue_goes_before_new_photos(self):
         self.catalog.append({**self.catalog[0], "id": self.ids[10], "name": "new.jpg", "taken": "2026-03-01 10:00:00"})
         self.indexer.last_sync = None
-        self.store.enqueue([self.ids[2]], "describe")
-        order = []
-        real = self.services.describe
-
-        def spy(tags, rating, settings, kind="IMAGE", terms=None):
-            order.append(kind)
-            return real(tags, rating, settings, kind, terms)
-
-        self.services.describe = spy
+        self.set(blocked=["car"])                                        # so that the queued retag really writes
+        self.store.enqueue([self.ids[2]], "retag")
+        before = len(self.fake.asset_puts)
         self.run_indexer(batch_size=1)
-        self.assertEqual(order[0], "VIDEO")                              # the queued video, then the new photo
-        self.assertEqual(len(order), 2)
+        order = [asset for asset, _body in self.fake.asset_puts[before:] if asset in (self.ids[2], self.ids[10])]
+        self.assertEqual(order, [self.ids[2], self.ids[10]])             # the queued video, then the new photo
 
     def test_a_strong_request_beats_a_weak_one_in_the_run(self):
         a = self.ids[0]
         self.store.enqueue([a], "retag")
         self.store.enqueue([a], "full")
-        self.store.enqueue([a], "describe")
+        self.store.enqueue([a], "describe")                                # a retag: it does not lower the full one
         self.run_indexer()
         self.assertEqual(self.services.tag_calls, [1])
 
@@ -1918,7 +2217,6 @@ class TestTestCard(Base):
     def test_preview_shows_everything_and_writes_nothing(self):
         self.put_description(0, "Mine.")
         self.set(rules=[rule(if_all=["girl", "beach"], add=["summer"])])
-        self.services.answer = lambda *a: {"description": "A girl.", "add_tags": ["smile"], "remove_tags": ["solo"], "note": ""}
         got = self.indexer.test(self.ids[0])
         self.assertEqual((got["id"], got["name"], got["type"], got["captures"]), (self.ids[0], "IMG_0000.jpg", "IMAGE", 1))
         self.assertEqual(got["frames"], [at.data_url(PHOTO.encode())])
@@ -1926,12 +2224,11 @@ class TestTestCard(Base):
         self.assertEqual(set(got["models"]), {"wd", "pixai", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["pixai"]}, {"beach": True, "sea": True, "wave": False})
         self.assertEqual(got["models"]["rating"]["general"], 0.9)
-        self.assertEqual(got["vlm"], {"description": "A girl.", "add_tags": ["smile"], "remove_tags": ["solo"], "note": ""})
+        self.assertEqual(set(got), {"id", "name", "type", "captures", "frames", "models", "rules", "tags", "block",
+                                    "currentDescription", "newDescription", "written"})        # no describer section, no description
         self.assertEqual(got["rules"], [{"rule": 0, "added": ["summer"], "removed": []}])
         sources = {t["tag"]: t["source"] for t in got["tags"]}
-        self.assertEqual((sources["girl"], sources["smile"], sources["summer"]), ("wd", "vlm", "rule"))
-        self.assertNotIn("solo", sources)
-        self.assertEqual(got["description"], "A girl.")
+        self.assertEqual((sources["girl"], sources["sea"], sources["summer"]), ("wd", "pixai", "rule"))
         self.assertEqual(got["currentDescription"], "Mine.")
         self.assertEqual(got["newDescription"], "Mine.\n\n" + got["block"])
         self.assertFalse(got["written"])
@@ -1939,7 +2236,8 @@ class TestTestCard(Base):
         self.assertIsNone(self.store.result(self.ids[0]))
         self.assertIsNone(self.store.raw(self.ids[0]))
         self.assertEqual(self.fake.asset_puts, [])
-        self.assertEqual(self.services.ready_calls[0], {"tagger": True, "vlm": True})
+        self.assertEqual(self.services.ready_calls[0], {"tagger": True})
+        self.assertEqual(self.services.tag_models, [["wd", "pixai"]])
 
     def test_apply_writes_and_remembers(self):
         got = self.indexer.test(self.ids[0], write=True)
@@ -1985,12 +2283,11 @@ class TestTestCard(Base):
         got = self.indexer.test(self.ids[0])
         self.assertEqual(self.services.tag_calls, [])
         self.assertEqual(tags_of(got), [])
-        self.assertEqual((self.services.vlm_calls, self.services.ready_calls[0]), ([], {"tagger": False, "vlm": False}))
-        self.assertEqual(got["description"], "")                        # a text model with no tags would make things up
-        self.assertIn("no tags", got["vlm"]["note"])
+        self.assertEqual(self.services.ready_calls[0], {"tagger": False})
+        self.assertEqual(got["block"], "")                              # nothing to say
 
 
-# ---------------------------------------------------------------- the model containers
+# ---------------------------------------------------------------- the model container
 
 class Clock:
     def __init__(self):
@@ -2006,7 +2303,7 @@ class Clock:
 class FakeRunner:
     """Stands in for the docker / nvidia-smi runner: containers have a state, compose up starts them."""
 
-    SERVICES = {"tagger": "immich_aitagger", "vlm": "immich_aitagger_vlm"}
+    SERVICES = {"tagger": "immich_aitagger"}          # the compose services that exist: the describer's is gone
 
     def __init__(self, gpu="24576, 1024"):
         self.calls: list[tuple] = []
@@ -2024,7 +2321,7 @@ class FakeRunner:
         if cmd[:2] == ["docker", "compose"]:
             if self.up_fails:
                 return at._Done(1, "", "no such image")
-            self.state[self.SERVICES[cmd[-1]]] = "running"
+            self.state[self.SERVICES[cmd[-1]]] = "running"      # any other service name is a KeyError: it must not be asked for
             return at._Done(0)
         if cmd[:2] == ["docker", "stop"]:
             self.state[cmd[-1]] = "stopped"
@@ -2041,23 +2338,21 @@ class FakeRunner:
 
 
 class FakeHealth:
-    """A model server that becomes ready ``after`` seconds (on the fake clock) once the container runs."""
+    """A tagger that becomes ready ``after`` seconds (on the fake clock) once the container runs."""
 
-    def __init__(self, clock, runner, container, after=10, error=None, vlm=False):
-        self.clock, self.runner, self.container, self.after, self.error, self.vlm = clock, runner, container, after, error, vlm
+    def __init__(self, clock, runner, container, after=10, error=None):
+        self.clock, self.runner, self.container, self.after, self.error = clock, runner, container, after, error
         self.started = None
 
     def health(self, timeout=3):
         if self.runner.state.get(self.container) != "running":
             self.started = None
-            return False if self.vlm else None
+            return None
         if self.started is None:
             self.started = self.clock()
         if self.error:
             return {"status": "error", "error": self.error}
         ready = self.clock() - self.started >= self.after
-        if self.vlm:
-            return ready
         return {"status": "ok" if ready else "loading", "error": None}
 
 
@@ -2068,88 +2363,88 @@ class TestServices(Base):
         self.stopped_search = []
         self.make()
 
-    def make(self, vlm_after=40, tagger_after=10, **kw):
+    def make(self, tagger_after=10, **kw):
         self.tagger = FakeHealth(self.clock, self.runner, "immich_aitagger", tagger_after)
-        self.vlm = FakeHealth(self.clock, self.runner, "immich_aitagger_vlm", vlm_after, vlm=True)
-        self.svc = at.Services(self.tagger, self.vlm, runner=self.runner, store=self.store, clock=self.clock,
+        self.svc = at.Services(self.tagger, runner=self.runner, store=self.store, clock=self.clock,
                                sleep=self.clock.sleep, search_stop=lambda: self.stopped_search.append(len(self.runner.calls)), **kw)
 
-    def test_vram_gb_is_the_taggers_cap_and_the_describers_share_is_a_constant(self):
-        default = {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT), "AITAGGER_VLM_UTIL": str(at.VLM_UTIL), "AITAGGER_VLM_SEQS": "16"}
-        self.assertEqual(self.svc.env(), default)
+    def test_vram_gb_is_the_taggers_cap_and_nothing_else_is_derived(self):
+        self.assertEqual(self.svc.env(), {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT)})
         lo, hi = at.VRAM_GB_LIMITS
         for gb in (lo, hi):                                                 # AITAGGER_VRAM_GB = vram_gb, nothing else moves
-            self.assertEqual(self.svc.env(S(vram_gb=gb, vlm_parallel=4)),
-                             {"AITAGGER_VRAM_GB": str(gb), "AITAGGER_VLM_UTIL": str(at.VLM_UTIL), "AITAGGER_VLM_SEQS": "4"})
+            self.assertEqual(self.svc.env(S(vram_gb=gb)), {"AITAGGER_VRAM_GB": str(gb)})
         self.runner.gpu = "12288, 100"                                      # not derived from the card either
         self.make()
-        self.assertEqual(self.svc.env(S(vram_gb=hi))["AITAGGER_VLM_UTIL"], str(at.VLM_UTIL))
-        with mock.patch.object(at, "VLM_UTIL", 0.2):                        # one constant to change
-            self.assertEqual(self.svc.env()["AITAGGER_VLM_UTIL"], "0.2")
-        self.assertEqual(self.svc.env()["AITAGGER_VRAM_GB"], str(at.VRAM_GB_DEFAULT))
-        self.assertTrue(0 < at.VLM_UTIL < 0.95)
+        self.assertEqual(self.svc.env(S(vram_gb=hi)), {"AITAGGER_VRAM_GB": str(hi)})
+        self.assertFalse(any("VLM" in key for key in self.svc.env()))
 
     def test_the_card_size_is_still_reported_and_taken_to_be_24_gb_without_nvidia_smi(self):
         self.runner.gpu = ""
         self.make()
         self.assertEqual(self.svc.gpu(), {"totalGb": 24, "usedGb": None})
 
-    def test_load_starts_both_containers_through_compose(self):
-        self.assertEqual(self.svc.load(), ["immich_aitagger", "immich_aitagger_vlm"])
+    def test_load_starts_only_the_tagger_through_compose(self):
+        self.assertEqual(self.svc.load(), ["immich_aitagger"])
         cmds = self.runner.ups()
         compose = str(at.COMPOSE)
         self.assertTrue(compose.replace("\\", "/").endswith("deploy/aitagger/docker-compose.yml"))
-        self.assertEqual(cmds[0], ["docker", "compose", "-p", "immich-aitagger", "-f", compose, "up", "-d", "tagger"])
-        self.assertEqual(cmds[1], ["docker", "compose", "-p", "immich-aitagger", "-f", compose, "up", "-d", "vlm"])
+        self.assertEqual(cmds, [["docker", "compose", "-p", "immich-aitagger", "-f", compose, "up", "-d", "tagger"]])
         for _, env in [c for c in self.runner.calls if c[0][:2] == ["docker", "compose"]]:
-            self.assertEqual(env, {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT), "AITAGGER_VLM_UTIL": str(at.VLM_UTIL),
-                                   "AITAGGER_VLM_SEQS": "16"})
+            self.assertEqual(env, {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT)})
         self.assertEqual(self.svc.load(), [])                               # already running: nothing to do
-        self.assertEqual(len(self.runner.ups()), 2)
+        self.assertEqual(len(self.runner.ups()), 1)
 
-    def test_only_what_is_needed_is_started(self):
-        self.assertEqual(self.svc.load(need_vlm=False), ["immich_aitagger"])
-        self.assertEqual(self.runner.state, {"immich_aitagger": "running"})
-        self.assertEqual(self.svc.load(need_tagger=False), ["immich_aitagger_vlm"])
+    def test_nothing_but_the_tagger_service_is_ever_started_or_stopped(self):
+        self.runner.state["immich_searchplus"] = "running"
+        self.svc.ensure_ready(wait=600)
+        self.svc.status()
+        self.svc.unload()
+        self.svc.load()
+        for cmd, env in self.runner.calls:
+            joined = " ".join(cmd)
+            self.assertNotIn("vlm", joined)
+            self.assertFalse(env and any("VLM" in key for key in env), cmd)
+            if cmd[:2] == ["docker", "compose"]:
+                self.assertEqual(cmd[-1], "tagger")
+            elif cmd[:2] == ["docker", "stop"]:
+                self.assertEqual(cmd[-1], "immich_aitagger")
+            elif cmd[:2] == ["docker", "inspect"]:
+                self.assertIn(cmd[-1], ("immich_aitagger", "immich_searchplus"))
+        self.assertEqual(self.runner.state["immich_searchplus"], "running")        # Search+ is left alone (not exclusive)
+        self.assertFalse(hasattr(self.svc, "vlm_box"))
+        self.assertFalse(hasattr(self.svc, "vlm"))
 
-    def test_the_containers_are_recreated_only_when_the_derived_env_changed(self):
+    def test_the_container_is_recreated_only_when_the_derived_env_changed(self):
         self.svc.load()
         self.assertFalse(any("--force-recreate" in c for c in self.runner.ups()))
-        self.assertEqual(json.loads(self.store.meta("services_env"))["immich_aitagger_vlm"],
-                         {"AITAGGER_VLM_UTIL": str(at.VLM_UTIL), "AITAGGER_VLM_SEQS": "16"})
+        self.assertEqual(json.loads(self.store.meta("services_env"))["immich_aitagger"],
+                         {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT)})
         self.svc.unload()
         self.runner.calls.clear()
         self.svc.load()                                                     # same settings: a plain start
         self.assertFalse(any("--force-recreate" in c for c in self.runner.ups()))
         self.svc.unload()
-        self.set(vlm_parallel=4)
-        self.runner.calls.clear()
-        self.svc.load()
-        recreated = [c[-1] for c in self.runner.ups() if "--force-recreate" in c]
-        self.assertEqual(recreated, ["vlm"])                               # the tagger's env did not change
-        self.svc.unload()
-        self.set(vram_gb=at.VRAM_GB_LIMITS[1])                              # the taggers' cap: only the tagger is recreated
+        self.set(batch_size=4, vram_gb=at.VRAM_GB_LIMITS[1])                # the taggers' cap changed: recreated
         self.runner.calls.clear()
         self.svc.load()
         self.assertEqual([c[-1] for c in self.runner.ups() if "--force-recreate" in c], ["tagger"])
-        self.svc.unload()
-        with mock.patch.object(at, "VLM_UTIL", at.VLM_UTIL + 0.05):         # the describer's share changed in the code
-            self.runner.calls.clear()
-            self.svc.load()
-            self.assertEqual([c[-1] for c in self.runner.ups() if "--force-recreate" in c], ["vlm"])
-        self.svc.unload()
-        self.runner.calls.clear()
-        self.svc.load()                                                     # back to the old share: recreated once more
-        self.assertEqual([c[-1] for c in self.runner.ups() if "--force-recreate" in c], ["vlm"])
         self.svc.unload()
         self.runner.calls.clear()
         self.svc.load()                                                     # remembered: no more recreating
         self.assertFalse(any("--force-recreate" in c for c in self.runner.ups()))
 
-    def test_a_container_that_exists_with_an_unknown_env_is_recreated(self):
-        self.runner.state["immich_aitagger_vlm"] = "stopped"               # made by hand, before the panel remembered anything
+    def test_what_v2_remembered_about_the_describer_container_does_no_harm(self):
+        self.store.set_meta("services_env", json.dumps({"immich_aitagger": {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT)},
+                                                        "immich_aitagger_vlm": {"AITAGGER_VLM_UTIL": "0.22", "AITAGGER_VLM_SEQS": "16"}}))
+        self.runner.state["immich_aitagger"] = "stopped"
         self.svc.load()
-        self.assertEqual([c[-1] for c in self.runner.ups() if "--force-recreate" in c], ["vlm"])
+        self.assertFalse(any("--force-recreate" in c for c in self.runner.ups()))
+        self.assertEqual(self.runner.state, {"immich_aitagger": "running"})
+
+    def test_a_container_that_exists_with_an_unknown_env_is_recreated(self):
+        self.runner.state["immich_aitagger"] = "stopped"                    # made by hand, before the panel remembered anything
+        self.svc.load()
+        self.assertEqual([c[-1] for c in self.runner.ups() if "--force-recreate" in c], ["tagger"])
 
     @mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True)
     def test_search_plus_is_stopped_before_anything_starts(self):
@@ -2165,17 +2460,17 @@ class TestServices(Base):
         self.assertEqual(self.stopped_search, [])
 
     def test_the_exclusive_switch_decides_whether_search_plus_is_stopped(self):
-        self.assertFalse(sp.AITAGGER_EXCLUSIVE)     # shipped: they share the card (measured 17.3 GB with everything)
+        self.assertFalse(sp.AITAGGER_EXCLUSIVE)     # shipped: they share the card
         for exclusive in (True, False):
             with self.subTest(exclusive=exclusive), mock.patch.object(sp, "AITAGGER_EXCLUSIVE", exclusive):
                 self.runner.state = {"immich_searchplus": "running"}
                 self.stopped_search.clear()
-                self.assertEqual(self.svc.load(), ["immich_aitagger", "immich_aitagger_vlm"])
+                self.assertEqual(self.svc.load(), ["immich_aitagger"])
                 self.assertEqual(len(self.stopped_search), 1 if exclusive else 0)       # False: Search+ is left running
                 self.assertEqual(self.runner.state["immich_searchplus"], "running")     # (the fake stop is only a record)
                 self.svc.unload()
 
-    def test_search_plus_is_left_alone_when_the_models_are_already_up(self):
+    def test_search_plus_is_left_alone_when_the_tagger_is_already_up(self):
         self.svc.load()
         self.runner.state["immich_searchplus"] = "running"
         self.svc.load()
@@ -2187,31 +2482,29 @@ class TestServices(Base):
             self.svc.load()
         self.assertIn("no such image", str(err.exception))
 
-    def test_ensure_ready_starts_and_waits_for_both(self):
+    def test_ensure_ready_starts_and_waits(self):
         progress = []
         self.svc.ensure_ready(wait=600, progress=progress.append)
-        self.assertEqual(self.clock.t, 1000 + 40)                           # the language model takes longest
+        self.assertEqual(self.clock.t, 1000 + 10)
         self.assertTrue(progress)
-        self.assertIn("loading the", progress[0])
-        before = len(self.runner.calls)
+        self.assertIn("loading the tagger", progress[0])
         self.svc.ensure_ready()                                             # ready: no work
-        self.assertEqual(len(self.runner.ups()), 2)
-        self.assertEqual(self.clock.t, 1040)
-        self.assertTrue(len(self.runner.calls) >= before)
-
-    def test_ensure_ready_without_the_vlm_does_not_start_it(self):
-        self.svc.ensure_ready(need_vlm=False, wait=600)
-        self.assertEqual(self.runner.state, {"immich_aitagger": "running"})
+        self.assertEqual(len(self.runner.ups()), 1)
         self.assertEqual(self.clock.t, 1010)
 
+    def test_ensure_ready_without_a_tagger_needs_nothing(self):
+        self.svc.ensure_ready(need_tagger=False, wait=600)
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.clock.t, 1000)
+
     def test_ensure_ready_gives_up_after_the_wait(self):
-        self.make(vlm_after=10_000)
+        self.make(tagger_after=10_000)
         with self.assertRaises(sp.ServiceDown) as err:
             self.svc.ensure_ready(wait=90)
         self.assertIn("still loading", str(err.exception))
         self.assertGreaterEqual(self.clock.t, 1090)
         self.assertLess(self.clock.t, 1100)
-        self.assertEqual(len(self.runner.ups()), 2)                         # it was started, so a retry finds it further on
+        self.assertEqual(len(self.runner.ups()), 1)                         # it was started, so a retry finds it further on
 
     def test_ensure_ready_stops_when_asked(self):
         stop = threading.Event()
@@ -2226,67 +2519,37 @@ class TestServices(Base):
         self.assertIn("no kernel image", str(err.exception))
 
     def test_a_container_that_dies_while_loading_is_reported(self):
-        self.make(vlm_after=10_000)
+        self.make(tagger_after=10_000)
         real_sleep = self.clock.sleep
 
         def sleep(s):
             real_sleep(s)
             if self.clock.t > 1020:
-                self.runner.state["immich_aitagger_vlm"] = "stopped"
+                self.runner.state["immich_aitagger"] = "stopped"
 
         self.svc.sleep = sleep
         with self.assertRaises(RuntimeError) as err:
             self.svc.ensure_ready(wait=600)
-        self.assertIn("docker logs immich_aitagger_vlm", str(err.exception))
+        self.assertIn("docker logs immich_aitagger", str(err.exception))
 
-    def test_unload_stops_both(self):
+    def test_unload_stops_the_tagger(self):
         self.svc.load()
-        self.assertEqual(self.svc.unload(), ["immich_aitagger_vlm", "immich_aitagger"])
-        self.assertEqual(self.runner.state, {"immich_aitagger": "stopped", "immich_aitagger_vlm": "stopped"})
+        self.assertEqual(self.svc.unload(), ["immich_aitagger"])
+        self.assertEqual(self.runner.state, {"immich_aitagger": "stopped"})
         self.assertEqual(self.svc.unload(), [])
 
-    def test_the_vlm_container_is_stopped_after_20_idle_minutes(self):
+    def test_the_panel_has_no_idle_clock_of_its_own(self):
+        # the tagger container exits by itself after IDLE_EXIT_MINUTES (see tagger_service.py); only the describer
+        # container needed the panel to stop it
         self.svc.ensure_ready(wait=600)
-        self.assertFalse(self.svc.idle_check())
-        self.clock.t += 19 * 60
-        self.assertFalse(self.svc.idle_check())
-        self.assertEqual(self.runner.state["immich_aitagger_vlm"], "running")
-        self.svc.touch()                                                    # work was done
-        self.clock.t += 19 * 60
-        self.assertFalse(self.svc.idle_check())
-        self.clock.t += 2 * 60
-        self.assertTrue(self.svc.idle_check())
-        self.assertEqual(self.runner.state["immich_aitagger_vlm"], "stopped")
-        self.assertEqual(self.runner.state["immich_aitagger"], "running")   # the tagger stops by itself
-        self.assertFalse(self.svc.idle_check())                             # nothing left to stop
-        self.assertEqual(at.IDLE_EXIT_MINUTES, 20)
+        self.clock.t += 3 * 60 * 60
+        self.assertEqual(self.runner.state, {"immich_aitagger": "running"})
+        self.assertEqual(len(self.runner.commands("stop")), 0)
 
-    def test_a_vlm_that_is_still_loading_gets_three_times_as_long(self):
-        self.make(vlm_after=10 ** 9)                                         # the first start downloads the model
-        self.svc.load()
-        self.clock.t += 30 * 60
-        self.assertFalse(self.svc.idle_check())
-        self.assertEqual(self.runner.state["immich_aitagger_vlm"], "running")
-        self.clock.t += 31 * 60
-        self.assertTrue(self.svc.idle_check())                               # an hour and more: given up
-        self.assertEqual(self.runner.state["immich_aitagger_vlm"], "stopped")
-
-    def test_waiting_for_the_models_is_using_them(self):
-        self.make(vlm_after=40 * 60)
-        with self.assertRaises(sp.ServiceDown):
-            self.svc.ensure_ready(wait=30 * 60)
-        self.assertGreater(self.svc.last_used, self.clock.t - 5)
-        self.assertFalse(self.svc.idle_check())
-
-    def test_using_the_models_counts_as_work(self):
+    def test_using_the_tagger_goes_through_to_the_client(self):
         self.svc.tagger = mock.Mock(tag=mock.Mock(return_value=([], [])))
-        self.svc.vlm = mock.Mock(describe=mock.Mock(return_value={}))
-        self.clock.t += 30 * 60
-        self.svc.tag([b"x"])
-        self.assertFalse(self.svc.idle_check())
-        self.clock.t += 30 * 60
-        self.svc.describe([], {}, S())
-        self.assertFalse(self.svc.idle_check())
+        self.svc.tag([b"x"], models=["wd"])
+        self.svc.tagger.tag.assert_called_once_with([b"x"], models=["wd"])
 
     def test_container_state_is_remembered_for_five_seconds(self):
         self.svc.tagger_box.container_state()
@@ -2305,24 +2568,20 @@ class TestServices(Base):
     def test_status_is_cheap_and_has_the_contract_shape(self):
         st = self.svc.status()
         self.assertEqual(st, {"tagger": {"container": "missing", "status": "down", "error": None},
-                              "vlm": {"container": "missing", "status": "down", "error": None},
                               "gpu": {"totalGb": 24.0, "usedGb": 1.0}, "searchplusRunning": False})
+        self.assertNotIn("vlm", st)
         n = len(self.runner.calls)
         for _ in range(5):
             self.svc.status()
         self.assertEqual(len(self.runner.calls), n)                          # all from memory
-        self.svc.load(need_vlm=False)
+        self.svc.load()
         self.svc.tagger_box.invalidate()
-        self.svc.vlm_box.invalidate()
         st = self.svc.status()
         self.assertEqual(st["tagger"], {"container": "running", "status": "loading", "error": None})
-        self.runner.state["immich_aitagger_vlm"] = "running"
-        self.svc.vlm_box.invalidate()
-        self.assertEqual(self.svc.status()["vlm"]["status"], "loading")
         self.clock.t += 60
         self.runner.state["immich_searchplus"] = "running"
         st = self.svc.status()
-        self.assertEqual((st["tagger"]["status"], st["vlm"]["status"], st["searchplusRunning"]), ("ok", "ok", True))
+        self.assertEqual((st["tagger"]["status"], st["searchplusRunning"]), ("ok", True))
 
     def test_docker_missing_is_unknown_not_a_crash(self):
         runner = mock.Mock(return_value=at._Done(127, "", "docker not found"))
@@ -2336,55 +2595,49 @@ class TestServices(Base):
 
 
 class TestWithRealClients(Base):
-    """The Indexer on the real Services / Tagger / VLM classes, talking HTTP to stand-in model servers."""
+    """The Indexer on the real Services / Tagger classes, talking HTTP to a stand-in model server."""
 
     def test_everything_end_to_end(self):
         def tag(body):
-            got = [read_picture(base64.b64decode(i)) for i in body["images"]]
+            got = [read_picture(base64.b64decode(i), body.get("models")) for i in body["images"]]
             return 200, {"results": [g[0] for g in got], "errors": [g[1] for g in got], "tookMs": 1}
 
-        def chat(body):
-            text = body["messages"][1]["content"]
-            tags = text.split("confidence: ", 1)[1].splitlines()[0]
-            return 200, {"choices": [{"message": {"content": json.dumps(
-                {"description": f"Seen: {tags.split(',')[0].rsplit(' ', 1)[0]}.", "add_tags": ["extra"],
-                 "remove_tags": []})}, "finish_reason": "stop"}]}
-
         tagger = StubServer({("POST", "/tag"): tag, ("GET", "/health"): lambda b: (200, {"status": "ok"})})
-        vlm = StubServer({("POST", "/v1/chat/completions"): chat, ("GET", "/health"): lambda b: (200, {})})
         self.addCleanup(tagger.close)
-        self.addCleanup(vlm.close)
         runner = FakeRunner()
-        runner.state = {"immich_aitagger": "running", "immich_aitagger_vlm": "running"}
-        services = at.Services(at.Tagger(tagger.url), at.VLM(vlm.url), runner=runner, store=self.store)
+        runner.state = {"immich_aitagger": "running"}
+        services = at.Services(at.Tagger(tagger.url), runner=runner, store=self.store)
         self.indexer = at.Indexer(self.store, services, client=self.client, catalog=lambda: self.catalog, frames=fake_frames)
         self.indexer.DROP_WAIT = 0.01
         self.run_indexer()
         self.assertEqual(self.indexer.state, "done", self.indexer.detail)
         self.assertEqual(self.store.counts()["processed"], 3)
-        self.assertEqual(self.description(1),
-                         "[AI Tagger]\nTags: dog, extra, grass, rating: general\nDescription: Seen: dog.\n[/AI Tagger]")
-        self.assertEqual(len([r for r in tagger.requests if r[1] == "/tag"]), 1)                   # one batch
-        self.assertEqual(len([r for r in vlm.requests if r[1] == "/v1/chat/completions"]), 3)
-        for _method, _path, body in [r for r in vlm.requests if r[1] == "/v1/chat/completions"]:
-            self.assertTrue(all(isinstance(m["content"], str) for m in body["messages"]))           # text only, no picture
-            self.assertNotIn("image_url", json.dumps(body))
-        self.assertEqual(runner.commands("compose"), [])                                            # they were running already
+        self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\n[/AI Tagger]")
+        requests = [r for r in tagger.requests if r[1] == "/tag"]
+        self.assertEqual(len(requests), 1)                                                          # one batch
+        self.assertEqual(requests[0][2]["models"], ["wd", "pixai"])                                 # only the enabled taggers
+        self.assertEqual(runner.commands("compose"), [])                                            # it was running already
         status = services.status()
-        self.assertEqual((status["tagger"]["status"], status["vlm"]["status"]), ("ok", "ok"))
-        # and a retag afterwards needs no request to either server
-        before = (len(tagger.requests), len(vlm.requests))
-        self.set(blocked=["extra"])
+        self.assertEqual(status["tagger"]["status"], "ok")
+        self.assertNotIn("vlm", status)
+        # and a retag afterwards needs no request to the server
+        before = len(tagger.requests)
+        self.set(blocked=["dog"])
         at.reprocess(self.store, "outdated", "retag")
         self.run_indexer()
-        self.assertEqual((len(tagger.requests), len(vlm.requests)), before)
-        self.assertNotIn("extra", self.description(1))
-        self.assertIn("Seen: dog.", self.description(1))
+        self.assertEqual(len(tagger.requests), before)
+        self.assertNotIn("dog", self.description(1))
+        self.assertIn("grass", self.description(1))
+        # turning a tagger off is sent on the next full pass: only the tagger that is still on is asked for
+        self.set(use_pixai=False)
+        self.store.enqueue([self.ids[1]], "full")
+        self.run_indexer()
+        self.assertEqual([r for r in tagger.requests if r[1] == "/tag"][-1][2]["models"], ["wd"])
 
 
 class TestInstance(Base):
     def test_one_per_home_and_autostart_resumes_only_when_it_was_on(self):
-        with mock.patch.object(at.Indexer, "start") as start, mock.patch.object(at, "_watch"):
+        with mock.patch.object(at.Indexer, "start") as start:
             at.autostart(self.client)
             start.assert_not_called()
             store, services, indexer = at.instance()

@@ -337,7 +337,8 @@ class TestSettingsAndFrames(Base):
 
 
 class TestGpuBusy(Base):
-    """While the AI Tagger's language model holds the graphics card, Search+ must not start its model server."""
+    """While the AI Tagger's container holds the graphics card (and the two are set to take turns), Search+ must not
+    start its model server. v3 has no describer container: the check is on ``immich_aitagger`` only."""
 
     def docker(self, running: dict):
         """A stand-in for subprocess.run: `docker inspect` answers from ``running``; other calls are recorded."""
@@ -355,8 +356,9 @@ class TestGpuBusy(Base):
 
     def test_gpu_busy_is_a_service_down_with_the_contract_message(self):
         self.assertTrue(issubclass(sp.GpuBusy, sp.ServiceDown))
-        self.assertEqual(sp.AITAGGER_VLM_CONTAINER, "immich_aitagger_vlm")
-        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):
+        self.assertEqual(sp.AITAGGER_CONTAINER, "immich_aitagger")
+        self.assertFalse(hasattr(sp, "AITAGGER_VLM_CONTAINER"))
+        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_searchplus": False, "immich_aitagger": True}):
             with self.assertRaises(sp.GpuBusy) as ctx:
                 sp.Service().start()
         self.assertEqual(str(ctx.exception), "The GPU is in use by the AI Tagger — pause it to use Search+")
@@ -364,30 +366,30 @@ class TestGpuBusy(Base):
 
     def test_ready_raises_it_too_so_searches_get_a_clear_answer(self):
         service = sp.Service()
-        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_aitagger_vlm": True}), \
+        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_aitagger": True}), \
                 mock.patch.object(service, "health", return_value=None):
             with self.assertRaises(sp.GpuBusy):
                 service.ready(wait=1)
 
     def test_the_exclusive_switch_is_the_one_place_that_decides(self):
         self.assertFalse(sp.AITAGGER_EXCLUSIVE)     # shipped: they share the card (measured 17.3 GB with everything)
-        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):
+        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_searchplus": False, "immich_aitagger": True}):
             with self.assertRaises(sp.GpuBusy):
                 sp.Service().start()
         with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", False):
-            with self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):      # the tagger runs: Search+ starts anyway
+            with self.docker({"immich_searchplus": False, "immich_aitagger": True}):          # the tagger runs: Search+ starts anyway
                 sp.Service().start()
             self.assertEqual(self.docker_calls[-1], ["docker", "start", "immich_searchplus"])
-            with self.docker({"immich_aitagger_vlm": True}):                                  # and from nothing, by compose
+            with self.docker({"immich_aitagger": True}):                                      # and from nothing, by compose
                 sp.Service().start()
             self.assertEqual(self.docker_calls[-1][:3], ["docker", "compose", "-f"])
             service = sp.Service()
-            with self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}), \
+            with self.docker({"immich_searchplus": False, "immich_aitagger": True}), \
                     mock.patch.object(service, "health", side_effect=[None, {"status": "ok"}]):
                 self.assertEqual(service.ready(wait=30), {"status": "ok"})                      # ready() no longer says GpuBusy
 
-    def test_search_plus_starts_as_before_when_the_language_model_is_not_running(self):
-        for tagger in ({}, {"immich_aitagger_vlm": False}):
+    def test_search_plus_starts_as_before_when_the_tagger_is_not_running(self):
+        for tagger in ({}, {"immich_aitagger": False}):
             with self.docker({"immich_searchplus": False, **tagger}):
                 sp.Service().start()
             self.assertEqual(self.docker_calls[-1], ["docker", "start", "immich_searchplus"])
@@ -395,14 +397,27 @@ class TestGpuBusy(Base):
             sp.Service().start()
         self.assertEqual(self.docker_calls[-1][:3], ["docker", "compose", "-f"])
 
+    def test_the_old_describer_container_does_not_make_the_card_busy(self):
+        # v2's second container is gone from the compose file; a leftover one must not block Search+ any more
+        with mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), self.docker({"immich_searchplus": False, "immich_aitagger_vlm": True}):
+            sp.Service().start()
+        self.assertEqual(self.docker_calls[-1], ["docker", "start", "immich_searchplus"])
+        self.assertFalse([c for c in self.docker_calls if c[-1] == "immich_aitagger_vlm"])        # it is not even looked at
+
+    def test_the_container_name_can_be_set_in_the_environment(self):
+        with mock.patch.object(sp, "AITAGGER_CONTAINER", "my_tagger"), mock.patch.object(sp, "AITAGGER_EXCLUSIVE", True), \
+                self.docker({"immich_searchplus": False, "my_tagger": True, "immich_aitagger": False}):
+            with self.assertRaises(sp.GpuBusy):
+                sp.Service().start()
+
     def test_a_running_search_plus_is_left_alone(self):
-        with self.docker({"immich_searchplus": True, "immich_aitagger_vlm": True}):
+        with self.docker({"immich_searchplus": True, "immich_aitagger": True}):
             sp.Service().start()
         self.assertEqual([c for c in self.docker_calls if c[:2] != ["docker", "inspect"]], [])
 
     def test_docker_missing_means_not_busy(self):
         with mock.patch.object(sp.subprocess, "run", side_effect=FileNotFoundError("docker")):
-            self.assertFalse(sp.container_running("immich_aitagger_vlm"))
+            self.assertFalse(sp.container_running("immich_aitagger"))
 
     def test_the_indexer_waits_for_the_card_and_does_not_count_it_as_a_drop(self):
         class Busy(FakeService):

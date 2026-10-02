@@ -33,6 +33,76 @@ add a **third tagger** that is good on both real photos and illustration, or is 
 5. **GPU:** only the `immich_aitagger` container. `vram_gb` stays the taggers' cap. Defaults and limits are
    re-measured with three taggers.
 
+### v3, panel side: as built (design details and where it differs from the list above)
+
+**The registry.** `aitagger.TAGGERS` is an ordered list of `TaggerKind(key, label, categories, character_categories,
+has_rating, default_on)`:
+- `key` is lowercase letters and digits. It is the key of the tagger's answer in `/tag`, its name in the request's
+  `models` list, and the stem of its settings `use_<key>` and `<key>_strictness`.
+- `categories` are the tag categories it answers with, `general` included; `rating` is separate. `character_categories`
+  are those of them that the `character_tags` setting switches off (WD: `character`; PixAI: `character`, `copyright`).
+- `has_rating` says whether it answers with a rating; `default_on` is the default of `use_<key>`.
+- Registered today: `wd` (`general`, `character`; rating) and `pixai` (`general`, `character`, `copyright`; rating).
+
+`configure_taggers()` generates from the registry, in place: `DEFAULTS` (`use_<key>` = `default_on`, `<key>_strictness` =
+0.5), `LIMITS` (`<key>_strictness` 0.05-0.95), `CONTENT`, and `REPROCESS` (`use_*` in `full`, `*_strictness` in `retag`).
+It runs once at import; the tests call it to add a fake third tagger (`tests/test_aitagger.py`: `EXTRA`, `with_extra`).
+Everything else loops over `TAGGERS` or `enabled_kinds(settings)`: `detect`, the rating (mean over the enabled taggers
+with `has_rating`; a tie goes to the earlier entry), `raw_from_results`, `synthetic_raw`, the status `models`
+(`{key: label}`, registry order), the preview's per-tagger lists (an empty list for a tagger that is off) and the `models`
+sent to `/tag`.
+
+**Adding the third tagger: the lines.**
+1. `immich_organizer/aitagger.py`, in `TAGGERS`, at the marked line:
+   `TaggerKind("<key>", "<model name>", ("general", "character"), ("character",))`, with `has_rating=False` if it gives no
+   rating and `default_on=False` if it should start switched off.
+2. `immich_organizer/tagger_service.py` answers `/tag` under `"<key>"` with those categories (and `rating`), and accepts
+   `"<key>"` in `models` and in `/health`.
+
+Nothing else changes: the settings and their validation, the status, the Test card, the web tab and the Android screen
+follow from the registry. The first time a store is opened after a tagger that is on by default was added, its results
+are "outdated" once (`meta.taggers` remembers the registry; see below), and an asset whose stored scores lack an enabled
+tagger is redone as `full` by any reprocess.
+
+**The explicit-tag check** counts the taggers that *kept* the tag (it passed that tagger's own strictness), not the ones
+that merely listed it. The check applies when the combined rating is general or sensitive, and needs at least two such
+taggers; with one tagger on, none can confirm.
+
+**Stored scores.** `raw.scores[i]` is `{key: {category: {tag: score}} | null}` for every registered tagger (`null` when it
+did not answer, for example because it was off when the asset was tagged) and `raw.ratings[i]` is
+`{key: {rating: probability} | null}` (`null` for a tagger without a rating). The panel asks `/tag` only for the enabled
+taggers (`models: [...]`), so a tagger that was off leaves no scores. A stored raw row lacking an enabled tagger (`missing_kinds`; this
+generalises the v2 PixAI rule) makes a `retag` run as `full` for that asset.
+
+**Reprocess modes.** `MODES = ("retag", "full")`. `normalize_mode()` turns `describe` into `retag`: in `enqueue` and
+`reprocess` (so a request from an old app is accepted), in the `reprocess` route and the settings route's `reprocess`
+field, and for a `describe` row already in the queue (rewritten to `retag` when the store opens, and still understood
+by `dequeue` and the Indexer if one gets in some other way). `vocabulary` is a `retag` setting now (renames re-apply to the
+stored scores); in v2 it was a `describe` one.
+
+**Store.** `results` is `(id, tags_json, block, settings_version, processed_at, written_at)`. A store made by v2 keeps its
+`vlm_json`, `description` and `note` columns (nullable, never written or read again). `/api/aitagger/assets` items have no
+`description`, and `q` matches the file name and the tags. One-time "outdated" bumps when a store is opened, each
+remembered in `meta` so none repeats, and all counted as one bump: `raw_format` (v1 scores, as in v2), `block_format` (a
+stored block with a `Description:` line, which a retag rewrites without it) and `taggers` (a tagger that is on by default
+is new since the store was last opened; a store without the key counts as having had `wd` and `pixai`).
+
+**Services.** Only the `tagger` compose service is started, recreated or stopped; the only environment is
+`AITAGGER_VRAM_GB` (`vram_gb`). `ensure_ready(need_tagger, ...)` and `load()` take no VLM argument, and `status()` has no
+`vlm`. The panel has no idle clock any more: it only existed to stop the describer container, and the tagger container
+exits by itself after `IDLE_EXIT_MINUTES` (`tagger_service.py`). Write-back parallelism is the constant
+`Indexer.WRITERS = 8` (it was `vlm_parallel`).
+
+**GPU sharing with Search+.** `searchplus.AITAGGER_CONTAINER` (environment `AITAGGER_CONTAINER`, default
+`immich_aitagger`) replaces `AITAGGER_VLM_CONTAINER`; `GpuBusy` is raised for it, and only while `AITAGGER_EXCLUSIVE` is
+true. `AITAGGER_EXCLUSIVE` stays `False`.
+
+**API and screens.** The status has no `vlm` under `service`, `models` is `{key: label}`, `limits` and `settings` have the
+generated keys, and `reprocessKeys` is `{retag: [...], full: [...]}`. The preview has `models.<key>` per registered tagger,
+`models.rating`, `models.dropped` when the explicit-tag check removed tags, and no `vlm` or `description`. The web tab and
+the Android screen build their tagger switches and strictness sliders from `models` + `settings` + `limits` (the web tab
+also takes the reprocess mode of each setting from `reprocessKeys`).
+
 ## v2 (2026-10-02) — superseded by v3 where they differ
 
 The owner found the 9B vision model too heavy for what it is needed for: stringing the tags into a short
