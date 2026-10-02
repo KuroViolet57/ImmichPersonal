@@ -1,4 +1,5 @@
 import base64
+import collections
 import io
 import itertools
 import json
@@ -3395,6 +3396,327 @@ class TestIndexer(Base):
         self.assertEqual(set(st), {"state", "detail", "error", "running", "ratePerMin", "etaMinutes"})
         self.indexer.state = "stopped"
         self.assertEqual(self.indexer.status()["etaMinutes"], None)
+
+
+class GatedServices(FakeServices):
+    """The tagger with a gate: a /tag request that arrives waits until the test lets it through (``release(n)`` for the
+    n-th request to arrive, ``open_all()`` for all of them), and the n-th request can be made to fail (``fail[n]``,
+    raised when it is let through). ``arrived`` holds the pictures of every request, in order of arrival."""
+
+    def __init__(self):
+        super().__init__()
+        self.cond = threading.Condition()
+        self.arrived: list[list[bytes]] = []
+        self.answered = 0
+        self.released: set[int] = set()
+        self.all_open = False
+        self.fail: dict[int, Exception] = {}
+        self.peak = 0                                       # most requests inside ``tag`` at the same time
+
+    def tag(self, images, models=None):
+        with self.cond:
+            self.arrived.append(list(images))
+            n = len(self.arrived)
+            self.peak = max(self.peak, n - self.answered)
+            self.cond.notify_all()
+            if not self.cond.wait_for(lambda: self.all_open or n in self.released, 30):
+                raise AssertionError(f"the test never let request {n} through")
+            self.answered += 1
+            self.cond.notify_all()
+        if n in self.fail:
+            raise self.fail[n]
+        return super().tag(images, models)
+
+    def wait_arrived(self, n: int, timeout: float = 10) -> bool:
+        with self.cond:
+            return self.cond.wait_for(lambda: len(self.arrived) >= n, timeout)
+
+    def release(self, n: int) -> None:
+        with self.cond:
+            self.released.add(n)
+            self.cond.notify_all()
+
+    def open_all(self) -> None:
+        with self.cond:
+            self.all_open = True
+            self.cond.notify_all()
+
+
+class Preps:
+    """The ``frames`` function of the indexer, remembering which assets had their pictures read."""
+
+    def __init__(self, frames):
+        self.frames, self.cond, self.seen = frames, threading.Condition(), []
+
+    def __call__(self, item, n):
+        with self.cond:
+            self.seen.append(item["id"])
+            self.cond.notify_all()
+        return self.frames(item, n)
+
+    def wait_for(self, asset_id: str, timeout: float = 10) -> bool:
+        """True once the pictures of that asset are being read (False after ``timeout``)."""
+        with self.cond:
+            return self.cond.wait_for(lambda: asset_id in self.seen, timeout)
+
+
+class TestIndexerPipeline(Base):
+    """The stages overlap across rounds: a round hands its batches to the tagger and goes on, so the next round is
+    prepared while the earlier requests are still on the GPU. The tagger here holds every request at a gate."""
+
+    def setUp(self):
+        super().setUp()
+        self.services = GatedServices()
+        self.indexer = at.Indexer(self.store, self.services, client=self.client, catalog=lambda: self.catalog,
+                                  frames=fake_frames)
+        self.indexer.DROP_WAIT = 0.01
+        self.addCleanup(self.indexer.stop, 5)
+        self.addCleanup(self.services.open_all)             # (runs first) so that no request is left at the gate
+        self.preps = Preps(fake_frames)
+        self.indexer.frames = self.preps
+        self.sent_with: list[int] = []                      # requests in flight right after each batch was handed over
+        real_send = self.indexer._send
+
+        def spy(*args, **kwargs):
+            sent = real_send(*args, **kwargs)
+            self.sent_with.append(self.indexer.tag_requests())
+            return sent
+
+        self.indexer._send = spy
+
+    def library(self, n: int, broken=()) -> list[str]:
+        """n photos, newest first (``ids[0]`` is worked on first), each with a picture of its own; the numbers in
+        ``broken`` have no preview. Returns their ids."""
+        self.catalog = [{"id": self.ids[i], "type": "IMAGE", "taken": f"2026-03-01 10:{59 - i:02d}:00", "name": f"IMG_{i:04d}.jpg",
+                         "preview": "MISSING" if i in broken else f"wd:p{i}=0.9|rating:general=0.9", "original": "",
+                         "duration_ms": 0} for i in range(n)]
+        return self.ids[:n]
+
+    def start(self, **settings) -> None:
+        self.set(keep_updated=False, indexing=True, **settings)
+        self.indexer.start()
+
+    def finish(self) -> None:
+        """Let every request through and wait for the run to end by itself."""
+        self.services.open_all()
+        self.indexer.thread.join(30)
+        self.assertFalse(self.indexer.running(), "the indexer did not finish")
+
+    def pictures(self) -> list[bytes]:
+        return [p for request in self.services.arrived for p in request]
+
+    def test_the_next_round_is_prepared_while_the_gpu_is_busy_with_the_last(self):
+        ids = self.library(6)
+        self.start(batch_size=2)
+        self.assertTrue(self.services.wait_arrived(1))                  # round 1 is on the tagger, held at the gate
+        self.assertTrue(self.preps.wait_for(ids[2]), "round 2 was not prepared while request 1 was running")
+        self.assertTrue(self.preps.wait_for(ids[3]))
+        self.assertEqual(self.services.answered, 0)                     # (request 1 is still running)
+        self.assertLessEqual({ids[0], ids[1]}, self.indexer._flying())  # its assets stay claimed ...
+        self.assertFalse({ids[0], ids[1]} & {a["id"] for a in self.store.work(6, skip=self.indexer._flying())})   # ... so no one else takes them
+        self.assertEqual(len(self.services.ready_calls), 1)             # no health check while a request is running
+        self.finish()
+        self.assertEqual(self.indexer.state, "done", self.indexer.detail)
+        self.assertEqual(self.store.counts()["processed"], 6)
+        self.assertEqual(self.services.tag_calls, [2, 2, 2])
+
+    def test_never_more_than_TAG_REQUESTS_in_flight_and_the_pictures_held_stay_bounded(self):
+        ids = self.library(12)
+        svc = self.services
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(2))                            # two requests on the tagger (the limit)
+        self.assertTrue(self.preps.wait_for(ids[5]))                    # round 3 is prepared, in hand, waiting for a slot
+        # Round 4 must not be read while both slots are taken: 2 batches in flight + 1 in hand is all that is held.
+        self.assertFalse(self.preps.wait_for(ids[6], timeout=0.3))
+        self.assertEqual(len(svc.arrived), 2)
+        self.assertEqual(self.indexer.tag_requests(), 2)
+        svc.release(1)                                                  # a slot is free: the batch in hand goes out
+        self.assertTrue(svc.wait_arrived(3))
+        self.assertEqual(self.indexer.tag_requests(), 2)                # (request 2 and the new one)
+        self.finish()
+        self.assertEqual(self.indexer.state, "done", self.indexer.detail)
+        self.assertEqual(self.store.counts()["processed"], 12)
+        self.assertEqual(max(self.sent_with), self.indexer.TAG_REQUESTS)
+        self.assertLessEqual(svc.peak, self.indexer.TAG_REQUESTS)
+        self.assertEqual(self.indexer.tag_requests(), 0)
+
+    def test_with_one_request_at_a_time_the_next_round_is_still_prepared_ahead(self):
+        self.indexer.TAG_REQUESTS = 1
+        ids = self.library(8)
+        svc = self.services
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(1))
+        self.assertTrue(self.preps.wait_for(ids[3]))                    # round 2 is in hand while request 1 runs
+        self.assertFalse(self.preps.wait_for(ids[4], timeout=0.3))      # round 3 waits until request 1 is answered
+        self.assertEqual(len(svc.arrived), 1)
+        self.finish()
+        self.assertEqual(self.store.counts()["processed"], 8)
+        self.assertEqual(max(self.sent_with), 1)
+        self.assertEqual(svc.peak, 1)
+
+    def test_the_last_partial_batch_of_a_round_goes_out_without_waiting_for_anything(self):
+        ids = self.library(4, broken={2})                               # round 2: one unreadable file, so a batch of one
+        svc = self.services
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(2), "the partial batch waited for request 1")
+        self.assertEqual(svc.answered, 0)                               # request 1 is still running
+        self.assertEqual(sorted(len(r) for r in svc.arrived), [1, 2])   # (a batch of one asset, and the full one)
+        self.finish()
+        self.assertEqual(self.store.counts()["processed"], 3)
+        self.assertEqual(self.store.counts()["failed"], 1)
+        self.assertEqual(self.indexer._flying(), set())
+
+    def test_a_failing_request_surfaces_and_the_assets_go_back_to_the_pool(self):
+        ids = self.library(6)
+        svc = self.services
+        svc.fail[1] = RuntimeError("the tagger fell over")
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(2))                            # request 2 is out too, request 1 still at the gate
+        svc.release(1)                                                  # request 1 fails now ...
+        svc.release(2)                                                  # ... and request 2, in flight beside it, succeeds
+        self.indexer.thread.join(30)
+        self.assertFalse(self.indexer.running())
+        self.assertEqual(self.indexer.state, "error")
+        self.assertIn("RuntimeError: the tagger fell over", self.indexer.error)
+        self.assertEqual(self.indexer._flying(), set())                 # nothing stays claimed
+        c = self.store.counts()
+        self.assertEqual((c["processed"], c["failed"]), (2, 0))         # request 2 was finished; nobody is "failed"
+        self.assertEqual({a["id"] for a in self.store.work(10)}, set(ids[:2]) | set(ids[4:]))
+        self.assertEqual(self.indexer.tag_requests(), 0)
+
+    def test_a_server_that_goes_away_while_the_next_round_is_prepared_is_waited_for(self):
+        ids = self.library(6)
+        svc = self.services
+        svc.fail[1] = at.ServiceDown("gone")
+        flying_after_drain = []
+        real_drain = self.indexer._drain
+
+        def drain():
+            real_drain()
+            flying_after_drain.append(self.indexer._flying())
+
+        self.indexer._drain = drain
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(2))
+        svc.release(1)
+        self.finish()
+        self.assertEqual(self.indexer.state, "done", self.indexer.detail)
+        self.assertEqual(self.store.counts()["processed"], 6)
+        self.assertEqual(self.store.counts()["failed"], 0)              # not the assets' fault
+        self.assertEqual(len(svc.arrived), 4)                           # 1 failed, 2, then the assets of 1 again, then round 3
+        self.assertEqual(sum(svc.tag_calls), 6)                         # six answers: no picture was tagged twice
+        self.assertEqual(flying_after_drain[0], set())                  # the drain waited for request 2 and gave back the rest
+        self.assertEqual(self.indexer._flying(), set())
+
+    def test_with_nothing_left_to_read_it_waits_for_the_requests_instead_of_looking_again_and_again(self):
+        self.library(2)
+        svc = self.services
+        looks, real_work = [], self.store.work
+        self.store.work = lambda *a, **k: looks.append(1) or real_work(*a, **k)
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(1))                            # the only batch is on the tagger, held at the gate
+        self.assertFalse(self.preps.wait_for("nothing is ever read again", timeout=0.3))
+        self.assertLessEqual(len(looks), 3)                             # (a look at the work is a database query)
+        self.finish()
+        self.assertEqual(self.indexer.state, "done", self.indexer.detail)
+        self.assertEqual(self.store.counts()["processed"], 2)
+
+    def test_a_request_that_fails_after_the_last_round_was_sent_is_not_lost(self):
+        self.library(2)
+        svc = self.services
+        svc.fail[1] = at.ServiceDown("gone")
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(1))
+        svc.release(1)
+        self.finish()
+        self.assertEqual(self.indexer.state, "done", self.indexer.detail)
+        self.assertEqual(self.store.counts()["processed"], 2)           # "everything is tagged" only when it is
+        self.assertEqual(len(svc.arrived), 2)
+
+    def test_a_failing_request_that_is_the_last_thing_left_ends_in_an_error(self):
+        self.library(2)
+        svc = self.services
+        svc.fail[1] = RuntimeError("bad answer")
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(1))
+        svc.release(1)
+        self.finish()
+        self.assertEqual(self.indexer.state, "error")
+        self.assertIn("bad answer", self.indexer.error)
+        self.assertEqual(self.store.counts()["processed"], 0)
+        self.assertEqual(self.indexer._flying(), set())
+
+    def test_pausing_with_requests_in_flight_loses_nothing_and_leaves_nothing_claimed(self):
+        ids = self.library(10)
+        svc = self.services
+        self.start(batch_size=2)
+        self.assertTrue(svc.wait_arrived(2))                            # two requests on the tagger
+        self.assertTrue(self.preps.wait_for(ids[5]))                    # round 3 is being prepared, waiting for a slot
+        self.indexer.stop()
+        svc.open_all()                                                  # the two requests on the tagger are answered
+        self.indexer.thread.join(30)
+        self.assertFalse(self.indexer.running())
+        self.assertEqual((self.indexer.state, self.indexer.detail), ("stopped", "paused"))
+        self.assertEqual(self.indexer._flying(), set())
+        self.assertEqual(len(svc.arrived), 2)                           # nothing was sent after the pause
+        c = self.store.counts()
+        self.assertEqual((c["processed"], c["failed"]), (4, 0))         # what was on the GPU was finished and written
+        self.assertEqual({a["id"] for a in self.store.work(20)}, set(ids[4:]))    # the rest is waiting its turn
+        self.indexer.start()                                            # and it picks up where it was
+        self.indexer.thread.join(30)
+        self.assertFalse(self.indexer.running())
+        self.assertEqual(self.store.counts()["processed"], 10)
+        self.assertEqual(len(self.pictures()), 10)                      # every picture went to the tagger once ...
+        self.assertEqual(len(set(self.pictures())), 10)                 # ... and only once
+
+    def test_no_asset_is_claimed_or_processed_twice_while_the_rounds_overlap(self):
+        ids = self.library(24)
+        svc = self.services
+        claimed_twice, processed = [], collections.Counter()
+        real_claim, real_process = self.indexer._claim, self.indexer.pipe.process
+
+        def claim(asset_id):
+            if asset_id in self.indexer._flying():
+                claimed_twice.append(asset_id)
+            real_claim(asset_id)
+
+        def process(item, mode, raw, settings, version):
+            processed[item["id"]] += 1
+            return real_process(item, mode, raw, settings, version)
+
+        self.indexer._claim, self.indexer.pipe.process = claim, process
+        self.start(batch_size=3)
+        for n in range(1, 9):                                           # answers come one at a time, rounds overlap
+            self.assertTrue(svc.wait_arrived(n))
+            svc.release(n)
+        self.finish()
+        self.assertEqual(self.indexer.state, "done", self.indexer.detail)
+        self.assertEqual(claimed_twice, [])
+        self.assertEqual(processed, collections.Counter({i: 1 for i in ids}))
+        self.assertEqual(len(set(self.pictures())), 24)
+        self.assertEqual(sum(svc.tag_calls), 24)
+        c = self.store.counts()
+        self.assertEqual((c["processed"], c["pending"], c["failed"]), (24, 0, 0))
+        self.assertEqual(self.indexer._done, 24)                        # the progress and rate counters
+        self.assertEqual(len(self.indexer.done_times), 24)
+        self.assertEqual(self.indexer._flying(), set())
+
+    def test_out_of_memory_halving_works_with_requests_in_flight(self):
+        self.library(12)
+        svc = self.services
+        svc.oom_above = 2
+        svc.open_all()
+        self.start(batch_size=4)
+        self.indexer.thread.join(30)
+        self.assertFalse(self.indexer.running())
+        self.assertEqual(self.indexer.state, "done", self.indexer.detail)
+        self.assertEqual(self.store.counts()["processed"], 12)
+        self.assertEqual(self.store.counts()["failed"], 0)
+        self.assertEqual(self.indexer.batch_cap, 2)                     # 4 -> 2 works
+        self.assertTrue(svc.oom_calls and all(n == 4 for n in svc.oom_calls))
+        self.assertTrue(all(n <= 2 for n in svc.tag_calls))
+        self.assertEqual(sum(svc.tag_calls), 12)
+        self.assertEqual(self.indexer._flying(), set())
 
 
 class TestReprocess(Base):
