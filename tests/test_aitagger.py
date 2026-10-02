@@ -20,13 +20,18 @@ from tests.fake_immich import API_KEY, FakeImmich
 
 # ---------------------------------------------------------------- fakes
 #
-# A "picture" is bytes like  b"wd:girl=0.9,beach=0.6|char:miku=0.8|pixai:beach=0.8|ram:sea=0.7|rating:general=0.9":
+# A "picture" is bytes like  b"wd:girl=0.9,beach=0.6|char:miku=0.8|pixai:beach=0.8|ram:sea=0.7|e621:anthro=0.9|rating:general=0.9":
 # what the tagger would answer for it. An asset's captures are separated by ";" in the catalogue's `preview`.
 # Parts: wd (WD general), char (WD character), rating (WD rating), pixai (PixAI general), pchar (PixAI character),
 # copy (PixAI copyright), prating (PixAI rating; left out, PixAI says nothing about the rating), ram (RAM++, the real
-# third tagger: ``{"general": {...}}``, no characters, no rating) and, for the fake FOURTH tagger ``EXTRA`` below (it is
-# registered only by ``with_extra``): extra (general), echar (character), erating (rating). A picture that has no
-# ``ram:`` part is one RAM++ names nothing in (as on most illustration).
+# third tagger: ``{"general": {...}}``, no characters, no rating), e621 (Hydra 3.5, the real fourth tagger: general),
+# e6species, e6char, e6copy (its species, character and copyright categories; it has no rating) and, for the fake FIFTH
+# tagger ``EXTRA`` below (it is registered only by ``with_extra``): extra (general), echar (character), erating (rating).
+# A picture that has no ``ram:`` part is one RAM++ names nothing in (as on most illustration); the same goes for
+# ``e621:`` and the other e621 parts: Hydra answers (with four empty categories) but names nothing.
+# The real service is asked for ``at.FLOOR`` (0.2) and never sends a tag score below it; this fake does not drop
+# them, so a fixture score below 0.2 stands for scores stored when the floor was 0.05: nothing under 0.2 is kept or
+# listed today either way (the strictness limits start at 0.2).
 
 PHOTO = ("wd:girl=0.9,beach=0.6,solo=0.8,hat=0.3|char:miku=0.8|pixai:beach=0.8,sea=0.7,wave=0.4|"
          "rating:general=0.9,sensitive=0.08,questionable=0.01,explicit=0.01")
@@ -37,19 +42,27 @@ CLIP = ";".join(["wd:dog=0.9|pixai:dog=0.9,car=0.6|rating:general=0.9",
 # PHOTO as RAM++ sees it: it names the sea again and adds what the anime taggers have no word for. "image" and "catch"
 # are two of its noise words (never kept); "wave" is 0.3: shown on the Test card, not kept.
 RAM_PHOTO = PHOTO + "|ram:sea=0.95,lake=0.9,screenshot=0.6,wave=0.3,image=0.9,catch=0.8"
+# What Hydra (e621) says about a furry picture: its general tags (``mammal`` is its noise word: it lands on every human
+# and animal), species, one character and one series (copyright). "tail" (0.3), "fox" (0.25) and "loki" (0.3) are below
+# 0.5: listed on the Test card, not kept.
+E621_PARTS = ("e621:anthro=0.95,mammal=0.99,fur=0.6,tail=0.3|e6species:wolf=0.9,canine=0.6,fox=0.25|"
+              "e6char:fenrir=0.8,loki=0.3|e6copy:norse mythology=0.7")
+E621_PHOTO = PHOTO + "|" + E621_PARTS             # PHOTO as Hydra sees it
+ALL_PHOTO = RAM_PHOTO + "|" + E621_PARTS          # ... and as all four taggers see it
 
-# A fourth tagger that exists only in the tests, to prove the registry can grow: off by default, like a new tagger would
-# be. ``with_extra(self)`` registers it on top of the real three for one test and restores the registry afterwards.
+# A fifth tagger that exists only in the tests, to prove the registry can grow: off by default, like a new tagger would
+# be. ``with_extra(self)`` registers it on top of the real four for one test and restores the registry afterwards.
 EXTRA = at.TaggerKind("extra", "extra-tagger-test", ("general", "character"), ("character",), default_on=False)
 EXTRA_ON = at.TaggerKind("extra", "extra-tagger-test", ("general", "character"), ("character",))      # on by default
 EXTRA_NO_RATING = at.TaggerKind("extra", "extra-tagger-test", ("general", "character"), ("character",),
                                 has_rating=False, default_on=False)
 EXTRA_NOISY = at.TaggerKind("extra", "extra-tagger-test", ("general", "character"), ("character",),
                             noise=frozenset({"filler"}))
+REAL = ["wd", "pixai", "ram", "e621"]       # the registry as it ships (hard-coded here on purpose: a new tagger is a decision)
 
 
 def with_extra(test, kind=EXTRA) -> None:
-    """Register the fake fourth tagger for the duration of ``test`` (call it first in setUp)."""
+    """Register the fake fifth tagger for the duration of ``test`` (call it first in setUp)."""
     saved = list(at.TAGGERS)
     at.configure_taggers([*saved, kind])
     test.addCleanup(at.configure_taggers, saved)
@@ -57,18 +70,22 @@ def with_extra(test, kind=EXTRA) -> None:
 
 def read_picture(data: bytes, models=None):
     """(the tagger's answer for this picture, None) or (None, why). ``models`` are the tagger keys that were asked for
-    (None: all of them); the real service answers only for those. RAM++ answers like the real service does: its tags
-    under ``general`` and no rating."""
+    (None: all of them); the real service answers only for those. RAM++ and Hydra answer like the real service does:
+    RAM++'s tags under ``general`` and no rating, Hydra's under ``general``, ``species``, ``character`` and
+    ``copyright`` and no rating."""
     text = data.decode()
     if text == "broken":
         return None, "cannot identify image file"
     out = {"wd": {"general": {}, "character": {}, "rating": {}},
            "pixai": {"general": {}, "character": {}, "copyright": {}, "rating": {}},
            "ram": {"general": {}},
+           "e621": {"general": {}, "species": {}, "character": {}, "copyright": {}},
            "extra": {"general": {}, "character": {}, "rating": {}}}
     where = {"wd": ("wd", "general"), "char": ("wd", "character"), "rating": ("wd", "rating"),
              "pixai": ("pixai", "general"), "pchar": ("pixai", "character"), "copy": ("pixai", "copyright"),
              "prating": ("pixai", "rating"), "ram": ("ram", "general"),
+             "e621": ("e621", "general"), "e6species": ("e621", "species"), "e6char": ("e621", "character"),
+             "e6copy": ("e621", "copyright"),
              "extra": ("extra", "general"), "echar": ("extra", "character"), "erating": ("extra", "rating")}
     for part in filter(None, text.split("|")):
         key, _, rest = part.partition(":")
@@ -373,10 +390,13 @@ class TestSettings(Base):
         s = at.load_settings()
         self.assertEqual(s, at.DEFAULTS)
         self.assertEqual((s["video_frames"], s["batch_size"], s["vram_gb"]), (6, 8, at.VRAM_GB_DEFAULT))
-        self.assertEqual((s["use_wd"], s["use_pixai"], s["use_ram"]), (True, True, True))         # the three, all on
-        self.assertEqual((s["wd_strictness"], s["pixai_strictness"], s["ram_strictness"]), (0.5, 0.5, 0.5))
-        self.assertEqual(at.VRAM_GB_LIMITS, (4, 8))                       # three taggers do not load under ~3.5 GB
+        self.assertEqual((s["use_wd"], s["use_pixai"], s["use_ram"], s["use_e621"]), (True,) * 4)       # the four, all on
+        self.assertEqual((s["wd_strictness"], s["pixai_strictness"], s["ram_strictness"], s["e621_strictness"]),
+                         (0.5,) * 4)
+        self.assertEqual(s["vram_gb"], 6)                                 # four taggers: 6 GB is full speed
+        self.assertEqual(at.VRAM_GB_LIMITS, (5, 8))                       # four taggers do not load under ~5 GB
         self.assertTrue(at.VRAM_GB_LIMITS[0] <= s["vram_gb"] <= at.VRAM_GB_LIMITS[1])
+        self.assertEqual({k for k in s if k.startswith("use_")}, {f"use_{key}" for key in REAL})
         for gone in ("describe", "instructions", "language", "vlm_parallel"):
             self.assertNotIn(gone, s)
         self.assertEqual((s["indexing"], s["keep_updated"], s["write_tags"], s["vocabulary"]), (False, True, False, ""))
@@ -389,6 +409,9 @@ class TestSettings(Base):
                          ("wd_strictness", True), ("wd_strictness", float("nan")), ("pixai_strictness", None),
                          ("use_ram", "true"), ("use_ram", 1), ("ram_strictness", "0.5"), ("ram_strictness", True),
                          ("ram_strictness", float("inf")),
+                         ("use_e621", "true"), ("use_e621", 1), ("use_e621", None), ("e621_strictness", "0.5"),
+                         ("e621_strictness", True), ("e621_strictness", None), ("e621_strictness", float("nan")),
+                         ("e621_strictness", float("inf")),
                          ("vocabulary", 5), ("vocabulary", "a -> b\n" * 3000), ("vocabulary", ["a"]), ("blocked", "cat"),
                          ("blocked", [1]), ("rules", {}), ("nope", 1)]:
             with self.assertRaises(ValueError, msg=f"{key}={bad!r}"):
@@ -398,20 +421,37 @@ class TestSettings(Base):
                               "ram_strictness": 1 - 0.3, "use_ram": False}, self.store)
         self.assertEqual((s["video_frames"], s["wd_strictness"], s["pixai_strictness"], s["use_pixai"]), (2, 0.5, 0.9, False))
         self.assertEqual((s["ram_strictness"], s["use_ram"]), (0.7, False))
+        s = at.save_settings({"e621_strictness": 1 - 0.3, "use_e621": False}, self.store)
+        self.assertEqual((s["e621_strictness"], s["use_e621"]), (0.7, False))
         self.assertIsInstance(s["video_frames"], int)
         self.assertEqual(at.save_settings({"wd_strictness": 1 - 0.5}, self.store)["wd_strictness"], 0.5)
 
     def test_limits(self):
-        for key, lo, hi in [("video_frames", 1, 8), ("batch_size", 1, 64), ("vram_gb", *at.VRAM_GB_LIMITS),
-                            ("max_tags", 5, 100), ("wd_strictness", 0.05, 0.95), ("pixai_strictness", 0.05, 0.95),
-                            ("ram_strictness", 0.05, 0.95)]:
+        for key, lo, hi in [("video_frames", 1, 8), ("batch_size", 1, 64), ("vram_gb", 5, 8),
+                            ("max_tags", 5, 100), ("wd_strictness", 0.2, 0.95), ("pixai_strictness", 0.2, 0.95),
+                            ("ram_strictness", 0.2, 0.95), ("e621_strictness", 0.2, 0.95)]:
             self.assertEqual(at.LIMITS[key], (lo, hi))
             for ok in (lo, hi):
                 self.assertEqual(at.save_settings({key: ok}, self.store)[key], ok)
-            for bad in (lo - 0.5 if isinstance(lo, float) else lo - 1, hi + 1):
-                with self.assertRaises(ValueError):
+            for bad in (lo - 0.01 if isinstance(lo, float) else lo - 1, hi + 0.01 if isinstance(hi, float) else hi + 1):
+                with self.assertRaises(ValueError, msg=f"{key}={bad}"):
+                    at.save_settings({key: bad}, self.store)
+        self.assertEqual(at.VRAM_GB_LIMITS, (5, 8))
+        for key in ("wd_strictness", "e621_strictness"):                           # 0.05 and 0.1 were fine before the floor rose
+            for bad in (0.05, 0.1, 0.19):
+                with self.assertRaises(ValueError, msg=f"{key}={bad}"):
                     at.save_settings({key: bad}, self.store)
         self.assertNotIn("vlm_parallel", at.LIMITS)
+
+    def test_the_floor_the_tagger_is_asked_for_is_the_lowest_a_threshold_can_be(self):
+        # at 0.05 RAM++ alone sent ~4,400 tags per picture and every one was stored: nothing under 0.2 is asked for,
+        # kept or listed, so no strictness can be lower than what the service sends
+        self.assertEqual((at.FLOOR, at.DISPLAY_FLOOR, at.STRICTNESS), (0.2, 0.2, (0.2, 0.95)))
+        self.assertGreaterEqual(at.STRICTNESS[0], at.FLOOR)
+        self.assertGreaterEqual(at.STRICTNESS[0], at.DISPLAY_FLOOR)
+        for kind in at.TAGGERS:
+            self.assertEqual(at.LIMITS[f"{kind.key}_strictness"], at.STRICTNESS)
+            self.assertGreaterEqual(at.DEFAULTS[f"{kind.key}_strictness"], at.FLOOR)
 
     def test_one_bad_change_saves_nothing(self):
         with self.assertRaises(ValueError):
@@ -426,7 +466,7 @@ class TestSettings(Base):
     def test_the_version_goes_up_only_for_content_settings(self):
         self.assertEqual(self.store.settings_version, 1)
         for changes in ({"indexing": True}, {"keep_updated": False}, {"batch_size": 4},
-                        {"vram_gb": at.VRAM_GB_LIMITS[0] + 1}):
+                        {"vram_gb": at.VRAM_GB_LIMITS[1]}):
             self.assertEqual(self.set(**changes), [])
         self.assertEqual(self.store.settings_version, 1)
         self.assertEqual(self.set(max_tags=12), ["max_tags"])
@@ -438,7 +478,7 @@ class TestSettings(Base):
         self.assertEqual(self.store.settings_version, 3)               # one bump per save
         for key, value in [("video_frames", 2), ("use_wd", False), ("use_pixai", True), ("wd_strictness", 0.7),
                            ("pixai_strictness", 0.6), ("use_ram", False), ("ram_strictness", 0.6),
-                           ("character_tags", False), ("rating_tag", False),
+                           ("use_e621", False), ("e621_strictness", 0.6), ("character_tags", False), ("rating_tag", False),
                            ("vocabulary", "a -> c"), ("blocked", ["cat"]),
                            ("rules", [rule(if_all=["a"], add=["b"])]), ("write_tags", True)]:
             before = self.store.settings_version
@@ -529,6 +569,7 @@ class TestSettings(Base):
         self.assertEqual((s["use_ram"], s["ram_strictness"], s["use_wd"], s["wd_strictness"]), (False, 0.9, False, 0.6))
         self.assertEqual((s["max_tags"], s["vocabulary"], s["blocked"], s["write_tags"]), (12, "a -> b", ["cat"], True))
         self.assertEqual((s["use_pixai"], s["pixai_strictness"]), (True, 0.5))             # v1 had no PixAI: the default
+        self.assertEqual((s["use_e621"], s["e621_strictness"]), (True, 0.5))               # nor Hydra: on, as new
         self.assertEqual(s["vram_gb"], at.VRAM_GB_DEFAULT)                                 # 20 is out of range now: default
         self.assertEqual(set(s), set(at.DEFAULTS))                                         # the describer keys are dropped
         for gone in ("describe", "instructions", "language", "vlm_parallel"):
@@ -548,15 +589,31 @@ class TestSettings(Base):
         bad = at.load_settings()
         self.assertEqual((bad["use_ram"], bad["ram_strictness"], bad["max_tags"]), (True, 0.5, 12))
 
-    def test_a_v2_vram_cap_below_the_new_lower_limit_falls_back_to_the_default(self):
-        # v2 allowed 3-8; with three taggers 3 no longer loads (docs: "default 5, limits 4-8")
+    def test_a_vram_cap_below_the_new_lower_limit_falls_back_to_the_default(self):
+        # v2 allowed 3-8, v3 with three taggers 4-8 (default 5); with four taggers 4 no longer loads: 5-8, default 6
         at.settings_path().write_text(json.dumps({"vram_gb": 3, "max_tags": 12}))
         s = at.load_settings()
-        self.assertEqual((s["vram_gb"], s["max_tags"]), (at.VRAM_GB_DEFAULT, 12))
-        at.settings_path().write_text(json.dumps({"vram_gb": 4}))
-        self.assertEqual(at.load_settings()["vram_gb"], 4)
-        with self.assertRaises(ValueError):
-            at.save_settings({"vram_gb": 3}, self.store)
+        self.assertEqual((s["vram_gb"], s["max_tags"]), (6, 12))
+        at.settings_path().write_text(json.dumps({"vram_gb": 4}))                    # a stored v3 value
+        self.assertEqual(at.load_settings()["vram_gb"], 6)
+        for kept in (5, 6, 8):
+            at.settings_path().write_text(json.dumps({"vram_gb": kept}))
+            self.assertEqual(at.load_settings()["vram_gb"], kept)
+        at.settings_path().write_text(json.dumps({"vram_gb": 9}))
+        self.assertEqual(at.load_settings()["vram_gb"], 6)
+        for bad in (3, 4, 9):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                at.save_settings({"vram_gb": bad}, self.store)
+        self.assertEqual(at.save_settings({"vram_gb": 5}, self.store)["vram_gb"], 5)
+
+    def test_a_threshold_below_the_new_lower_limit_falls_back_to_the_default(self):
+        # the floor went from 0.05 to 0.2: a strictness saved under the old limits (0.05-0.95) below it is not valid now
+        at.settings_path().write_text(json.dumps({"wd_strictness": 0.1, "pixai_strictness": 0.2, "ram_strictness": 0.05,
+                                                  "e621_strictness": 0.19, "max_tags": 12}))
+        s = at.load_settings()
+        self.assertEqual((s["wd_strictness"], s["pixai_strictness"], s["ram_strictness"], s["e621_strictness"]),
+                         (0.5, 0.2, 0.5, 0.5))
+        self.assertEqual(s["max_tags"], 12)
 
     def test_a_settings_file_from_v2_with_the_describer_keys_still_loads(self):
         v2 = {"indexing": True, "keep_updated": False, "video_frames": 2, "batch_size": 4, "vlm_parallel": 8, "vram_gb": 6,
@@ -573,6 +630,8 @@ class TestSettings(Base):
         self.assertEqual((s["use_pixai"], s["pixai_strictness"], s["vocabulary"], s["write_tags"]),
                          (False, 0.4, "1girl -> woman\nthe lake house", True))      # everything else is read as it was
         self.assertEqual((s["use_ram"], s["ram_strictness"]), (True, 0.5))           # v2 knew no RAM++: it is on, as new
+        self.assertEqual((s["use_e621"], s["e621_strictness"]), (True, 0.5))         # nor Hydra
+        self.assertEqual(s["vram_gb"], 6)                                              # 6 is inside 5-8: kept
         saved = at.save_settings({"max_tags": 13}, self.store)           # saving cleans the file up
         self.assertEqual(saved["max_tags"], 13)
         self.assertEqual(set(json.loads(at.settings_path().read_text("utf-8"))), set(at.DEFAULTS))
@@ -592,6 +651,8 @@ class TestSettings(Base):
         self.assertEqual(at.suggest_mode(["pixai_strictness"]), "retag")
         self.assertEqual(at.suggest_mode(["use_ram"]), "full")                          # which taggers run changes the scores
         self.assertEqual(at.suggest_mode(["ram_strictness"]), "retag")                  # a threshold re-applies to stored ones
+        self.assertEqual(at.suggest_mode(["use_e621"]), "full")
+        self.assertEqual(at.suggest_mode(["e621_strictness"]), "retag")
         self.assertEqual(at.suggest_mode(["batch_size"]), "none")
         self.assertEqual(set(at.REPROCESS), {"retag", "full"})                           # no describe mode any more
         every = {k for keys in at.REPROCESS.values() for k in keys}
@@ -614,9 +675,9 @@ class TestSettings(Base):
 class TestTaggerRegistry(Base):
     """The registry ``TAGGERS``: settings, limits and modes are generated from it, nothing else names a tagger."""
 
-    def test_wd_pixai_and_ram_are_registered(self):
-        self.assertEqual([k.key for k in at.TAGGERS], ["wd", "pixai", "ram"])
-        wd, pixai, ram = at.TAGGERS
+    def test_wd_pixai_ram_and_e621_are_registered(self):
+        self.assertEqual([k.key for k in at.TAGGERS], REAL)
+        wd, pixai, ram, e621 = at.TAGGERS
         self.assertEqual((wd.label, wd.categories, wd.character_categories, wd.has_rating, wd.default_on, wd.noise),
                          ("wd-eva02-large-tagger-v3", ("general", "character"), ("character",), True, True, frozenset()))
         self.assertEqual((pixai.label, pixai.categories, pixai.character_categories, pixai.has_rating, pixai.default_on,
@@ -627,25 +688,44 @@ class TestTaggerRegistry(Base):
         self.assertEqual((ram.label, ram.categories, ram.character_categories, ram.has_rating, ram.default_on),
                          ("RAM++ (swin-large)", ("general",), (), False, True))
         self.assertEqual(ram.noise, frozenset({"image", "catch", "peak", "miss", "take", "wear", "label"}))
+        # Hydra 3.5, the e621 vocabulary: four categories (species is its own), the series and characters are the ones
+        # `character_tags` switches off; no rating; on by default; "mammal" (it lands on every human) is noise
+        self.assertEqual((e621.label, e621.categories, e621.character_categories, e621.has_rating, e621.default_on,
+                          e621.noise),
+                         ("Hydra 3.5 (e621)", ("general", "species", "character", "copyright"), ("character", "copyright"),
+                          False, True, frozenset({"mammal"})))
         self.assertEqual(at.model_labels(), {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0",
-                                             "ram": "RAM++ (swin-large)"})
-        self.assertEqual(list(at.model_labels()), ["wd", "pixai", "ram"])               # in registry order
-        self.assertEqual([k.key for k in at.enabled_kinds(at.DEFAULTS)], ["wd", "pixai", "ram"])
-        self.assertEqual([k.key for k in at.enabled_kinds({**at.DEFAULTS, "use_pixai": False})], ["wd", "ram"])
-        self.assertEqual(at.enabled_kinds({**at.DEFAULTS, "use_wd": False, "use_pixai": False, "use_ram": False}), [])
+                                             "ram": "RAM++ (swin-large)", "e621": "Hydra 3.5 (e621)"})
+        self.assertEqual(list(at.model_labels()), REAL)                                  # in registry order
+        self.assertEqual([k.key for k in at.enabled_kinds(at.DEFAULTS)], REAL)
+        self.assertEqual([k.key for k in at.enabled_kinds({**at.DEFAULTS, "use_pixai": False})], ["wd", "ram", "e621"])
+        self.assertEqual([k.key for k in at.enabled_kinds({**at.DEFAULTS, "use_e621": False})], ["wd", "pixai", "ram"])
+        self.assertEqual([k.key for k in at.enabled_kinds({**at.DEFAULTS, "use_wd": False, "use_ram": False})],
+                         ["pixai", "e621"])
+        self.assertEqual(at.enabled_kinds({k: False if k.startswith("use_") else v for k, v in at.DEFAULTS.items()}), [])
 
-    def test_only_ram_has_noise_words_and_they_are_normalised(self):
+    def test_only_ram_and_e621_have_noise_words_and_they_are_normalised(self):
         for kind in at.TAGGERS:
             for word in kind.noise:
                 self.assertEqual(at.norm_tag(word), word, f"{kind.key}: noise words are compared after normalising")
-        self.assertEqual([k.key for k in at.TAGGERS if k.noise], ["ram"])
+        self.assertEqual([k.key for k in at.TAGGERS if k.noise], ["ram", "e621"])
+
+    def test_only_the_taggers_that_name_a_rating_have_one(self):
+        self.assertEqual([k.key for k in at.TAGGERS if k.has_rating], ["wd", "pixai"])      # ram and e621 never take part
+
+    def test_only_hydra_has_a_species_category_and_only_the_two_character_ones_are_switched_off(self):
+        self.assertEqual([k.key for k in at.TAGGERS if "species" in k.categories], ["e621"])
+        self.assertNotIn("species", [c for k in at.TAGGERS for c in k.character_categories])
+        self.assertEqual({k.key: k.character_categories for k in at.TAGGERS},
+                         {"wd": ("character",), "pixai": ("character", "copyright"), "ram": (),
+                          "e621": ("character", "copyright")})
 
     def test_every_tagger_has_generated_settings_limits_and_modes(self):
         for kind in at.TAGGERS:
             use, strict = f"use_{kind.key}", f"{kind.key}_strictness"
             self.assertIs(at.DEFAULTS[use], kind.default_on)
             self.assertEqual(at.DEFAULTS[strict], 0.5)
-            self.assertEqual(at.LIMITS[strict], (0.05, 0.95))
+            self.assertEqual(at.LIMITS[strict], (0.2, 0.95))
             self.assertNotIn(use, at.LIMITS)
             self.assertIn(use, at.CONTENT)
             self.assertIn(strict, at.CONTENT)
@@ -655,23 +735,23 @@ class TestTaggerRegistry(Base):
             self.assertNotIn(strict, at.REPROCESS["full"])
         self.assertEqual(at.suggest_mode(["use_wd", "wd_strictness"]), "full")
 
-    def test_a_fourth_tagger_gets_its_settings_without_any_other_change(self):
+    def test_a_fifth_tagger_gets_its_settings_without_any_other_change(self):
         with_extra(self)
-        self.assertEqual([k.key for k in at.TAGGERS], ["wd", "pixai", "ram", "extra"])
+        self.assertEqual([k.key for k in at.TAGGERS], [*REAL, "extra"])
         self.assertEqual((at.DEFAULTS["use_extra"], at.DEFAULTS["extra_strictness"]), (False, 0.5))      # off by default
-        self.assertEqual(at.LIMITS["extra_strictness"], (0.05, 0.95))
+        self.assertEqual(at.LIMITS["extra_strictness"], (0.2, 0.95))
         self.assertIn("use_extra", at.CONTENT)
         self.assertIn("extra_strictness", at.CONTENT)
         self.assertIn("use_extra", at.REPROCESS["full"])
         self.assertIn("extra_strictness", at.REPROCESS["retag"])
         self.assertEqual(at.model_labels()["extra"], "extra-tagger-test")
-        self.assertEqual(list(at.model_labels()), ["wd", "pixai", "ram", "extra"])
+        self.assertEqual(list(at.model_labels()), [*REAL, "extra"])
         s = at.load_settings()
         self.assertEqual((s["use_extra"], s["extra_strictness"]), (False, 0.5))
         self.assertEqual(set(s), set(at.DEFAULTS))
         # validation is the same as for the others
         for key, bad in [("use_extra", "yes"), ("use_extra", 1), ("extra_strictness", "0.5"), ("extra_strictness", True),
-                         ("extra_strictness", 0.04), ("extra_strictness", 0.96), ("extra_strictness", float("inf"))]:
+                         ("extra_strictness", 0.19), ("extra_strictness", 0.96), ("extra_strictness", float("inf"))]:
             with self.assertRaises(ValueError, msg=f"{key}={bad!r}"):
                 at.save_settings({key: bad}, self.store)
         self.assertEqual(self.set(use_extra=True, extra_strictness=0.7), ["use_extra", "extra_strictness"])
@@ -679,20 +759,20 @@ class TestTaggerRegistry(Base):
         self.assertEqual(at.suggest_mode(["extra_strictness"]), "retag")
         saved = at.load_settings()
         self.assertEqual((saved["use_extra"], saved["extra_strictness"]), (True, 0.7))
-        self.assertEqual([k.key for k in at.enabled_kinds(saved)], ["wd", "pixai", "ram", "extra"])
-        self.assertEqual([k.key for k in at.enabled_kinds({**saved, "use_pixai": False})], ["wd", "ram", "extra"])
-        self.assertEqual([k.key for k in at.enabled_kinds({**saved, "use_ram": False})], ["wd", "pixai", "extra"])
+        self.assertEqual([k.key for k in at.enabled_kinds(saved)], [*REAL, "extra"])
+        self.assertEqual([k.key for k in at.enabled_kinds({**saved, "use_pixai": False})], ["wd", "ram", "e621", "extra"])
+        self.assertEqual([k.key for k in at.enabled_kinds({**saved, "use_e621": False})], ["wd", "pixai", "ram", "extra"])
         every = {k for keys in at.REPROCESS.values() for k in keys}
         self.assertEqual(every, set(at.CONTENT))
 
-    def test_a_fourth_tagger_can_be_added_and_removed_and_the_registry_is_restored(self):
+    def test_a_fifth_tagger_can_be_added_and_removed_and_the_registry_is_restored(self):
         saved = list(at.TAGGERS)
         registry = at.TAGGERS                                      # the list itself: what other code refers to
         defaults, limits, content = dict(at.DEFAULTS), dict(at.LIMITS), at.CONTENT
         reprocess = {mode: tuple(keys) for mode, keys in at.REPROCESS.items()}
         at.configure_taggers([*saved, EXTRA])                      # added ...
         self.assertIs(at.TAGGERS, registry)
-        self.assertEqual([k.key for k in at.TAGGERS], ["wd", "pixai", "ram", "extra"])
+        self.assertEqual([k.key for k in at.TAGGERS], [*REAL, "extra"])
         self.assertEqual(set(at.DEFAULTS) - set(defaults), {"use_extra", "extra_strictness"})
         self.assertEqual(set(at.LIMITS) - set(limits), {"extra_strictness"})
         self.assertEqual(set(at.CONTENT) - set(content), {"use_extra", "extra_strictness"})
@@ -704,7 +784,7 @@ class TestTaggerRegistry(Base):
         self.assertNotIn("extra_strictness", at.LIMITS)
         with self.assertRaises(ValueError):
             at.save_settings({"use_extra": True}, self.store)
-        self.assertIn("use_ram", at.DEFAULTS)                      # the real three were never touched
+        self.assertIn("use_e621", at.DEFAULTS)                     # the real four were never touched
         # rebuilding the tables without changing the registry changes nothing either
         at.configure_taggers()
         self.assertEqual((at.TAGGERS, dict(at.DEFAULTS), at.CONTENT), (saved, defaults, content))
@@ -719,7 +799,15 @@ class TestTaggerRegistry(Base):
     def test_a_tagger_can_be_taken_out_of_the_registry_too(self):
         saved = list(at.TAGGERS)
         self.addCleanup(at.configure_taggers, saved)
-        at.configure_taggers(saved[:2])                            # no RAM++
+        at.configure_taggers(saved[:3])                            # no Hydra
+        self.assertEqual([k.key for k in at.TAGGERS], ["wd", "pixai", "ram"])
+        self.assertNotIn("use_e621", at.DEFAULTS)
+        self.assertNotIn("e621_strictness", at.CONTENT)
+        self.assertNotIn("e621_strictness", at.LIMITS)
+        self.assertEqual(list(at.model_labels()), ["wd", "pixai", "ram"])
+        with self.assertRaises(ValueError):
+            at.save_settings({"use_e621": False}, self.store)
+        at.configure_taggers(saved[:2])                            # no RAM++ either
         self.assertEqual([k.key for k in at.TAGGERS], ["wd", "pixai"])
         self.assertNotIn("use_ram", at.DEFAULTS)
         self.assertNotIn("ram_strictness", at.CONTENT)
@@ -821,7 +909,7 @@ class TestAggregation(unittest.TestCase):
         self.assertAlmostEqual(found["display"]["rating"]["general"], 0.4)                  # (.2 + .6) / 2; the bad capture is no vote
         self.assertAlmostEqual(found["tags"]["rating: explicit"][0], 0.6)                   # (.8 + .4) / 2
         self.assertEqual(raw["ratings"], [{"wd": {"general": 0.2, "explicit": 0.8}, "pixai": {"general": 0.6, "explicit": 0.4},
-                                           "ram": None}])
+                                           "ram": None, "e621": None}])
 
     def test_models_and_character_tags_can_be_switched_off(self):
         raw = raw_of(PHOTO)
@@ -873,9 +961,21 @@ class TestAggregation(unittest.TestCase):
         self.assertEqual(wd["hat"]["score"], 0.3)
         self.assertEqual([t["score"] for t in shown["wd"]], sorted((t["score"] for t in shown["wd"]), reverse=True))
         self.assertIn("wave", {t["tag"] for t in shown["pixai"]})
-        self.assertEqual(set(shown), {"wd", "pixai", "ram", "rating"})          # RAM++ has a list too: PHOTO has none for it
-        self.assertEqual(shown["ram"], [])
+        self.assertEqual(set(shown), {"wd", "pixai", "ram", "e621", "rating"})  # RAM++ and Hydra have a list too: PHOTO has none
+        self.assertEqual((shown["ram"], shown["e621"]), ([], []))
         self.assertEqual(shown["rating"]["general"], 0.9)
+
+    def test_scores_stored_under_the_old_floor_are_never_kept_or_listed(self):
+        # a store made when the floor was 0.05 holds scores down there (RAM++ alone sent ~4,400 tags per picture): with
+        # the strictness at its lowest, 0.2, nothing below 0.2 is kept, and the Test card lists from 0.2 up
+        raw = raw_of("wd:a=0.19,b=0.9,c=0.05|pixai:d=0.1|ram:e=0.05,f=0.15,g=0.2|e621:h=0.19,i=0.2|e6species:j=0.04|"
+                     "rating:general=0.9")
+        lowest = {f"{kind.key}_strictness": at.STRICTNESS[0] for kind in at.TAGGERS}
+        self.assertEqual(set(lowest.values()), {0.2})
+        found = at.detect(raw, S(rating_tag=False, **lowest))
+        self.assertEqual(set(found["tags"]), {"b", "g", "i"})                  # g and i are exactly 0.2: kept
+        listed = {key: {t["tag"] for t in found["display"][key]} for key in REAL}
+        self.assertEqual(listed, {"wd": {"b"}, "pixai": set(), "ram": {"g"}, "e621": {"i"}})
 
     def test_a_capture_the_tagger_could_not_read_is_not_a_vote(self):
         raw = at.raw_from_results([read_picture(b"pixai:dog=0.9")[0], None], [None, "cannot identify image file"])
@@ -1122,6 +1222,43 @@ class TestSexualTagsNeedAgreement(unittest.TestCase):
         got = self.tags(self.EVERYDAY, vocabulary="oral -> mouth stuff")
         self.assertNotIn("mouth stuff", got["tags"])
 
+    def test_hydra_votes_like_any_other_tagger(self):
+        # WD and Hydra agree (PixAI does not name it): kept
+        got = self.tags("wd:door=0.9,oral=0.9|pixai:door=0.9|e621:oral=0.8,door=0.9|rating:general=0.9")
+        self.assertIn("oral", got["tags"])
+        self.assertNotIn("dropped", got["display"])
+        # Hydra alone is not enough, and neither is anyone else alone when Hydra is on
+        got = self.tags("wd:door=0.9|pixai:door=0.9|e621:oral=0.9,door=0.9|rating:general=0.9")
+        self.assertNotIn("oral", got["tags"])
+        self.assertEqual(got["display"]["dropped"], ["oral"])
+        got = self.tags("wd:door=0.9|pixai:oral=0.9,door=0.9|e621:door=0.9|rating:general=0.9")
+        self.assertNotIn("oral", got["tags"])
+        # PixAI and Hydra agree without WD; Hydra counts only while it is on
+        picture = "wd:door=0.9|pixai:oral=0.9,door=0.9|e621:oral=0.8|rating:general=0.9"
+        self.assertIn("oral", self.tags(picture)["tags"])
+        self.assertNotIn("oral", self.tags(picture, use_e621=False)["tags"])
+        # an explicit rating still keeps everything
+        self.assertIn("oral", self.tags("wd:oral=0.9|e621:door=0.9|rating:explicit=0.9")["tags"])
+
+    def test_hydra_confirms_by_its_own_strictness_and_with_the_categories_that_are_on(self):
+        picture = "wd:oral=0.9,door=0.9|pixai:door=0.9|e621:oral=0.3,door=0.9|rating:general=0.9"
+        self.assertNotIn("oral", self.tags(picture)["tags"])                       # 0.3 is below Hydra's 0.5
+        self.assertIn("oral", self.tags(picture, e621_strictness=0.25)["tags"])
+        # a name in Hydra's character category votes only while character tags are on
+        picture = "wd:oral=0.9,door=0.9|pixai:door=0.9|e6char:oral=0.9|rating:general=0.9"
+        self.assertIn("oral", self.tags(picture)["tags"])
+        self.assertNotIn("oral", self.tags(picture, character_tags=False)["tags"])
+
+    def test_a_rename_lets_two_vocabularies_agree_on_the_same_tag(self):
+        # WD says "fellatio", Hydra says "oral sex": two names, one vote each, and "oral sex" is not on the explicit list
+        picture = "wd:door=0.9,fellatio=0.9|pixai:door=0.9|e621:oral sex=0.8,door=0.9|rating:general=0.9"
+        got = self.tags(picture)
+        self.assertNotIn("fellatio", got["tags"])
+        self.assertIn("oral sex", got["tags"])
+        got = self.tags(picture, vocabulary="oral sex -> fellatio")                # now both say fellatio: two votes
+        self.assertEqual(got["tags"]["fellatio"], (0.9, "wd"))
+        self.assertNotIn("dropped", got["display"])
+
 
 V1_RAM = {"beach": 0.8, "sea": 0.6, "wave": 0.3, "image": 0.9}       # what the v1 service stored for RAM++: flat
 
@@ -1197,7 +1334,7 @@ class TestRamPlusPlus(unittest.TestCase):
         # and a rating in the service's answer for it is not stored
         stored = at.raw_from_results([{"wd": {"general": {"a": 0.9}, "character": {}, "rating": {"general": 0.8}},
                                        "ram": {"general": {"b": 0.9}, "rating": {"explicit": 0.99}}}], [None])
-        self.assertEqual(stored["ratings"], [{"wd": {"general": 0.8}, "pixai": None, "ram": None}])
+        self.assertEqual(stored["ratings"], [{"wd": {"general": 0.8}, "pixai": None, "ram": None, "e621": None}])
         self.assertEqual(stored["scores"][0]["ram"], {"general": {"b": 0.9}})
         # with RAM++ the only tagger there is no rating at all: no rating tag, nothing on the Test card
         alone = at.detect(raw_of(picture), S(use_wd=False, use_pixai=False))
@@ -1231,7 +1368,7 @@ class TestRamPlusPlus(unittest.TestCase):
         self.assertTrue(ram.noise)
         words = sorted(ram.noise)
         picture = "ram:" + ",".join(f"{w}=0.95" for w in words) + ",sea=0.9,Image=0.9|rating:general=0.9"
-        for strictness in (0.5, 0.05):                                         # not a matter of the threshold
+        for strictness in (0.5, at.STRICTNESS[0]):                             # not a matter of the threshold
             built = at.build(raw_of(picture), S(ram_strictness=strictness))
             names = tags_of(built)
             self.assertEqual(names, ["sea", "rating: general"], strictness)
@@ -1267,38 +1404,197 @@ class TestRamPlusPlus(unittest.TestCase):
         self.assertEqual(set(at.detect(raw, S(rating_tag=False))["tags"]), {"sea"})
 
 
-class TestThreeTaggers(Base):
-    """The real three taggers (wd, pixai, ram), all on: agreement, the rating, the lists, the merge, the stored scores."""
+class TestHydraE621(unittest.TestCase):
+    """The real fourth tagger, Hydra 3.5 (key ``e621``): the furry booru's vocabulary in four categories (general,
+    species, character, copyright), no rating, and ``mammal`` (it lands on every human and animal) as its noise word."""
+
+    ONLY = dict(use_wd=False, use_pixai=False, use_ram=False)          # Hydra on its own
+
+    def kept(self, *pictures, **settings):
+        return dict(at.detect(raw_of(*pictures), S(rating_tag=False, **settings))["tags"])
+
+    def listed(self, picture, **settings):
+        return {t["tag"]: t["kept"] for t in at.detect(raw_of(picture), S(**settings))["display"]["e621"]}
+
+    def test_its_four_categories_pass_its_own_strictness_and_say_e621(self):
+        got = self.kept(E621_PHOTO, **self.ONLY)
+        self.assertEqual(got, {"anthro": (0.95, "e621"), "fur": (0.6, "e621"), "wolf": (0.9, "e621"),
+                               "canine": (0.6, "e621"), "fenrir": (0.8, "e621"), "norse mythology": (0.7, "e621")})
+        low = self.kept(E621_PHOTO, e621_strictness=0.25, **self.ONLY)                     # tail .3, fox .25, loki .3
+        self.assertEqual({t: low[t] for t in ("tail", "fox", "loki")},
+                         {"tail": (0.3, "e621"), "fox": (0.25, "e621"), "loki": (0.3, "e621")})
+        self.assertEqual(set(self.kept(E621_PHOTO, e621_strictness=0.85, **self.ONLY)), {"anthro", "wolf"})
+        self.assertEqual(self.kept(E621_PHOTO, e621_strictness=0.95, **self.ONLY), {"anthro": (0.95, "e621")})
+        # the other taggers' thresholds are not its own: its 0.3 stays below 0.5 while WD's 0.3 and PixAI's 0.4 pass 0.25
+        got = self.kept(E621_PHOTO, wd_strictness=0.25, pixai_strictness=0.25)
+        self.assertEqual((got["hat"], got["wave"]), ((0.3, "wd"), (0.4, "pixai")))
+        self.assertEqual(got.keys() & {"tail", "fox", "loki"}, set())
+        # ... and its own does not move theirs
+        got = self.kept(E621_PHOTO, e621_strictness=0.25)
+        self.assertEqual((got["tail"], got["girl"]), ((0.3, "e621"), (0.9, "wd")))
+        self.assertEqual(got.keys() & {"hat", "wave"}, set())
+
+    def test_it_can_be_switched_off_and_then_says_nothing(self):
+        got = at.detect(raw_of(E621_PHOTO), S(use_e621=False))
+        self.assertEqual(got["display"]["e621"], [])
+        self.assertTrue(all(source != "e621" for _score, source in got["tags"].values()))
+        self.assertEqual(got["tags"].keys() & {"anthro", "wolf", "fenrir", "norse mythology"}, set())
+        self.assertIn("wolf", at.detect(raw_of(E621_PHOTO), S())["tags"])
+
+    def test_the_species_character_and_copyright_categories_are_read_like_general(self):
+        picture = "e621:anthro=0.9|e6species:wolf=0.8|e6char:fenrir=0.7|e6copy:norse mythology=0.6"
+        self.assertEqual(self.kept(picture, **self.ONLY),
+                         {"anthro": (0.9, "e621"), "wolf": (0.8, "e621"), "fenrir": (0.7, "e621"),
+                          "norse mythology": (0.6, "e621")})
+        self.assertEqual(self.listed(picture), {"anthro": True, "wolf": True, "fenrir": True, "norse mythology": True})
+
+    def test_a_tag_in_two_of_its_categories_keeps_the_higher_score(self):
+        self.assertEqual(self.kept("e621:wolf=0.6|e6species:wolf=0.8", **self.ONLY), {"wolf": (0.8, "e621")})
+        self.assertEqual(self.kept("e621:wolf=0.9|e6species:wolf=0.6", **self.ONLY), {"wolf": (0.9, "e621")})
+        # the category that is switched off no longer counts: the lower score of the other one stays
+        self.assertEqual(self.kept("e621:fenrir=0.6|e6char:fenrir=0.8", character_tags=False, **self.ONLY),
+                         {"fenrir": (0.6, "e621")})
+        self.assertEqual(self.kept("e621:fenrir=0.6|e6char:fenrir=0.8", **self.ONLY), {"fenrir": (0.8, "e621")})
+
+    def test_the_highest_score_wins_across_taggers_and_ties_go_to_the_earlier_one(self):
+        got = self.kept("wd:smile=0.7,a=0.6|pixai:smile=0.8|ram:smile=0.85|e621:smile=0.9,a=0.8|rating:general=0.9")
+        self.assertEqual((got["smile"], got["a"]), ((0.9, "e621"), (0.8, "e621")))
+        self.assertEqual(self.kept("wd:smile=0.95|pixai:smile=0.8|ram:smile=0.9|e621:smile=0.9")["smile"], (0.95, "wd"))
+        self.assertEqual(self.kept("wd:smile=0.9|e621:smile=0.9")["smile"], (0.9, "wd"))          # a tie: the earlier one
+        self.assertEqual(self.kept("pixai:smile=0.9|e621:smile=0.9")["smile"], (0.9, "pixai"))
+        self.assertEqual(self.kept("ram:smile=0.9|e621:smile=0.9")["smile"], (0.9, "ram"))
+        self.assertEqual(self.kept("wd:woman=0.9|e621:woman=0.9", vocabulary="woman -> lady")["lady"], (0.9, "wd"))
+
+    def test_character_tags_gate_its_characters_and_series_but_not_its_species(self):
+        picture = "e621:anthro=0.9|e6species:wolf=0.9|e6char:fenrir=0.9|e6copy:norse mythology=0.9"
+        self.assertEqual(self.kept(picture, **self.ONLY).keys(), {"anthro", "wolf", "fenrir", "norse mythology"})
+        self.assertEqual(self.kept(picture, character_tags=False, **self.ONLY).keys(), {"anthro", "wolf"})
+        # the Test card follows the same switch
+        self.assertEqual(self.listed(picture).keys(), {"anthro", "wolf", "fenrir", "norse mythology"})
+        self.assertEqual(self.listed(picture, character_tags=False).keys(), {"anthro", "wolf"})
+        # one switch for every tagger's characters and series
+        everyone = ("wd:girl=0.9|char:miku=0.9|pixai:smile=0.9|pchar:rin=0.9|copy:vocaloid=0.9|ram:sea=0.9|" + picture)
+        self.assertEqual(self.kept(everyone).keys(), {"girl", "miku", "smile", "rin", "vocaloid", "sea", "anthro", "wolf",
+                                                      "fenrir", "norse mythology"})
+        self.assertEqual(self.kept(everyone, character_tags=False).keys(), {"girl", "smile", "sea", "anthro", "wolf"})
+
+    def test_mammal_never_shows(self):
+        # it is on every human and animal, so it says nothing: not a tag, not on the Test card, not in the block,
+        # whatever the threshold, and whichever of its categories it comes in
+        picture = "e621:mammal=0.99,anthro=0.9|e6species:Mammal=0.95,wolf=0.9|e6char:mammal=0.9|rating:general=0.9"
+        for strictness in (0.5, at.STRICTNESS[0]):
+            with self.subTest(strictness=strictness):
+                built = at.build(raw_of(picture), S(e621_strictness=strictness))
+                self.assertEqual(tags_of(built), ["anthro", "wolf", "rating: general"])
+                self.assertEqual(built["block"], "[AI Tagger]\nTags: anthro, wolf, rating: general\n[/AI Tagger]")
+                self.assertEqual({t["tag"] for t in built["models"]["e621"]}, {"anthro", "wolf"})
+        # stored in full (it is dropped when tags are made, not when scores are stored), and exactly its word
+        raw = raw_of(picture)
+        self.assertEqual(raw["scores"][0]["e621"]["general"], {"mammal": 0.99, "anthro": 0.9})
+        self.assertEqual(self.kept("e621:mammals=0.9,mammal like=0.9", **self.ONLY).keys(), {"mammals", "mammal like"})
+        # the same word from the other taggers is a tag like any other, and Hydra's .99 never counts against theirs
+        got = self.kept("wd:mammal=0.8|pixai:mammal=0.85|ram:mammal=0.7|e621:mammal=0.99")
+        self.assertEqual(got, {"mammal": (0.85, "pixai")})
+        self.assertEqual(self.kept("e621:mammal=0.99", **self.ONLY), {})
+
+    def test_it_reports_no_rating_so_it_never_takes_part_in_it(self):
+        # general: wd .9, pixai .3 -> .6; explicit: wd .1, pixai .7 -> .4 (Hydra has no rating to add)
+        picture = "wd:a=0.9|rating:general=0.9,explicit=0.1|prating:general=0.3,explicit=0.7|e621:b=0.9"
+        got = at.detect(raw_of(picture), S())
+        self.assertEqual(got["display"]["rating"], {"general": 0.6, "explicit": 0.4})
+        self.assertEqual((got["tags"]["rating: general"][1], round(got["tags"]["rating: general"][0], 3)), ("wd", 0.6))
+        self.assertEqual(at.detect(raw_of(picture), S(use_e621=False))["display"]["rating"], got["display"]["rating"])
+        # a rating stored under "e621" (nothing writes one) is not read
+        raw = raw_of(picture)
+        raw["ratings"][0]["e621"] = {"general": 0.0, "explicit": 1.0}
+        self.assertEqual(at.detect(raw, S())["display"]["rating"], {"general": 0.6, "explicit": 0.4})
+        # and a rating in the service's answer for it is not stored (nor is a stray category)
+        stored = at.raw_from_results([{"wd": {"general": {"a": 0.9}, "character": {}, "rating": {"general": 0.8}},
+                                       "e621": {"general": {"b": 0.9}, "species": {}, "character": {}, "copyright": {},
+                                                "rating": {"explicit": 0.99}, "artist": {"someone": 0.9}}}], [None])
+        self.assertEqual(stored["ratings"], [{"wd": {"general": 0.8}, "pixai": None, "ram": None, "e621": None}])
+        self.assertEqual(stored["scores"][0]["e621"], {"general": {"b": 0.9}, "species": {}, "character": {}, "copyright": {}})
+        # with Hydra (and RAM++) the only taggers there is no rating at all: no rating tag, nothing on the Test card
+        for only in (dict(use_wd=False, use_pixai=False, use_ram=False), dict(use_wd=False, use_pixai=False)):
+            alone = at.detect(raw_of(picture + "|ram:c=0.9"), S(**only))
+            self.assertEqual(alone["display"]["rating"], {})
+            self.assertEqual({t: source for t, (_s, source) in alone["tags"].items()},
+                             {"b": "e621"} if "use_ram" in only else {"b": "e621", "c": "ram"})
+        # it does not dilute the mean of the two that have one: each averaged over the captures, then the two
+        two = ("wd:a=0.9|rating:general=0.8|prating:general=0.2|e621:b=0.9", "wd:a=0.9|rating:general=0.6|prating:general=0.4|e621:b=0.9")
+        self.assertAlmostEqual(at.detect(raw_of(*two), S())["display"]["rating"]["general"], 0.5, places=3)
+        # a tie still goes to the earlier tagger, not to Hydra
+        tie = at.detect(raw_of("wd:a=0.9|rating:general=0.6,sensitive=0.4|prating:general=0.6,sensitive=0.4|e621:b=0.9"), S())
+        self.assertEqual(tie["tags"]["rating: general"], (0.6, "wd"))
+
+    def test_it_combines_the_captures_like_the_others_category_by_category(self):
+        raw = raw_of("e621:cat=0.9,dog=0.6", "e621:cat=0.2", "e6species:cat=0.9")
+        found = at.detect(raw, S(rating_tag=False, **self.ONLY))
+        self.assertAlmostEqual(found["tags"]["cat"][0], 0.9)                  # median .9, best .9 (capture 3 says it as species)
+        self.assertEqual(set(found["tags"]), {"cat"})                         # "dog" in one capture only: (0 + .6) / 2 = .3
+        self.assertEqual({t["tag"]: (t["score"], t["kept"]) for t in found["display"]["e621"]},
+                         {"cat": (0.9, True), "dog": (0.3, False)})
+        raw = at.raw_from_results([read_picture(b"e621:cat=0.9")[0], None], [None, "cannot identify image file"])
+        self.assertEqual(raw["captures"], 1)                                   # a capture it could not read is no vote
+
+    def test_its_names_are_normalised_like_the_others(self):
+        # Hydra's names keep underscores (``human_on_anthro``); some have capitals
+        got = self.kept("e621:human_on_anthro=0.9,Male=0.8|e6species:Canis Lupus=0.7|e6copy:the_legend_of_zelda=0.6", **self.ONLY)
+        self.assertEqual(got, {"human on anthro": (0.9, "e621"), "male": (0.8, "e621"), "canis lupus": (0.7, "e621"),
+                               "the legend of zelda": (0.6, "e621")})
+
+    def test_a_rename_or_a_combination_can_bridge_the_two_vocabularies(self):
+        # WD's own "furry with non-furry" is Hydra's "human on anthro"; a combination adds one from the other's tags
+        got = self.kept("wd:furry with non-furry=0.8|e621:human_on_anthro=0.7,anthro=0.9",
+                        vocabulary="furry with non-furry -> human on anthro")
+        self.assertEqual(got, {"human on anthro": (0.8, "wd"), "anthro": (0.9, "e621")})
+        got = at.build(raw_of("wd:furry=0.9,human=0.8|e621:anthro=0.9"), S(rating_tag=False, vocabulary="furry + human -> human on anthro"))
+        self.assertEqual(got["rules"], [{"rule": "line 1", "added": ["human on anthro"], "removed": []}])
+        self.assertEqual({t["tag"]: t["source"] for t in got["tags"]}["human on anthro"], "rule")
+
+
+class TestFourTaggers(Base):
+    """The real four taggers (wd, pixai, ram, e621), all on: agreement, the rating, the lists, the merge, the stored
+    scores, what is asked for."""
 
     def detect(self, *pictures, **settings):
         return at.detect(raw_of(*pictures), S(**settings))
 
-    def test_ram_can_be_switched_off_so_two_taggers_work_as_before(self):
-        picture = "wd:a=0.9|pixai:b=0.9|ram:c=0.9|rating:general=0.9"
-        self.assertEqual(set(self.detect(picture)["tags"]), {"a", "b", "c", "rating: general"})
-        self.assertEqual(set(self.detect(picture, use_ram=False)["tags"]), {"a", "b", "rating: general"})
+    def test_ram_and_e621_can_be_switched_off_so_two_taggers_work_as_before(self):
+        picture = "wd:a=0.9|pixai:b=0.9|ram:c=0.9|e621:d=0.9|rating:general=0.9"
+        self.assertEqual(set(self.detect(picture)["tags"]), {"a", "b", "c", "d", "rating: general"})
+        self.assertEqual(set(self.detect(picture, use_ram=False)["tags"]), {"a", "b", "d", "rating: general"})
+        self.assertEqual(set(self.detect(picture, use_e621=False)["tags"]), {"a", "b", "c", "rating: general"})
+        self.assertEqual(set(self.detect(picture, use_ram=False, use_e621=False)["tags"]), {"a", "b", "rating: general"})
         self.assertEqual(self.detect(picture, use_ram=False)["display"]["ram"], [])
+        self.assertEqual(self.detect(picture, use_e621=False)["display"]["e621"], [])
 
-    def test_a_sexual_tag_is_kept_when_any_two_of_the_three_found_it(self):
-        # every subset of the three taggers that names "oral": two or three keep it, one alone (or none) does not
-        for who in subsets(("wd", "pixai", "ram")):
+    def test_a_sexual_tag_is_kept_when_any_two_of_the_four_found_it(self):
+        # every subset of the four taggers that names "oral": two, three or four keep it, one alone (or none) does not
+        for who in subsets(("wd", "pixai", "ram", "e621")):
             with self.subTest(named_by=who):
                 picture = "|".join(f"{key}:door=0.9" + (",oral=0.9" if key in who else "")
-                                   for key in ("wd", "pixai", "ram")) + "|rating:general=0.9"
+                                   for key in ("wd", "pixai", "ram", "e621")) + "|rating:general=0.9"
                 got = self.detect(picture)
                 self.assertEqual("oral" in got["tags"], len(who) >= 2)
                 self.assertEqual(got["display"].get("dropped"), ["oral"] if len(who) == 1 else None)
                 self.assertIn("door", got["tags"])
 
     def test_found_means_it_passed_that_taggers_own_strictness(self):
-        picture = "wd:oral=0.9,door=0.9|pixai:door=0.9|ram:oral=0.3,door=0.9|rating:general=0.9|prating:general=0.9"
-        self.assertNotIn("oral", self.detect(picture)["tags"])                           # RAM++'s 0.3 is below its 0.5
-        self.assertIn("oral", self.detect(picture, ram_strictness=0.25)["tags"])         # now it found it too
-        self.assertNotIn("oral", self.detect(picture, ram_strictness=0.25, use_ram=False)["tags"])
-        # switching a second tagger off leaves one: dropped (PixAI still gives the general rating that asks for the check)
-        self.assertNotIn("oral", self.detect(picture, ram_strictness=0.25, use_wd=False)["tags"])
+        for key in ("ram", "e621"):
+            with self.subTest(tagger=key):
+                picture = (f"wd:oral=0.9,door=0.9|pixai:door=0.9|{key}:oral=0.3,door=0.9|"
+                           "rating:general=0.9|prating:general=0.9")
+                self.assertNotIn("oral", self.detect(picture)["tags"])                       # its 0.3 is below its 0.5
+                self.assertIn("oral", self.detect(picture, **{f"{key}_strictness": 0.25})["tags"])     # now it found it too
+                self.assertNotIn("oral", self.detect(picture, **{f"{key}_strictness": 0.25, f"use_{key}": False})["tags"])
+                # another tagger's threshold is not its own
+                other = "ram" if key == "e621" else "e621"
+                self.assertNotIn("oral", self.detect(picture, **{f"{other}_strictness": 0.25})["tags"])
+                # switching a second tagger off leaves one: dropped (PixAI still gives the general rating that asks for it)
+                self.assertNotIn("oral", self.detect(picture, **{f"{key}_strictness": 0.25, "use_wd": False})["tags"])
 
-    def test_with_the_real_registry_the_check_is_wd_and_pixai_because_ram_names_no_sexual_tag(self):
+    def test_with_the_real_registry_ram_neither_confirms_nor_removes_a_sexual_tag(self):
         # RAM++ has no sexual vocabulary: what it says is plain English, so it neither confirms nor removes one
         for picture, kept in [("wd:oral=0.9,door=0.9|pixai:oral=0.8,door=0.9|ram:door=0.9,room=0.8", True),
                               ("wd:oral=0.9,door=0.9|pixai:door=0.9|ram:door=0.9,room=0.8", False),
@@ -1309,65 +1605,118 @@ class TestThreeTaggers(Base):
                     self.assertEqual("oral" in got["tags"], kept)
                     self.assertEqual(got["display"].get("dropped"), None if kept else ["oral"])
                     self.assertEqual("room" in got["tags"], ram)
-        self.assertIn("oral", self.detect("wd:oral=0.9|pixai:oral=0.9|ram:door=0.9|rating:explicit=0.9")["tags"])
+        # Hydra's vocabulary does cover them: it is a voter like WD and PixAI, with or without RAM++
+        for ram in (True, False):
+            with self.subTest(hydra=True, ram=ram):
+                got = self.detect("wd:oral=0.9,door=0.9|pixai:door=0.9|ram:door=0.9|e621:oral=0.8|rating:general=0.9", use_ram=ram)
+                self.assertIn("oral", got["tags"])
+                got = self.detect("wd:door=0.9|pixai:door=0.9|ram:door=0.9|e621:oral=0.8|rating:general=0.9", use_ram=ram)
+                self.assertNotIn("oral", got["tags"])
+        self.assertIn("oral", self.detect("wd:oral=0.9|pixai:oral=0.9|ram:door=0.9|e621:door=0.9|rating:explicit=0.9")["tags"])
 
     def test_an_explicit_rating_keeps_tags_one_tagger_saw(self):
-        got = self.detect("wd:oral=0.9|pixai:a=0.9|ram:b=0.9|rating:explicit=0.9,general=0.05")
+        got = self.detect("wd:oral=0.9|pixai:a=0.9|ram:b=0.9|e621:c=0.9|rating:explicit=0.9,general=0.05")
         self.assertIn("oral", got["tags"])
 
-    def test_with_ram_alone_there_is_no_rating_and_so_no_explicit_check(self):
-        # with RAM++ the only tagger there is no rating and so no check: its tags are all kept
-        got = self.detect("ram:oral=0.9,door=0.9", use_wd=False, use_pixai=False)
-        self.assertEqual(set(got["tags"]), {"oral", "door"})
-        self.assertNotIn("dropped", got["display"])
+    def test_ram_and_e621_never_take_part_in_the_rating(self):
+        # general: wd .9, pixai .3 -> .6; explicit: wd .1, pixai .7 -> .4, whatever the other two say
+        picture = ("wd:a=0.9|rating:general=0.9,explicit=0.1|prating:general=0.3,explicit=0.7|ram:b=0.9|e621:c=0.9")
+        want = {"general": 0.6, "explicit": 0.4}
+        for off in subsets(("use_ram", "use_e621")):
+            with self.subTest(off=off):
+                got = self.detect(picture, **{key: False for key in off})
+                self.assertEqual(got["display"]["rating"], want)
+                self.assertEqual(got["tags"]["rating: general"][1], "wd")
+        raw = raw_of(picture)                                              # ratings stored under their keys are not read
+        raw["ratings"][0]["ram"] = {"general": 0.0, "explicit": 1.0}
+        raw["ratings"][0]["e621"] = {"general": 0.0, "explicit": 1.0}
+        self.assertEqual(at.detect(raw, S())["display"]["rating"], want)
+        self.assertEqual(raw_of(picture)["ratings"], [{"wd": {"general": 0.9, "explicit": 0.1},
+                                                       "pixai": {"general": 0.3, "explicit": 0.7}, "ram": None, "e621": None}])
+
+    def test_with_ram_or_e621_alone_there_is_no_rating_and_so_no_explicit_check(self):
+        # with either the only tagger (or both) there is no rating and so no check: its tags are all kept
+        for only in ({"use_wd": False, "use_pixai": False, "use_e621": False}, {"use_wd": False, "use_pixai": False, "use_ram": False},
+                     {"use_wd": False, "use_pixai": False}):
+            with self.subTest(only=only):
+                got = self.detect("ram:oral=0.9,door=0.9|e621:oral=0.9,door=0.9", **only)
+                self.assertEqual(set(got["tags"]), {"oral", "door"})
+                self.assertNotIn("dropped", got["display"])
+                self.assertEqual(got["display"]["rating"], {})
 
     def test_the_preview_has_a_list_for_every_registered_tagger(self):
-        picture = "wd:girl=0.9,hat=0.3|pixai:beach=0.8|ram:sea=0.7,wave=0.3,gone=0.1|rating:general=0.9"
+        picture = ("wd:girl=0.9,hat=0.3|pixai:beach=0.8|ram:sea=0.7,wave=0.3,gone=0.1|"
+                   "e621:anthro=0.9,tail=0.3,gone too=0.1|rating:general=0.9")
         shown = self.detect(picture)["display"]
-        self.assertEqual(set(shown), {"wd", "pixai", "ram", "rating"})
+        self.assertEqual(set(shown), {"wd", "pixai", "ram", "e621", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in shown["ram"]}, {"sea": True, "wave": False})   # from 0.2 up
+        self.assertEqual({t["tag"]: t["kept"] for t in shown["e621"]}, {"anthro": True, "tail": False})
         self.assertEqual([t["tag"] for t in shown["wd"]], ["girl", "hat"])
-        off = self.detect(picture, use_ram=False)["display"]                               # RAM++ is off: an empty list
-        self.assertEqual((off["ram"], set(off)), ([], {"wd", "pixai", "ram", "rating"}))
+        for key in ("ram", "e621"):                                       # off: an empty list, the others as before
+            off = self.detect(picture, **{f"use_{key}": False})["display"]
+            self.assertEqual((off[key], set(off)), ([], {"wd", "pixai", "ram", "e621", "rating"}))
+            self.assertEqual([t["tag"] for t in off["wd"]], ["girl", "hat"])
 
     def test_stored_scores_keep_every_taggers_categories_and_rating(self):
         raw = raw_of("wd:girl=0.9|char:miku=0.8|rating:general=0.9|pixai:smile=0.7|pchar:rin=0.6|copy:vocaloid=0.8|"
-                     "prating:general=0.8|ram:sea=0.7,Birthday Cake=0.4")
+                     "prating:general=0.8|ram:sea=0.7,Birthday Cake=0.4|"
+                     "e621:anthro=0.9,Mammal=0.4|e6species:wolf=0.8|e6char:fenrir=0.6|e6copy:norse mythology=0.7")
         self.assertEqual(raw["scores"], [{"wd": {"general": {"girl": 0.9}, "character": {"miku": 0.8}},
                                           "pixai": {"general": {"smile": 0.7}, "character": {"rin": 0.6},
                                                     "copyright": {"vocaloid": 0.8}},
-                                          "ram": {"general": {"sea": 0.7, "Birthday Cake": 0.4}}}])     # nested, as served
-        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9}, "pixai": {"general": 0.8}, "ram": None}])
-        self.assertEqual(raw["models"], ["pixai", "ram", "wd"])
+                                          "ram": {"general": {"sea": 0.7, "Birthday Cake": 0.4}},       # nested, as served
+                                          "e621": {"general": {"anthro": 0.9, "Mammal": 0.4}, "species": {"wolf": 0.8},
+                                                   "character": {"fenrir": 0.6}, "copyright": {"norse mythology": 0.7}}}])
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9}, "pixai": {"general": 0.8}, "ram": None, "e621": None}])
+        self.assertEqual(raw["models"], ["e621", "pixai", "ram", "wd"])
         self.store.save_raw("a", raw)
         self.assertEqual(self.store.raw("a"), raw)
         self.assertTrue(at.has_kind(raw, "ram"))
+        self.assertTrue(at.has_kind(raw, "e621"))
+
+    def test_a_service_answer_that_lacks_one_of_hydras_categories_is_stored_with_it_empty(self):
+        stored = at.raw_from_results([{"e621": {"general": {"anthro": 0.9}, "species": {"wolf": 0.8}}}], [None])
+        self.assertEqual(stored["scores"][0]["e621"], {"general": {"anthro": 0.9}, "species": {"wolf": 0.8},
+                                                       "character": {}, "copyright": {}})
+        self.assertEqual(stored["models"], ["e621"])
+        # a tagger that was not asked for has no entry at all (None), and so counts as missing when it is on
+        only_wd = at.raw_from_results([read_picture(b"wd:a=0.9", ["wd"])[0]], [None])
+        self.assertEqual(only_wd["scores"], [{"wd": {"general": {"a": 0.9}, "character": {}}, "pixai": None, "ram": None,
+                                              "e621": None}])
+        self.assertFalse(at.has_kind(only_wd, "e621"))
 
     def test_a_stored_raw_row_lacking_an_enabled_tagger_is_incomplete(self):
-        old = raw_of("wd:a=0.9|pixai:b=0.9|rating:general=0.9")
-        old["scores"] = [{k: v for k, v in cap.items() if k != "ram"} for cap in old["scores"]]     # made before RAM++
-        self.assertEqual(at.missing_kinds(old, S()), ["ram"])
-        self.assertEqual(at.missing_kinds(old, S(use_ram=False)), [])                      # RAM++ is off: nothing missing
-        self.assertEqual(at.missing_kinds(old, S(use_wd=False, use_pixai=False)), ["ram"])
-        self.assertEqual(at.missing_kinds(None, S()), ["wd", "pixai", "ram"])
-        self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9|ram:b=0.9"), S()), [])
-        self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9"), S(use_wd=False, use_pixai=False, use_ram=False)), [])
+        full = raw_of("wd:a=0.9|pixai:b=0.9|rating:general=0.9")
+        for gone in ("ram", "e621"):
+            with self.subTest(made_before=gone):
+                old = {**full, "scores": [{k: v for k, v in cap.items() if k != gone} for cap in full["scores"]]}
+                self.assertEqual(at.missing_kinds(old, S()), [gone])
+                self.assertEqual(at.missing_kinds(old, S(**{f"use_{gone}": False})), [])               # it is off: nothing missing
+                self.assertEqual(at.missing_kinds(old, S(use_wd=False, use_pixai=False)), [gone])
+        both = {**full, "scores": [{k: v for k, v in cap.items() if k not in ("ram", "e621")} for cap in full["scores"]]}
+        self.assertEqual(at.missing_kinds(both, S()), ["ram", "e621"])
+        self.assertEqual(at.missing_kinds(both, S(use_ram=False)), ["e621"])
+        self.assertEqual(at.missing_kinds(at.raw_from_results([read_picture(b"wd:a=0.9", ["wd", "pixai"])[0]], [None]), S()),
+                         ["ram", "e621"])
+        self.assertEqual(at.missing_kinds(None, S()), REAL)
+        self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9|ram:b=0.9|e621:c=0.9"), S()), [])
+        self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9"), S(use_wd=False, use_pixai=False, use_ram=False, use_e621=False)), [])
 
     def test_only_the_enabled_taggers_are_asked_for_and_stored(self):
         self.run_indexer()
-        self.assertEqual(set(map(tuple, self.services.tag_models)), {("wd", "pixai", "ram")})
-        self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), "ram"))
-        self.services.tag_models.clear()
-        self.store.enqueue(self.ids[:2], "full")
-        self.run_indexer(use_pixai=False, use_ram=False)
-        self.assertEqual(set(map(tuple, self.services.tag_models)), {("wd",)})
-        self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), "pixai"))
-        self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), "ram"))
-        self.services.tag_models.clear()
-        self.store.enqueue(self.ids[:2], "full")
-        self.run_indexer(use_wd=False, use_pixai=False, use_ram=True)
-        self.assertEqual(set(map(tuple, self.services.tag_models)), {("ram",)})
-        self.assertEqual(self.store.raw(self.ids[0])["models"], ["ram"])
+        self.assertEqual(set(map(tuple, self.services.tag_models)), {tuple(REAL)})
+        for key in ("ram", "e621"):
+            self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), key))
+        for asked in [("wd",), ("ram", "e621"), ("e621",), ("ram",), ("wd", "pixai", "e621"), ("pixai", "ram")]:
+            with self.subTest(enabled=asked):
+                self.services.tag_models.clear()
+                self.store.enqueue(self.ids[:2], "full")
+                self.run_indexer(**{f"use_{key}": key in asked for key in REAL})
+                self.assertEqual(set(map(tuple, self.services.tag_models)), {asked})      # asked for in registry order
+                raw = self.store.raw(self.ids[0])
+                self.assertEqual(raw["models"], sorted(asked))
+                for kind in REAL:
+                    self.assertEqual(at.has_kind(raw, kind), kind in asked, kind)
 
     def test_ram_takes_part_end_to_end(self):
         self.catalog[0]["preview"] = RAM_PHOTO
@@ -1380,35 +1729,85 @@ class TestThreeTaggers(Base):
         self.assertEqual(by["sea"]["score"], 0.95)                          # the highest of PixAI's .7 and RAM++'s .95
         for noise in ("image", "catch", "wave"):                            # its noise words, and the one below 0.5
             self.assertNotIn(noise, by)
-        self.assertEqual(self.store.raw(self.ids[0])["models"], ["pixai", "ram", "wd"])
+        self.assertEqual(self.store.raw(self.ids[0])["models"], ["e621", "pixai", "ram", "wd"])
         self.assertIn("image", self.store.raw(self.ids[0])["scores"][0]["ram"]["general"])      # stored, filtered at tagging
         self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\n[/AI Tagger]")
 
+    def test_hydra_takes_part_end_to_end(self):
+        self.catalog[0]["preview"] = E621_PHOTO
+        self.run_indexer()
+        self.assertEqual(self.description(0), "[AI Tagger]\nTags: anthro, girl, wolf, beach, fenrir, miku, solo, "
+                                              "norse mythology, sea, canine, fur, rating: general\n[/AI Tagger]")
+        by = {t["tag"]: t for t in self.store.result(self.ids[0])["tags"]}
+        for tag in ("anthro", "wolf", "fenrir", "norse mythology", "fur", "canine"):
+            self.assertEqual(by[tag]["source"], "e621", tag)
+        self.assertEqual((by["girl"]["source"], by["beach"]["source"], by["sea"]["source"]), ("wd", "pixai", "pixai"))
+        self.assertEqual((by["anthro"]["score"], by["wolf"]["score"]), (0.95, 0.9))
+        for left_out in ("mammal", "tail", "fox", "loki"):                 # its noise word, and three below 0.5
+            self.assertNotIn(left_out, by)
+        raw = self.store.raw(self.ids[0])
+        self.assertEqual(raw["models"], ["e621", "pixai", "ram", "wd"])
+        self.assertEqual(raw["scores"][0]["e621"]["species"], {"wolf": 0.9, "canine": 0.6, "fox": 0.25})   # all of it is stored
+        self.assertEqual(raw["scores"][0]["e621"]["general"]["mammal"], 0.99)
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9, "sensitive": 0.08, "questionable": 0.01, "explicit": 0.01},
+                                           "pixai": None, "ram": None, "e621": None}])
+        self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\n[/AI Tagger]")
+
+    def test_the_character_switch_is_a_retag_that_takes_hydras_characters_and_series_away(self):
+        self.catalog[0]["preview"] = ALL_PHOTO
+        self.run_indexer()
+        self.assertIn("fenrir", self.description(0))
+        self.services.tag_calls.clear()
+        self.set(character_tags=False)
+        at.reprocess(self.store, "outdated", "retag")
+        self.run_indexer()
+        self.assertEqual(self.services.tag_calls, [])                         # the stored scores are enough
+        names = {t["tag"]: t["source"] for t in self.store.result(self.ids[0])["tags"]}
+        self.assertEqual(names.keys() & {"fenrir", "norse mythology", "miku"}, set())
+        self.assertEqual((names["wolf"], names["anthro"], names["canine"]), ("e621", "e621", "e621"))   # species stays
+
     def test_noise_never_reaches_the_written_description_or_the_native_tags(self):
-        self.catalog[0]["preview"] = "ram:" + ",".join(f"{w}=0.99" for w in sorted(at.TAGGERS[2].noise)) + ",lake=0.9"
+        ram = next(k for k in at.TAGGERS if k.key == "ram")
+        self.catalog[0]["preview"] = "ram:" + ",".join(f"{w}=0.99" for w in sorted(ram.noise)) + ",lake=0.9"
         self.run_indexer(write_tags=True)
         self.assertEqual(self.description(0), "[AI Tagger]\nTags: lake\n[/AI Tagger]")     # no rating: nobody here has one
         self.assertEqual(sorted(self.fake.tags[t]["value"] for t in self.fake.asset_tags[self.ids[0]]), ["AI/lake"])
+        hydra = next(k for k in at.TAGGERS if k.key == "e621")
+        self.catalog[0]["preview"] = "e621:" + ",".join(f"{w}=0.99" for w in sorted(hydra.noise)) + ",anthro=0.9"
+        self.indexer.last_sync = None                                       # read the library list again
+        self.store.enqueue(self.ids[:1], "full")
+        self.run_indexer(write_tags=True)
+        self.assertEqual(self.description(0), "[AI Tagger]\nTags: anthro\n[/AI Tagger]")
+        self.assertEqual(sorted(self.fake.tags[t]["value"] for t in self.fake.asset_tags[self.ids[0]]), ["AI/anthro"])
 
-    def test_enabling_it_later_makes_a_retag_a_full_reprocess(self):
-        self.run_indexer(use_ram=False)
-        self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), "ram"))
+    def enabling_it_later(self, key):
+        self.run_indexer(**{f"use_{key}": False})
+        self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), key))
+        for other in REAL:
+            if other != key:
+                self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), other), other)
         self.services.tag_calls.clear()
         self.services.tag_models.clear()
-        self.assertEqual(self.set(use_ram=True), ["use_ram"])
+        self.assertEqual(self.set(**{f"use_{key}": True}), [f"use_{key}"])
         self.assertEqual(at.reprocess(self.store, "outdated", "retag"), 3)  # only a retag was asked for ...
         self.run_indexer()
         self.assertEqual(sum(self.services.tag_calls), 1 + 1 + 3)           # ... but the stored scores lack an enabled tagger
-        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd", "pixai", "ram")})
-        self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), "ram"))
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {tuple(REAL)})
+        self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), key))
         self.services.tag_calls.clear()
-        self.assertEqual(self.set(ram_strictness=0.6), ["ram_strictness"])
+        self.assertEqual(self.set(**{f"{key}_strictness": 0.6}), [f"{key}_strictness"])
         at.reprocess(self.store, "outdated", "retag")
         self.run_indexer()
         self.assertEqual(self.services.tag_calls, [])                       # complete now: a retag is cheap again
 
-    def test_a_retag_with_all_three_stored_needs_no_gpu(self):
-        self.catalog[0]["preview"] = RAM_PHOTO
+    def test_enabling_ram_later_makes_a_retag_a_full_reprocess(self):
+        self.enabling_it_later("ram")
+
+    def test_enabling_hydra_later_makes_a_retag_a_full_reprocess(self):
+        self.enabling_it_later("e621")
+
+    def test_a_retag_with_all_four_stored_needs_no_gpu(self):
+        self.catalog[0]["preview"] = ALL_PHOTO
         self.run_indexer()
         self.services.tag_calls.clear()
         self.set(ram_strictness=0.95)
@@ -1419,48 +1818,73 @@ class TestThreeTaggers(Base):
         self.assertNotIn("lake", names)                                     # RAM++'s .9 is below its .95 now
         self.assertNotIn("screenshot", names)
         self.assertEqual(names["sea"], "ram")                               # its .95 still passes
+        self.assertEqual((names["wolf"], names["anthro"]), ("e621", "e621"))        # Hydra's are as they were
         self.set(ram_strictness=0.5, use_ram=False)
         at.reprocess(self.store, "outdated", "retag")
         self.run_indexer()
         self.assertEqual(self.services.tag_calls, [])                       # switching it off applies to the stored scores too
         names = {t["tag"]: t["source"] for t in self.store.result(self.ids[0])["tags"]}
-        self.assertEqual((names.get("lake"), names.get("screenshot"), names["sea"]), (None, None, "pixai"))
+        self.assertEqual((names.get("lake"), names.get("screenshot"), names["sea"], names["wolf"]), (None, None, "pixai", "e621"))
+        self.set(use_ram=True, e621_strictness=0.95)
+        at.reprocess(self.store, "outdated", "retag")
+        self.run_indexer()
+        self.assertEqual(self.services.tag_calls, [])
+        names = {t["tag"]: t["source"] for t in self.store.result(self.ids[0])["tags"]}
+        self.assertEqual((names["anthro"], names.get("wolf"), names.get("fenrir"), names["lake"]), ("e621", None, None, "ram"))
+        self.set(e621_strictness=0.5, use_e621=False)
+        at.reprocess(self.store, "outdated", "retag")
+        self.run_indexer()
+        self.assertEqual(self.services.tag_calls, [])                       # ... and Hydra's too
+        names = {t["tag"]: t["source"] for t in self.store.result(self.ids[0])["tags"]}
+        self.assertEqual((names.get("anthro"), names.get("wolf"), names.get("fenrir"), names["lake"]), (None, None, None, "ram"))
 
-    def test_agreement_by_any_two_of_three_end_to_end(self):
-        picture = "wd:door=0.9,oral=0.9|pixai:door=0.9|ram:oral=0.9|rating:general=0.9"
+    def agreement_end_to_end(self, key):
+        picture = f"wd:door=0.9,oral=0.9|pixai:door=0.9|{key}:oral=0.9|rating:general=0.9"
         self.catalog = [{**self.catalog[0], "preview": picture}]
         self.run_indexer()
-        self.assertIn("oral", self.description(0))                          # WD and RAM++ agree
-        self.set(use_ram=False)
+        self.assertIn("oral", self.description(0))                          # WD and the other one agree
+        self.set(**{f"use_{key}": False})
         at.reprocess(self.store, "outdated", "retag")
         calls = list(self.services.tag_calls)
         self.run_indexer()
         self.assertNotIn("oral", self.description(0))                       # only WD is left that saw it
         self.assertEqual(self.services.tag_calls, calls)                    # (the stored scores were enough)
-        self.set(use_ram=True)
+        self.set(**{f"use_{key}": True})
         at.reprocess(self.store, "outdated", "retag")
         self.run_indexer()
         self.assertIn("oral", self.description(0))                          # and back, from the same stored scores
         self.assertEqual(self.services.tag_calls, calls)
 
-    def test_the_preview_lists_all_three_taggers(self):
-        self.catalog[0]["preview"] = RAM_PHOTO
+    def test_agreement_by_any_two_of_the_four_end_to_end_with_ram(self):
+        self.agreement_end_to_end("ram")
+
+    def test_agreement_by_any_two_of_the_four_end_to_end_with_hydra(self):
+        self.agreement_end_to_end("e621")
+
+    def test_the_preview_lists_all_four_taggers(self):
+        self.catalog[0]["preview"] = ALL_PHOTO
         got = self.indexer.test(self.ids[0])
-        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "rating"})
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "e621", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["ram"]},
                          {"sea": True, "lake": True, "screenshot": True, "wave": False})       # no noise word is listed
-        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram"]])
+        self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["e621"]},
+                         {"anthro": True, "fur": True, "wolf": True, "canine": True, "fenrir": True, "norse mythology": True,
+                          "tail": False, "fox": False, "loki": False})                         # no "mammal"
+        self.assertEqual(self.services.tag_models, [REAL])
         self.assertEqual((got["models"]["rating"]["general"], got["models"]["rating"]["sensitive"]), (0.9, 0.08))
         self.assertEqual(self.services.ready_calls[0], {"tagger": True})
-        self.assertEqual({t["tag"] for t in got["tags"]} & {"image", "catch"}, set())
-        self.assertIn("screenshot", {t["tag"] for t in got["tags"]})
+        self.assertEqual({t["tag"] for t in got["tags"]} & {"image", "catch", "mammal"}, set())
+        self.assertTrue({"screenshot", "wolf", "fenrir"} <= {t["tag"] for t in got["tags"]})
         self.assertNotIn("image", got["block"])
-        # with RAM++ off the card has its (empty) list and the others as before
-        self.services.tag_models.clear()
-        self.set(use_ram=False)
-        off = self.indexer.test(self.ids[0])
-        self.assertEqual((off["models"]["ram"], self.services.tag_models), ([], [["wd", "pixai"]]))
-        self.assertNotIn("lake", {t["tag"] for t in off["tags"]})
+        self.assertNotIn("mammal", got["block"])
+        # with one of them off the card has its (empty) list and the others as before
+        for key, gone in (("ram", "lake"), ("e621", "wolf")):
+            self.services.tag_models.clear()
+            self.set(**{f"use_{key}": False})
+            off = self.indexer.test(self.ids[0])
+            self.assertEqual((off["models"][key], self.services.tag_models), ([], [[k for k in REAL if k != key]]))
+            self.assertNotIn(gone, {t["tag"] for t in off["tags"]})
+            self.set(**{f"use_{key}": True})
 
 
 class TestV1ScoresStayReadable(Base):
@@ -1501,15 +1925,17 @@ class TestV1ScoresStayReadable(Base):
         stored = at.raw_from_results([{"wd": {"general": {"a": 0.9}, "character": {}, "rating": {"general": 0.9}},
                                        "ram": {"beach": 0.8}}], [None])
         self.assertEqual(stored["scores"][0]["ram"], {"general": {"beach": 0.8}})
-        self.assertEqual(stored["ratings"], [{"wd": {"general": 0.9}, "pixai": None, "ram": None}])
+        self.assertEqual(stored["ratings"], [{"wd": {"general": 0.9}, "pixai": None, "ram": None, "e621": None}])
 
-    def test_a_v1_row_lacks_pixai_so_with_it_on_it_needs_a_full_reprocess(self):
+    def test_a_v1_row_lacks_pixai_and_hydra_so_with_them_on_it_needs_a_full_reprocess(self):
         raw = v1_raw()
         self.assertTrue(at.has_kind(raw, "ram"))
         self.assertTrue(at.has_kind(raw, "wd"))
         self.assertFalse(at.has_kind(raw, "pixai"))
-        self.assertEqual(at.missing_kinds(raw, S()), ["pixai"])                # the default settings: a retag becomes full
-        self.assertEqual(at.missing_kinds(raw, S(use_pixai=False)), [])        # PixAI off: the stored scores are enough
+        self.assertFalse(at.has_kind(raw, "e621"))
+        self.assertEqual(at.missing_kinds(raw, S()), ["pixai", "e621"])        # the default settings: a retag becomes full
+        self.assertEqual(at.missing_kinds(raw, S(use_pixai=False)), ["e621"])  # Hydra is still on, and has no scores in it
+        self.assertEqual(at.missing_kinds(raw, S(use_pixai=False, use_e621=False)), [])      # both off: enough
 
     def test_a_v1_store_row_round_trips_as_written_and_is_read_right(self):
         folder = Path(self.tmp.name) / "v1rows"
@@ -1527,8 +1953,8 @@ class TestV1ScoresStayReadable(Base):
                          "[AI Tagger]\nTags: girl, beach, sea, rating: general\n[/AI Tagger]")
 
 
-class TestAFourthTagger(Base):
-    """The registry is open: a fake fourth tagger ``extra`` on top of wd, pixai and ram takes part in everything the
+class TestAFifthTagger(Base):
+    """The registry is open: a fake fifth tagger ``extra`` on top of wd, pixai, ram and e621 takes part in everything the
     registry loops over (agreement, the rating, the lists, the merge, the stored scores, the models asked for)."""
 
     def setUp(self):
@@ -1538,14 +1964,14 @@ class TestAFourthTagger(Base):
     def detect(self, *pictures, **settings):
         return at.detect(raw_of(*pictures), S(**{"use_extra": True, **settings}))
 
-    def test_extra_is_off_by_default_so_the_three_work_as_before(self):
-        picture = "wd:a=0.9|pixai:b=0.9|ram:r=0.9|extra:c=0.9|rating:general=0.9"
+    def test_extra_is_off_by_default_so_the_four_work_as_before(self):
+        picture = "wd:a=0.9|pixai:b=0.9|ram:r=0.9|e621:h=0.9|extra:c=0.9|rating:general=0.9"
         raw = raw_of(picture)
-        self.assertEqual(set(at.detect(raw, S())["tags"]), {"a", "b", "r", "rating: general"})
-        self.assertEqual(set(self.detect(picture)["tags"]), {"a", "b", "r", "c", "rating: general"})
+        self.assertEqual(set(at.detect(raw, S())["tags"]), {"a", "b", "r", "h", "rating: general"})
+        self.assertEqual(set(self.detect(picture)["tags"]), {"a", "b", "r", "h", "c", "rating: general"})
 
-    def test_a_sexual_tag_is_kept_when_any_two_of_the_four_found_it(self):
-        keys = ("wd", "pixai", "ram", "extra")
+    def test_a_sexual_tag_is_kept_when_any_two_of_the_five_found_it(self):
+        keys = (*REAL, "extra")
         for who in subsets(keys):
             with self.subTest(named_by=who):
                 picture = "|".join(f"{key}:door=0.9" + (",oral=0.9" if key in who else "") for key in keys) + \
@@ -1567,10 +1993,10 @@ class TestAFourthTagger(Base):
         got = self.detect("wd:oral=0.9|pixai:a=0.9|extra:b=0.9|rating:explicit=0.9,general=0.05")
         self.assertIn("oral", got["tags"])
 
-    def test_the_rating_is_the_mean_of_the_taggers_that_report_one_and_ram_does_not(self):
-        # general: wd .9, pixai .3, extra .6 -> .6; explicit: wd .1, pixai .7, extra .4 -> .4 (RAM++ reports none)
+    def test_the_rating_is_the_mean_of_the_taggers_that_report_one_and_ram_and_hydra_do_not(self):
+        # general: wd .9, pixai .3, extra .6 -> .6; explicit: wd .1, pixai .7, extra .4 -> .4 (RAM++ and Hydra report none)
         pictures = ("wd:a=0.9|rating:general=0.9,explicit=0.1|prating:general=0.3,explicit=0.7|extra:b=0.9|ram:r=0.9|"
-                    "erating:general=0.6,explicit=0.4",)
+                    "e621:h=0.9|erating:general=0.6,explicit=0.4",)
         got = self.detect(*pictures)
         self.assertEqual(got["display"]["rating"], {"general": 0.6, "explicit": 0.4})
         score, source = got["tags"]["rating: general"]
@@ -1580,7 +2006,7 @@ class TestAFourthTagger(Base):
         two = ("wd:a=0.9|rating:general=0.8|prating:general=0.2|erating:general=0.4",
                "wd:a=0.9|rating:general=0.6|prating:general=0.4|erating:general=0.8")
         self.assertAlmostEqual(self.detect(*two)["display"]["rating"]["general"], (0.7 + 0.3 + 0.6) / 3, places=3)
-        # the fourth one decides when the two others split
+        # the fifth one decides when the two others split
         split = "wd:a=0.9|rating:general=0.6,explicit=0.4|prating:general=0.45,explicit=0.55|erating:general=0.1,explicit=0.9"
         self.assertEqual(list(k for k in self.detect(split)["tags"] if k.startswith("rating")), ["rating: explicit"])
         no_extra = at.detect(raw_of(split), S())                           # extra off: general .525 against explicit .475
@@ -1597,10 +2023,11 @@ class TestAFourthTagger(Base):
         self.assertEqual(tie["tags"]["rating: general"][1], "wd")
 
     def test_a_tagger_without_a_rating_is_left_out_of_the_rating(self):
-        at.configure_taggers([*at.TAGGERS[:3], EXTRA_NO_RATING])      # this test's fake reports no rating (setUp restores)
+        at.configure_taggers([*at.TAGGERS[:4], EXTRA_NO_RATING])      # this test's fake reports no rating (setUp restores)
         self.assertFalse(at.TAGGERS[-1].has_rating)
         raw = at.raw_from_results([read_picture(b"wd:a=0.9|rating:general=0.8|extra:b=0.9|erating:explicit=0.99")[0]], [None])
-        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.8}, "pixai": None, "ram": None, "extra": None}])   # never stored
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.8}, "pixai": None, "ram": None, "e621": None,
+                                           "extra": None}])                                  # never stored
         got = at.detect(raw, S(use_extra=True))
         self.assertEqual(got["display"]["rating"], {"general": 0.8})
         self.assertEqual(got["tags"]["b"], (0.9, "extra"))                                      # its tags still count
@@ -1608,48 +2035,57 @@ class TestAFourthTagger(Base):
     def test_the_highest_score_wins_and_the_source_is_that_tagger(self):
         got = self.detect("wd:smile=0.7,a=0.6|pixai:smile=0.8|extra:smile=0.9,a=0.8|ram:smile=0.85|rating:general=0.9")["tags"]
         self.assertEqual((got["smile"], got["a"]), ((0.9, "extra"), (0.8, "extra")))
-        got = self.detect("wd:smile=0.95|pixai:smile=0.8|extra:smile=0.9|ram:smile=0.9|rating:general=0.9")["tags"]
+        got = self.detect("wd:smile=0.95|pixai:smile=0.8|extra:smile=0.9|ram:smile=0.9|e621:smile=0.9|rating:general=0.9")["tags"]
         self.assertEqual(got["smile"], (0.95, "wd"))
         got = self.detect("ram:smile=0.9|extra:smile=0.9|rating:general=0.9")["tags"]               # a tie: the earlier one
         self.assertEqual(got["smile"], (0.9, "ram"))
+        got = self.detect("e621:smile=0.9|extra:smile=0.9|rating:general=0.9")["tags"]
+        self.assertEqual(got["smile"], (0.9, "e621"))
 
-    def test_character_tags_gate_the_fourth_taggers_character_category(self):
-        picture = "wd:girl=0.9|extra:smile=0.9|echar:hatsune_miku=0.9|ram:sea=0.9|rating:general=0.9"
+    def test_character_tags_gate_the_fifth_taggers_character_category(self):
+        picture = "wd:girl=0.9|extra:smile=0.9|echar:hatsune_miku=0.9|ram:sea=0.9|e6char:fenrir=0.9|rating:general=0.9"
         self.assertIn("hatsune miku", self.detect(picture)["tags"])
         got = self.detect(picture, character_tags=False)
         self.assertNotIn("hatsune miku", got["tags"])
+        self.assertNotIn("fenrir", got["tags"])
         self.assertIn("smile", got["tags"])
         self.assertIn("sea", got["tags"])                                   # RAM++ has none to switch off
         self.assertNotIn("hatsune miku", {t["tag"] for t in got["display"]["extra"]})
 
-    def test_a_fourth_taggers_noise_words_are_its_own(self):
-        at.configure_taggers([*at.TAGGERS[:3], EXTRA_NOISY])
-        picture = "extra:filler=0.9,Filler=0.8,sea=0.9,image=0.9|ram:filler=0.9,image=0.9,sea=0.8|rating:general=0.9"
+    def test_a_fifth_taggers_noise_words_are_its_own(self):
+        at.configure_taggers([*at.TAGGERS[:4], EXTRA_NOISY])
+        picture = ("extra:filler=0.9,Filler=0.8,sea=0.9,image=0.9,mammal=0.9|ram:filler=0.9,image=0.9,sea=0.8|"
+                   "e621:filler=0.7,mammal=0.99|rating:general=0.9")
         got = self.detect(picture, rating_tag=False)
-        self.assertEqual({t: v[1] for t, v in got["tags"].items()}, {"sea": "extra", "image": "extra", "filler": "ram"})
-        self.assertEqual({t["tag"] for t in got["display"]["extra"]}, {"sea", "image"})
+        self.assertEqual({t: v[1] for t, v in got["tags"].items()},
+                         {"sea": "extra", "image": "extra", "filler": "ram", "mammal": "extra"})   # Hydra's "mammal" is still noise
+        self.assertEqual({t["tag"] for t in got["display"]["extra"]}, {"sea", "image", "mammal"})
         self.assertEqual({t["tag"] for t in got["display"]["ram"]}, {"filler", "sea"})
+        self.assertEqual({t["tag"] for t in got["display"]["e621"]}, {"filler"})
 
     def test_the_preview_has_a_list_for_every_registered_tagger(self):
         picture = "wd:girl=0.9,hat=0.3|pixai:beach=0.8|ram:r=0.9|extra:sea=0.7,wave=0.3,gone=0.1|rating:general=0.9"
         shown = self.detect(picture)["display"]
-        self.assertEqual(set(shown), {"wd", "pixai", "ram", "extra", "rating"})
+        self.assertEqual(set(shown), {"wd", "pixai", "ram", "e621", "extra", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in shown["extra"]}, {"sea": True, "wave": False})   # from 0.2 up
         self.assertEqual([t["tag"] for t in shown["wd"]], ["girl", "hat"])
         off = at.detect(raw_of(picture), S())["display"]                                   # extra is off: an empty list
-        self.assertEqual((off["extra"], set(off)), ([], {"wd", "pixai", "ram", "extra", "rating"}))
+        self.assertEqual((off["extra"], set(off)), ([], {"wd", "pixai", "ram", "e621", "extra", "rating"}))
 
     def test_stored_scores_keep_every_taggers_categories_and_rating(self):
         raw = raw_of("wd:girl=0.9|char:miku=0.8|rating:general=0.9|pixai:smile=0.7|pchar:rin=0.6|copy:vocaloid=0.8|"
-                     "prating:general=0.8|ram:lake=0.6|extra:sea=0.7|echar:luka=0.6|erating:general=0.7,explicit=0.2")
+                     "prating:general=0.8|ram:lake=0.6|e621:anthro=0.9|e6species:wolf=0.8|"
+                     "extra:sea=0.7|echar:luka=0.6|erating:general=0.7,explicit=0.2")
         self.assertEqual(raw["scores"], [{"wd": {"general": {"girl": 0.9}, "character": {"miku": 0.8}},
                                           "pixai": {"general": {"smile": 0.7}, "character": {"rin": 0.6},
                                                     "copyright": {"vocaloid": 0.8}},
                                           "ram": {"general": {"lake": 0.6}},
+                                          "e621": {"general": {"anthro": 0.9}, "species": {"wolf": 0.8}, "character": {},
+                                                   "copyright": {}},
                                           "extra": {"general": {"sea": 0.7}, "character": {"luka": 0.6}}}])
-        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9}, "pixai": {"general": 0.8}, "ram": None,
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9}, "pixai": {"general": 0.8}, "ram": None, "e621": None,
                                            "extra": {"general": 0.7, "explicit": 0.2}}])
-        self.assertEqual(raw["models"], ["extra", "pixai", "ram", "wd"])
+        self.assertEqual(raw["models"], ["e621", "extra", "pixai", "ram", "wd"])
         self.store.save_raw("a", raw)
         self.assertEqual(self.store.raw("a"), raw)
         self.assertTrue(at.has_kind(raw, "extra"))
@@ -1660,26 +2096,26 @@ class TestAFourthTagger(Base):
         self.assertEqual(at.missing_kinds(old, S()), [])                                     # extra is off: nothing missing
         self.assertEqual(at.missing_kinds(old, S(use_extra=True)), ["extra"])
         self.assertEqual(at.missing_kinds(old, S(use_extra=True, use_wd=False, use_pixai=False, use_ram=False)), ["extra"])
-        self.assertEqual(at.missing_kinds(None, S()), ["wd", "pixai", "ram"])
-        self.assertEqual(at.missing_kinds(None, S(use_extra=True)), ["wd", "pixai", "ram", "extra"])
+        self.assertEqual(at.missing_kinds(None, S()), REAL)
+        self.assertEqual(at.missing_kinds(None, S(use_extra=True)), [*REAL, "extra"])
         self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9|extra:b=0.9"), S(use_extra=True)), [])
-        self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9"), S(use_wd=False, use_pixai=False, use_ram=False)), [])
+        self.assertEqual(at.missing_kinds(raw_of("wd:a=0.9"), S(use_wd=False, use_pixai=False, use_ram=False, use_e621=False)), [])
 
     def test_only_the_enabled_taggers_are_asked_for_and_stored(self):
         self.set(use_extra=True)
         self.run_indexer()
-        self.assertEqual(set(map(tuple, self.services.tag_models)), {("wd", "pixai", "ram", "extra")})
+        self.assertEqual(set(map(tuple, self.services.tag_models)), {(*REAL, "extra")})
         self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), "extra"))
         self.services.tag_models.clear()
         self.store.enqueue(self.ids[:2], "full")
         self.run_indexer(use_pixai=False, use_extra=False)
-        self.assertEqual(set(map(tuple, self.services.tag_models)), {("wd", "ram")})
+        self.assertEqual(set(map(tuple, self.services.tag_models)), {("wd", "ram", "e621")})
         self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), "pixai"))
         self.assertFalse(at.has_kind(self.store.raw(self.ids[0]), "extra"))
 
     EXTRA_PHOTO = PHOTO + "|extra:lake=0.9,sea=0.95|erating:general=0.9"
 
-    def test_the_fourth_tagger_takes_part_end_to_end(self):
+    def test_the_fifth_tagger_takes_part_end_to_end(self):
         self.catalog[0]["preview"] = self.EXTRA_PHOTO
         self.run_indexer(use_extra=True)
         self.assertEqual(self.description(0),
@@ -1688,7 +2124,7 @@ class TestAFourthTagger(Base):
         self.assertEqual((by["sea"]["source"], by["lake"]["source"], by["girl"]["source"], by["beach"]["source"]),
                          ("extra", "extra", "wd", "pixai"))
         self.assertEqual(by["sea"]["score"], 0.95)                          # the highest of pixai's .7 and extra's .95
-        self.assertEqual(self.store.raw(self.ids[0])["models"], ["extra", "pixai", "ram", "wd"])
+        self.assertEqual(self.store.raw(self.ids[0])["models"], ["e621", "extra", "pixai", "ram", "wd"])
         self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\n[/AI Tagger]")
 
     def test_enabling_it_later_makes_a_retag_a_full_reprocess(self):
@@ -1700,7 +2136,7 @@ class TestAFourthTagger(Base):
         self.assertEqual(at.reprocess(self.store, "outdated", "retag"), 3)  # only a retag was asked for ...
         self.run_indexer()
         self.assertEqual(sum(self.services.tag_calls), 1 + 1 + 3)           # ... but the stored scores lack an enabled tagger
-        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd", "pixai", "ram", "extra")})
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {(*REAL, "extra")})
         self.assertTrue(at.has_kind(self.store.raw(self.ids[0]), "extra"))
         self.services.tag_calls.clear()
         self.assertEqual(self.set(extra_strictness=0.6), ["extra_strictness"])
@@ -1708,7 +2144,7 @@ class TestAFourthTagger(Base):
         self.run_indexer()
         self.assertEqual(self.services.tag_calls, [])                       # complete now: a retag is cheap again
 
-    def test_a_retag_with_all_four_stored_needs_no_gpu(self):
+    def test_a_retag_with_all_five_stored_needs_no_gpu(self):
         self.catalog[0]["preview"] = self.EXTRA_PHOTO
         self.run_indexer(use_extra=True)
         self.services.tag_calls.clear()
@@ -1738,27 +2174,27 @@ class TestAFourthTagger(Base):
         self.assertNotIn("oral", self.description(0))                       # only WD is left that saw it
         self.assertEqual(self.services.tag_calls, calls)                    # (the stored scores were enough)
 
-    def test_the_preview_lists_all_four_taggers(self):
+    def test_the_preview_lists_all_five_taggers(self):
         self.catalog[0]["preview"] = self.EXTRA_PHOTO.replace("lake=0.9", "lake=0.9,wave=0.3")
         self.set(use_extra=True)
         got = self.indexer.test(self.ids[0])
-        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "extra", "rating"})
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "e621", "extra", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["extra"]}, {"sea": True, "lake": True, "wave": False})
-        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram", "extra"]])
+        self.assertEqual(self.services.tag_models, [[*REAL, "extra"]])
         self.assertEqual((got["models"]["rating"]["general"], got["models"]["rating"]["sensitive"]), (0.9, 0.04))
         self.assertEqual(self.services.ready_calls[0], {"tagger": True})
         self.assertIn("sea", {t["tag"] for t in got["tags"]})
 
-    def test_taking_it_out_again_leaves_the_real_three_working(self):
+    def test_taking_it_out_again_leaves_the_real_four_working(self):
         self.set(use_extra=True)
         self.run_indexer()
-        at.configure_taggers(at.TAGGERS[:3])                                # as if it had never been added
+        at.configure_taggers(at.TAGGERS[:4])                                # as if it had never been added
         settings = at.load_settings()
         self.assertNotIn("use_extra", settings)
         self.assertEqual(at.missing_kinds(self.store.raw(self.ids[0]), settings), [])        # its stored scores are just ignored
         built = at.build(self.store.raw(self.ids[0]), settings)
         self.assertEqual(tags_of(built), ["girl", "beach", "miku", "solo", "sea", "rating: general"])
-        self.assertEqual(set(built["models"]), {"wd", "pixai", "ram", "rating"})
+        self.assertEqual(set(built["models"]), {"wd", "pixai", "ram", "e621", "rating"})
 
 
 class TestFinalTags(unittest.TestCase):
@@ -2019,7 +2455,8 @@ class TestTaggerClient(unittest.TestCase):
         self.assertIsNone(results[1])
         (_, path, body), = [r for r in server.requests if r[1] == "/tag"]
         self.assertEqual([base64.b64decode(i) for i in body["images"]], [b"one", b"two"])
-        self.assertEqual(body["floor"], 0.05)
+        self.assertEqual(body["floor"], 0.2)                             # at 0.05 RAM++ alone sent ~4,400 tags per picture
+        self.assertEqual(body["floor"], at.FLOOR)
         self.assertNotIn("models", body)                                 # no list given: the service runs all of them
         self.assertEqual(client.health()["status"], "ok")
 
@@ -2029,20 +2466,33 @@ class TestTaggerClient(unittest.TestCase):
         at.Tagger(server.url).tag([b"x"], models=["wd", "ram"])
         (_, _, body), = [r for r in server.requests if r[1] == "/tag"]
         self.assertEqual(body["models"], ["wd", "ram"])
+        at.Tagger(server.url).tag([b"x"], models=["e621"])
+        self.assertEqual([r[2]["models"] for r in server.requests if r[1] == "/tag"], [["wd", "ram"], ["e621"]])
+        self.assertTrue(all(r[2]["floor"] == 0.2 for r in server.requests if r[1] == "/tag"))
 
-    def test_the_answer_of_the_service_with_ram_goes_through_as_it_is(self):
-        # the service's /tag answer: RAM++ nested under "general", no rating (docs/AI-TAGGER.md, v3)
+    def test_the_answer_of_the_service_with_ram_and_hydra_goes_through_as_it_is(self):
+        # the service's /tag answer: RAM++ nested under "general", Hydra under its four categories, neither with a
+        # rating (docs/AI-TAGGER.md, v3)
+        hydra = {"general": {"anthro": 0.93, "mammal": 0.99}, "species": {"wolf": 0.7}, "character": {},
+                 "copyright": {"norse mythology": 0.4}}
         answer = {"results": [{"wd": {"general": {"a": 0.9}, "character": {}, "rating": {"general": 1.0}},
                                "pixai": {"general": {"b": 0.8}, "character": {}, "copyright": {}, "rating": {"general": 0.9}},
-                               "ram": {"general": {"screenshot": 0.88, "text message": 0.62}}}, None],
+                               "ram": {"general": {"screenshot": 0.88, "text message": 0.62}}, "e621": hydra}, None],
                   "errors": [None, "cannot identify image file"], "tookMs": 412}
         server = self.serve({("POST", "/tag"): lambda b: (200, answer)})
-        results, errors = at.Tagger(server.url).tag([b"x", b"y"], models=["wd", "pixai", "ram"])
+        results, errors = at.Tagger(server.url).tag([b"x", b"y"], models=["wd", "pixai", "ram", "e621"])
         self.assertEqual(results[0]["ram"], {"general": {"screenshot": 0.88, "text message": 0.62}})
+        self.assertEqual(results[0]["e621"], hydra)
         raw = at.raw_from_results(results, errors)
         self.assertEqual(raw["scores"][0]["ram"], {"general": {"screenshot": 0.88, "text message": 0.62}})
-        self.assertEqual(raw["models"], ["pixai", "ram", "wd"])
-        self.assertEqual(raw["ratings"], [{"wd": {"general": 1.0}, "pixai": {"general": 0.9}, "ram": None}])
+        self.assertEqual(raw["scores"][0]["e621"], hydra)
+        self.assertEqual(raw["models"], ["e621", "pixai", "ram", "wd"])
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 1.0}, "pixai": {"general": 0.9}, "ram": None, "e621": None}])
+        # an old service that does not know Hydra answers without it: no entry, so it counts as missing
+        old = at.raw_from_results([{"wd": {"general": {"a": 0.9}, "character": {}, "rating": {"general": 1.0}},
+                                    "pixai": {"general": {}, "character": {}, "copyright": {}, "rating": {}},
+                                    "ram": {"general": {}}}], [None])
+        self.assertEqual((old["models"], at.missing_kinds(old, S())), (["pixai", "ram", "wd"], ["e621"]))
 
     def test_at_most_64_pictures_per_request(self):
         with self.assertRaises(ValueError):
@@ -2230,8 +2680,9 @@ class TestStore(Base):
         raw = raw_of(PHOTO, DOG)
         self.store.save_raw("a", raw)
         self.assertEqual(self.store.raw("a"), raw)
-        self.assertEqual(raw["models"], ["pixai", "ram", "wd"])
+        self.assertEqual(raw["models"], ["e621", "pixai", "ram", "wd"])
         self.assertEqual(raw["scores"][0]["ram"], {"general": {}})                     # RAM++ answered, with nothing to say
+        self.assertEqual(raw["scores"][0]["e621"], {"general": {}, "species": {}, "character": {}, "copyright": {}})
         self.assertIsNone(self.store.raw("b"))
 
     def test_raw_keeps_the_pixai_categories_and_both_ratings(self):
@@ -2240,16 +2691,20 @@ class TestStore(Base):
         self.assertEqual(raw["scores"], [{"wd": {"general": {"girl": 0.9}, "character": {"miku": 0.8}},
                                           "pixai": {"general": {"smile": 0.7}, "character": {"rin": 0.6},
                                                     "copyright": {"vocaloid": 0.8}},
-                                          "ram": {"general": {}}}])
-        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9}, "pixai": {"general": 0.8, "explicit": 0.2}, "ram": None}])
+                                          "ram": {"general": {}},
+                                          "e621": {"general": {}, "species": {}, "character": {}, "copyright": {}}}])
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.9}, "pixai": {"general": 0.8, "explicit": 0.2}, "ram": None,
+                                           "e621": None}])
         self.store.save_raw("a", raw)
         self.assertEqual(self.store.raw("a"), raw)
         self.assertTrue(at.has_kind(raw, "pixai"))
         self.assertFalse(at.has_kind(self.store.raw("nothing"), "pixai"))
         only_wd = at.raw_from_results([{"wd": {"general": {"a": 0.9}, "character": {}, "rating": {"general": 1.0}}}], [None])
         self.assertEqual((only_wd["models"], at.has_kind(only_wd, "wd"), at.has_kind(only_wd, "pixai")), (["wd"], True, False))
-        self.assertEqual(only_wd["scores"], [{"wd": {"general": {"a": 0.9}, "character": {}}, "pixai": None, "ram": None}])
+        self.assertEqual(only_wd["scores"], [{"wd": {"general": {"a": 0.9}, "character": {}}, "pixai": None, "ram": None,
+                                              "e621": None}])
         self.assertFalse(at.has_kind(only_wd, "ram"))
+        self.assertFalse(at.has_kind(only_wd, "e621"))
 
     def v1_store(self, ids):
         """A store as the RAM++ panel left it: written results with stored scores that have no PixAI entry."""
@@ -2278,7 +2733,7 @@ class TestStore(Base):
         raw = store.raw(self.ids[0])
         self.assertEqual(raw["scores"][0]["ram"], {"beach": 0.8})            # kept as v1 wrote it (flat) ...
         self.assertEqual(at.detect(raw, S(use_pixai=False))["tags"]["beach"], (0.8, "ram"))      # ... and read as RAM++'s tags
-        self.assertEqual(at.missing_kinds(raw, S()), ["pixai"])               # with PixAI on, a retag of it becomes a full
+        self.assertEqual(at.missing_kinds(raw, S()), ["pixai", "e621"])       # with PixAI and Hydra on, a retag becomes a full
         store.conn.close()
         again = at.Store(folder)                                            # opening it again does not bump it again
         self.addCleanup(again.conn.close)
@@ -2288,10 +2743,10 @@ class TestStore(Base):
     OLD_RESULTS = ("create table results (id text primary key, tags_json text, vlm_json text, description text, block text,"
                    " settings_version integer, processed_at text, written_at text, note text)")
 
-    def v2_store(self, blocks, taggers="wd,pixai,ram"):
+    def v2_store(self, blocks, taggers="wd,pixai,ram,e621"):
         """A store as the describer version left it: results with the old columns, whose blocks are ``blocks``. It knows
-        the registry as it is now (``taggers``), so that only the block format decides whether it is bumped; ``taggers``
-        None is a store from before the registry was remembered (then it had wd and pixai)."""
+        the registry as it is now (``taggers``, the four real ones), so that only the block format decides whether it is
+        bumped; ``taggers`` None is a store from before the registry was remembered (then it had wd and pixai)."""
         folder = Path(self.tmp.name) / "v2"
         folder.mkdir()
         conn = sqlite3.connect(str(folder / "tagger.sqlite"))
@@ -2347,38 +2802,73 @@ class TestStore(Base):
     def test_a_new_store_is_not_bumped_and_remembers_the_format(self):
         self.assertEqual(self.store.settings_version, 1)
         self.assertEqual((self.store.meta("block_format"), self.store.meta("raw_format")), (at.BLOCK_FORMAT, at.RAW_FORMAT))
-        self.assertEqual(self.store.meta("taggers"), "wd,pixai,ram")
+        self.assertEqual(self.store.meta("taggers"), "wd,pixai,ram,e621")
 
-    def test_ram_arriving_makes_results_made_without_it_outdated_once(self):
-        # a store from before RAM++ was registered: the panel remembered "wd,pixai" (or, in v2, nothing: wd and pixai)
+    def test_ram_and_hydra_arriving_make_results_made_without_them_outdated_once(self):
+        # a store from before RAM++ was registered: the panel remembered "wd,pixai" (or, in v2, nothing: wd and pixai).
+        # Both RAM++ and Hydra are on by default: the results lack the tags of both
         for taggers in ("wd,pixai", None):
             with self.subTest(remembered=taggers):
                 folder = self.v2_store([BLOCK], taggers=taggers)
-                store = at.Store(folder)                                    # RAM++ is on by default: the results lack its tags
-                self.assertEqual((store.settings_version, store.meta("taggers")), (2, "wd,pixai,ram"))
-                store.sync_catalog(self.catalog)
-                self.assertEqual(store.counts()["outdated"], 1)
-                store.conn.close()
-                again = at.Store(folder)                                    # once
-                self.assertEqual((again.settings_version, again.meta("taggers")), (2, "wd,pixai,ram"))
-                again.conn.close()
-                shutil.rmtree(folder)
+                try:
+                    store = at.Store(folder)
+                    self.assertEqual((store.settings_version, store.meta("taggers")), (2, "wd,pixai,ram,e621"))
+                    store.sync_catalog(self.catalog)
+                    self.assertEqual(store.counts()["outdated"], 1)
+                    store.conn.close()
+                    again = at.Store(folder)                                # once
+                    self.assertEqual((again.settings_version, again.meta("taggers")), (2, "wd,pixai,ram,e621"))
+                    again.conn.close()
+                finally:
+                    shutil.rmtree(folder, ignore_errors=True)
+
+    def test_hydra_arriving_makes_results_made_without_it_outdated_once(self):
+        # the store of the three-tagger panel: it knew wd, pixai and ram (and had no e621 scores)
+        folder = self.v2_store([BLOCK], taggers="wd,pixai,ram")
+        store = at.Store(folder)                                            # Hydra is on by default: the results lack its tags
+        self.addCleanup(store.conn.close)
+        self.assertEqual((store.settings_version, store.meta("taggers")), (2, "wd,pixai,ram,e621"))
+        store.sync_catalog(self.catalog)
+        self.assertEqual(store.counts()["outdated"], 1)
+        self.assertEqual(set(store.scope_ids("outdated")), {self.ids[0]})
+        store.conn.close()
+        again = at.Store(folder)                                            # once
+        self.addCleanup(again.conn.close)
+        self.assertEqual((again.settings_version, again.meta("taggers")), (2, "wd,pixai,ram,e621"))
+        # a result written afterwards is made with the new version: not outdated
+        again.save_result(self.ids[0], tags=[{"tag": "dog", "score": 0.9, "source": "e621"}], block=BLOCK2, version=2, written=True)
+        again.sync_catalog(self.catalog)
+        self.assertEqual(again.counts()["outdated"], 0)
+
+    def test_a_store_that_already_knows_hydra_is_not_bumped_by_it(self):
+        folder = self.v2_store([BLOCK], taggers="wd,pixai,ram,e621")
+        store = at.Store(folder)
+        self.addCleanup(store.conn.close)
+        self.assertEqual((store.settings_version, store.meta("taggers")), (1, "wd,pixai,ram,e621"))
+        store.conn.close()
+        again = at.Store(folder)
+        self.addCleanup(again.conn.close)
+        self.assertEqual((again.settings_version, again.meta("taggers")), (1, "wd,pixai,ram,e621"))
 
     def test_a_store_that_knows_ram_is_not_bumped_by_it(self):
+        # the panel as it was before Hydra: three taggers registered, the store knows all of them
+        saved = list(at.TAGGERS)
+        self.addCleanup(at.configure_taggers, saved)
+        at.configure_taggers(saved[:3])
         folder = self.v2_store([BLOCK], taggers="wd,pixai,ram")
         store = at.Store(folder)
         self.addCleanup(store.conn.close)
         self.assertEqual((store.settings_version, store.meta("taggers")), (1, "wd,pixai,ram"))
 
-    def test_a_fourth_tagger_that_is_on_by_default_makes_old_results_outdated_once(self):
-        folder = self.v2_store([BLOCK])                                     # knows wd, pixai and ram
+    def test_a_fifth_tagger_that_is_on_by_default_makes_old_results_outdated_once(self):
+        folder = self.v2_store([BLOCK])                                     # knows wd, pixai, ram and e621
         store = at.Store(folder)                                            # same registry as then: nothing to do
-        self.assertEqual((store.settings_version, store.meta("taggers")), (1, "wd,pixai,ram"))
+        self.assertEqual((store.settings_version, store.meta("taggers")), (1, "wd,pixai,ram,e621"))
         store.conn.close()
-        with_extra(self, EXTRA_ON)                                          # a fourth tagger that is on by default arrives
+        with_extra(self, EXTRA_ON)                                          # a fifth tagger that is on by default arrives
         store = at.Store(folder)
         self.addCleanup(store.conn.close)
-        self.assertEqual((store.settings_version, store.meta("taggers")), (2, "wd,pixai,ram,extra"))
+        self.assertEqual((store.settings_version, store.meta("taggers")), (2, "wd,pixai,ram,e621,extra"))
         store.sync_catalog(self.catalog)
         self.assertEqual(store.counts()["outdated"], 1)
         store.conn.close()
@@ -2387,27 +2877,32 @@ class TestStore(Base):
         self.assertEqual(again.settings_version, 2)
 
     def test_a_tagger_that_is_off_by_default_or_removed_changes_nothing(self):
-        folder = self.v2_store([BLOCK], taggers="wd,pixai,ram")
+        folder = self.v2_store([BLOCK], taggers="wd,pixai,ram,e621")
         with_extra(self)                                                    # EXTRA is off by default: no tags are missing
         store = at.Store(folder)
-        self.assertEqual((store.settings_version, store.meta("taggers")), (1, "wd,pixai,ram,extra"))
+        self.assertEqual((store.settings_version, store.meta("taggers")), (1, "wd,pixai,ram,e621,extra"))
         store.conn.close()
-        at.configure_taggers(list(at.TAGGERS[:3]))                          # and removing one is no reason either
+        at.configure_taggers(list(at.TAGGERS[:4]))                          # and removing one is no reason either
         again = at.Store(folder)
         self.addCleanup(again.conn.close)
-        self.assertEqual((again.settings_version, again.meta("taggers")), (1, "wd,pixai,ram"))
+        self.assertEqual((again.settings_version, again.meta("taggers")), (1, "wd,pixai,ram,e621"))
         again.conn.close()
-        at.configure_taggers(list(at.TAGGERS[:2]))                          # not even RAM++ going away again
+        at.configure_taggers(list(at.TAGGERS[:3]))                          # not even Hydra going away again
         gone = at.Store(folder)
         self.addCleanup(gone.conn.close)
-        self.assertEqual((gone.settings_version, gone.meta("taggers")), (1, "wd,pixai"))
+        self.assertEqual((gone.settings_version, gone.meta("taggers")), (1, "wd,pixai,ram"))
+        gone.conn.close()
+        at.configure_taggers(list(at.TAGGERS[:2]))                          # nor RAM++
+        last = at.Store(folder)
+        self.addCleanup(last.conn.close)
+        self.assertEqual((last.settings_version, last.meta("taggers")), (1, "wd,pixai"))
 
     def test_an_empty_store_opened_with_a_new_tagger_is_not_bumped(self):
         with_extra(self, EXTRA_ON)
         store = at.Store(Path(self.tmp.name) / "fresh")
         self.addCleanup(store.conn.close)
         self.assertEqual(store.settings_version, 1)
-        self.assertEqual(store.meta("taggers"), "wd,pixai,ram,extra")
+        self.assertEqual(store.meta("taggers"), "wd,pixai,ram,e621,extra")
 
     def test_a_new_store_or_one_with_pixai_scores_is_not_bumped(self):
         self.assertEqual(self.store.settings_version, 1)
@@ -2700,13 +3195,13 @@ class TestIndexer(Base):
         self.assertEqual(self.store.raw(self.ids[2])["captures"], 3)
         self.assertEqual(self.services.ready_calls[0], {"tagger": True})
         self.assertEqual(sum(self.services.tag_calls), 1 + 1 + 3 + 1)                # the unreadable file never got to the tagger
-        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd", "pixai", "ram")})     # the enabled ones are asked for
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {tuple(REAL)})     # the enabled ones are asked for
 
     def test_only_the_enabled_taggers_are_asked_for_and_stored(self):
-        self.run_indexer(use_pixai=False, use_ram=False)
+        self.run_indexer(use_pixai=False, use_ram=False, use_e621=False)
         self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd",)})
         raw = self.store.raw(self.ids[0])
-        self.assertEqual((at.has_kind(raw, "wd"), at.has_kind(raw, "pixai"), at.has_kind(raw, "ram")), (True, False, False))
+        self.assertEqual([at.has_kind(raw, key) for key in REAL], [True, False, False, False])
         self.assertEqual(raw["models"], ["wd"])
         self.assertNotIn("sea", self.description(0))                                 # a PixAI-only tag
         self.assertIn("girl", self.description(0))
@@ -2829,7 +3324,7 @@ class TestIndexer(Base):
         self.assertEqual(self.services.tag_calls, [16] * 5)
 
     def test_no_tagger_means_no_tags(self):
-        self.run_indexer(use_wd=False, use_pixai=False, use_ram=False)
+        self.run_indexer(use_wd=False, use_pixai=False, use_ram=False, use_e621=False)
         self.assertEqual(self.services.tag_calls, [])
         self.assertEqual(self.services.ready_calls[0], {"tagger": False})            # the container is not even started
         self.assertEqual(self.store.counts()["processed"], 4)               # no tagger to say "broken" about the last one
@@ -2978,7 +3473,7 @@ class TestReprocess(Base):
         at.reprocess(self.store, "outdated", "full")
         self.run_indexer()
         self.assertEqual(sum(self.services.tag_calls), 1 + 1 + 3)          # the video's three captures
-        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd", "pixai", "ram")})
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {tuple(REAL)})
 
     def test_without_stored_scores_retag_becomes_full(self):
         self.store.conn.execute("delete from raw where id=?", (self.ids[1],))
@@ -2988,7 +3483,8 @@ class TestReprocess(Base):
         self.assertEqual(self.services.tag_calls, [1])
 
     def make_v1(self, i):
-        """Turn asset i's stored scores into what the RAM++ service left (WD scores plus a "ram" entry, no PixAI)."""
+        """Turn asset i's stored scores into what the RAM++ service left (WD scores plus a "ram" entry, no PixAI and no
+        Hydra)."""
         scores = [{"wd": {"general": {"girl": 0.9}, "character": {}}, "ram": {"beach": 0.8}}]
         self.store.conn.execute("update raw set scores_json=?, rating_json=?, models=? where id=?",
                                 (json.dumps(scores), json.dumps([{"general": 0.9}]), "ram,wd", self.ids[i]))
@@ -3003,6 +3499,7 @@ class TestReprocess(Base):
         self.assertEqual(self.services.tag_calls, [1])                    # the taggers ran again for it, and only for it
         self.assertEqual(self.services.ready_calls[0], {"tagger": True})
         self.assertTrue(at.has_kind(self.store.raw(self.ids[1]), "pixai"))        # the stored scores are complete now
+        self.assertTrue(at.has_kind(self.store.raw(self.ids[1]), "e621"))
         self.assertIn("grass", self.description(1))                       # PixAI's tag is in the result
         self.assertEqual(self.store.queue(), [])
         self.services.tag_calls.clear()
@@ -3023,9 +3520,19 @@ class TestReprocess(Base):
         self.assertEqual(self.services.tag_calls, [1])
         self.assertEqual(self.store.counts()["processed"], 3)
 
-    def test_scores_without_pixai_are_fine_while_pixai_is_off(self):
+    def test_scores_without_hydra_make_a_retag_a_full_reprocess_even_with_pixai_off(self):
         self.make_v1(1)
-        self.set(use_pixai=False)                                          # nothing is lost: PixAI is not used
+        self.set(use_pixai=False)                                          # Hydra is on and the stored scores have none
+        at.reprocess(self.store, "ids", "retag", ids=[self.ids[1]])
+        self.run_indexer()
+        self.assertEqual(self.services.tag_calls, [1])
+        self.assertEqual({tuple(m) for m in self.services.tag_models}, {("wd", "ram", "e621")})      # PixAI is not asked for
+        self.assertTrue(at.has_kind(self.store.raw(self.ids[1]), "e621"))
+        self.assertFalse(at.has_kind(self.store.raw(self.ids[1]), "pixai"))
+
+    def test_scores_without_pixai_and_hydra_are_fine_while_both_are_off(self):
+        self.make_v1(1)
+        self.set(use_pixai=False, use_e621=False)                          # nothing is lost: neither is used
         at.reprocess(self.store, "ids", "retag", ids=[self.ids[1]])
         self.run_indexer()
         self.assertEqual((self.services.tag_calls, self.services.ready_calls), ([], []))
@@ -3049,7 +3556,9 @@ class TestReprocess(Base):
         self.assertEqual(self.services.tag_calls, [1])                         # PixAI is on and missing: the GPU runs
         raw = self.store.raw(self.ids[1])
         self.assertEqual(raw["scores"][0]["ram"], {"general": {}})             # what the v3 service answers (DOG: nothing)
-        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.95, "sensitive": 0.05}, "pixai": None, "ram": None}])
+        self.assertEqual(raw["scores"][0]["e621"], {"general": {}, "species": {}, "character": {}, "copyright": {}})
+        self.assertEqual(raw["ratings"], [{"wd": {"general": 0.95, "sensitive": 0.05}, "pixai": None, "ram": None,
+                                           "e621": None}])
         self.assertNotIn("beach", self.description(1))                         # the stale v1 RAM++ tag is gone with its row
         self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\n[/AI Tagger]")
 
@@ -3131,9 +3640,9 @@ class TestTestCard(Base):
         self.assertEqual((got["id"], got["name"], got["type"], got["captures"]), (self.ids[0], "IMG_0000.jpg", "IMAGE", 1))
         self.assertEqual(got["frames"], [at.data_url(PHOTO.encode())])
         self.assertTrue({t["tag"] for t in got["models"]["wd"]} >= {"girl", "hat"})
-        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "rating"})
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "e621", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["pixai"]}, {"beach": True, "sea": True, "wave": False})
-        self.assertEqual(got["models"]["ram"], [])                                    # PHOTO has no RAM++ tags
+        self.assertEqual((got["models"]["ram"], got["models"]["e621"]), ([], []))     # PHOTO has no RAM++ or Hydra tags
         self.assertEqual(got["models"]["rating"]["general"], 0.9)
         self.assertEqual(set(got), {"id", "name", "type", "captures", "frames", "models", "rules", "tags", "block",
                                     "currentDescription", "newDescription", "written"})        # no describer section, no description
@@ -3148,7 +3657,7 @@ class TestTestCard(Base):
         self.assertIsNone(self.store.raw(self.ids[0]))
         self.assertEqual(self.fake.asset_puts, [])
         self.assertEqual(self.services.ready_calls[0], {"tagger": True})
-        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram"]])
+        self.assertEqual(self.services.tag_models, [REAL])
 
     def test_the_trace_names_typed_combinations_by_line(self):
         self.set(rules=[rule(if_all=["girl", "beach"], add=["summer"])],
@@ -3202,7 +3711,7 @@ class TestTestCard(Base):
         self.assertEqual(at.PREVIEW_WAIT, 90)
 
     def test_no_tagger_models_selected(self):
-        self.set(use_wd=False, use_pixai=False, use_ram=False)
+        self.set(use_wd=False, use_pixai=False, use_ram=False, use_e621=False)
         got = self.indexer.test(self.ids[0])
         self.assertEqual(self.services.tag_calls, [])
         self.assertEqual(tags_of(got), [])
@@ -3293,7 +3802,9 @@ class TestServices(Base):
 
     def test_vram_gb_is_the_taggers_cap_and_nothing_else_is_derived(self):
         self.assertEqual(self.svc.env(), {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT)})
+        self.assertEqual(self.svc.env(), {"AITAGGER_VRAM_GB": "6"})              # four taggers: 6 GB, full speed
         lo, hi = at.VRAM_GB_LIMITS
+        self.assertEqual((lo, hi), (5, 8))
         for gb in (lo, hi):                                                 # AITAGGER_VRAM_GB = vram_gb, nothing else moves
             self.assertEqual(self.svc.env(S(vram_gb=gb)), {"AITAGGER_VRAM_GB": str(gb)})
         self.runner.gpu = "12288, 100"                                      # not derived from the card either
@@ -3538,7 +4049,8 @@ class TestWithRealClients(Base):
         self.assertEqual(self.description(1), "[AI Tagger]\nTags: dog, grass, rating: general\n[/AI Tagger]")
         requests = [r for r in tagger.requests if r[1] == "/tag"]
         self.assertEqual(len(requests), 1)                                                          # one batch
-        self.assertEqual(requests[0][2]["models"], ["wd", "pixai", "ram"])                          # only the enabled taggers
+        self.assertEqual(requests[0][2]["models"], REAL)                                            # only the enabled taggers
+        self.assertEqual(requests[0][2]["floor"], 0.2)
         self.assertEqual(runner.commands("compose"), [])                                            # it was running already
         status = services.status()
         self.assertEqual(status["tagger"]["status"], "ok")
@@ -3555,8 +4067,12 @@ class TestWithRealClients(Base):
         self.set(use_pixai=False)
         self.store.enqueue([self.ids[1]], "full")
         self.run_indexer()
-        self.assertEqual([r for r in tagger.requests if r[1] == "/tag"][-1][2]["models"], ["wd", "ram"])
+        self.assertEqual([r for r in tagger.requests if r[1] == "/tag"][-1][2]["models"], ["wd", "ram", "e621"])
         self.set(use_ram=False)
+        self.store.enqueue([self.ids[1]], "full")
+        self.run_indexer()
+        self.assertEqual([r for r in tagger.requests if r[1] == "/tag"][-1][2]["models"], ["wd", "e621"])
+        self.set(use_e621=False)
         self.store.enqueue([self.ids[1]], "full")
         self.run_indexer()
         self.assertEqual([r for r in tagger.requests if r[1] == "/tag"][-1][2]["models"], ["wd"])

@@ -1302,10 +1302,11 @@ class TestAiTagger(WebCase):
         data = self.get("/api/aitagger")
         self.assertEqual(data["settings"], self.at.DEFAULTS)
         self.assertEqual(data["limits"], {"video_frames": [1, 8], "batch_size": [1, 64],
-                                          "vram_gb": list(self.at.VRAM_GB_LIMITS), "wd_strictness": [0.05, 0.95],
-                                          "pixai_strictness": [0.05, 0.95], "ram_strictness": [0.05, 0.95],
-                                          "max_tags": [5, 100]})
-        self.assertEqual(data["limits"]["vram_gb"], [4, 8])                              # three taggers: 4-8 GB
+                                          "vram_gb": list(self.at.VRAM_GB_LIMITS), "wd_strictness": [0.2, 0.95],
+                                          "pixai_strictness": [0.2, 0.95], "ram_strictness": [0.2, 0.95],
+                                          "e621_strictness": [0.2, 0.95], "max_tags": [5, 100]})
+        self.assertEqual(data["limits"]["vram_gb"], [5, 8])                              # four taggers: 5-8 GB, default 6
+        self.assertEqual(data["settings"]["vram_gb"], 6)
         for gone in ("describe", "instructions", "language", "vlm_parallel"):       # the describer's settings are gone
             self.assertNotIn(gone, data["settings"])
             self.assertNotIn(gone, data["limits"])
@@ -1323,36 +1324,39 @@ class TestAiTagger(WebCase):
         with mock.patch.object(self.sp, "AITAGGER_EXCLUSIVE", False):
             self.assertIs(self.get("/api/aitagger")["service"]["exclusive"], False)
         self.assertEqual(data["models"], {"wd": "wd-eva02-large-tagger-v3", "pixai": "pixai-tagger-v1.0",
-                                          "ram": "RAM++ (swin-large)"})
-        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram"])                  # in registry order
+                                          "ram": "RAM++ (swin-large)", "e621": "Hydra 3.5 (e621)"})
+        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram", "e621"])          # in registry order
         self.assertEqual((data["settings"]["use_ram"], data["settings"]["ram_strictness"]), (True, 0.5))
+        self.assertEqual((data["settings"]["use_e621"], data["settings"]["e621_strictness"]), (True, 0.5))
         self.assertEqual(data["failures"], [])
         self.assertEqual(set(data["reprocessKeys"]), {"retag", "full"})
         self.assertIn("rules", data["reprocessKeys"]["retag"])
         self.assertIn("vocabulary", data["reprocessKeys"]["retag"])
-        self.assertEqual(sorted(data["reprocessKeys"]["full"]), ["use_pixai", "use_ram", "use_wd", "video_frames"])
+        self.assertEqual(sorted(data["reprocessKeys"]["full"]),
+                         ["use_e621", "use_pixai", "use_ram", "use_wd", "video_frames"])
         self.assertEqual(sorted(k for k in data["reprocessKeys"]["retag"] if k.endswith("_strictness")),
-                         ["pixai_strictness", "ram_strictness", "wd_strictness"])
+                         ["e621_strictness", "pixai_strictness", "ram_strictness", "wd_strictness"])
 
     def test_every_tagger_in_the_status_has_its_settings_and_limits(self):
         data = self.get("/api/aitagger")
         for key in data["models"]:
             self.assertIn(f"use_{key}", data["settings"])
             self.assertIn(f"{key}_strictness", data["settings"])
-            self.assertEqual(data["limits"][f"{key}_strictness"], [0.05, 0.95])
+            self.assertEqual(data["limits"][f"{key}_strictness"], [0.2, 0.95])
             self.assertIn(f"use_{key}", data["reprocessKeys"]["full"])
             self.assertIn(f"{key}_strictness", data["reprocessKeys"]["retag"])
 
-    def test_a_fourth_tagger_appears_in_the_status_and_works_through_the_routes(self):
+    def test_a_fifth_tagger_appears_in_the_status_and_works_through_the_routes(self):
         self.t.with_extra(self)
         data = self.get("/api/aitagger")
-        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram", "extra"])
+        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram", "e621", "extra"])
         self.assertEqual(data["models"]["extra"], "extra-tagger-test")
         self.assertEqual((data["settings"]["use_extra"], data["settings"]["extra_strictness"]), (False, 0.5))
-        self.assertEqual(data["limits"]["extra_strictness"], [0.05, 0.95])
+        self.assertEqual(data["limits"]["extra_strictness"], [0.2, 0.95])
         self.assertIn("use_extra", data["reprocessKeys"]["full"])
         self.assertIn("extra_strictness", data["reprocessKeys"]["retag"])
-        for changes in ({"use_extra": "yes"}, {"extra_strictness": 1.5}, {"extra_strictness": "0.5"}):
+        for changes in ({"use_extra": "yes"}, {"extra_strictness": 1.5}, {"extra_strictness": 0.19},
+                        {"extra_strictness": "0.5"}):
             self.refused(lambda: self.post("settings", {"changes": changes}), 400)
         data = self.post("settings", {"changes": {"use_extra": True, "extra_strictness": 0.4}})
         self.assertEqual((sorted(data["changed"]), data["suggest"]), (["extra_strictness", "use_extra"], "full"))
@@ -1360,38 +1364,70 @@ class TestAiTagger(WebCase):
         self.assertEqual((data["changed"], data["suggest"]), (["extra_strictness"], "retag"))
         self.catalog[0]["preview"] = self.t.PHOTO + "|extra:lake=0.9,wave=0.3|erating:general=0.9"
         got = self.post("preview", {"id": self.ids[0]})
-        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "extra", "rating"})
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "e621", "extra", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["extra"]}, {"lake": True, "wave": False})
-        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram", "extra"]])
+        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram", "e621", "extra"]])
         self.assertEqual({t["tag"]: t["source"] for t in got["tags"]}["lake"], "extra")
 
-    def test_the_fourth_tagger_is_gone_from_the_status_when_it_is_removed_again(self):
+    def test_the_fifth_tagger_is_gone_from_the_status_when_it_is_removed_again(self):
         saved = list(self.at.TAGGERS)
         self.addCleanup(self.at.configure_taggers, saved)
         self.at.configure_taggers([*saved, self.t.EXTRA])
         self.assertIn("extra", self.get("/api/aitagger")["models"])
         self.at.configure_taggers(saved)
         data = self.get("/api/aitagger")
-        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram"])
+        self.assertEqual(list(data["models"]), ["wd", "pixai", "ram", "e621"])
         self.assertNotIn("use_extra", data["settings"])
         self.refused(lambda: self.post("settings", {"changes": {"use_extra": True}}), 400)
 
     def test_ram_works_through_the_routes_and_its_noise_stays_out(self):
         self.catalog[0]["preview"] = self.t.RAM_PHOTO
         got = self.post("preview", {"id": self.ids[0]})
-        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "rating"})
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "e621", "rating"})
         self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["ram"]},
                          {"sea": True, "lake": True, "screenshot": True, "wave": False})        # no "image", no "catch"
         sources = {t["tag"]: t["source"] for t in got["tags"]}
         self.assertEqual((sources["lake"], sources["screenshot"], sources["sea"]), ("ram", "ram", "ram"))
         self.assertNotIn("image", sources)
         self.assertNotIn("catch", sources)
-        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram"]])
+        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram", "e621"]])
         data = self.post("settings", {"changes": {"use_ram": False}})
         self.assertEqual((data["changed"], data["suggest"]), (["use_ram"], "full"))
         got = self.post("preview", {"id": self.ids[0]})
-        self.assertEqual((got["models"]["ram"], self.services.tag_models[-1]), ([], ["wd", "pixai"]))
+        self.assertEqual((got["models"]["ram"], self.services.tag_models[-1]), ([], ["wd", "pixai", "e621"]))
         self.assertNotIn("lake", {t["tag"] for t in got["tags"]})
+
+    def test_hydra_works_through_the_routes_and_its_noise_and_characters_follow_the_settings(self):
+        self.catalog[0]["preview"] = self.t.E621_PHOTO
+        got = self.post("preview", {"id": self.ids[0]})
+        self.assertEqual(set(got["models"]), {"wd", "pixai", "ram", "e621", "rating"})
+        self.assertEqual({t["tag"]: t["kept"] for t in got["models"]["e621"]},
+                         {"anthro": True, "fur": True, "wolf": True, "canine": True, "fenrir": True,
+                          "norse mythology": True, "tail": False, "fox": False, "loki": False})     # no "mammal"
+        sources = {t["tag"]: t["source"] for t in got["tags"]}
+        self.assertEqual((sources["anthro"], sources["wolf"], sources["fenrir"], sources["norse mythology"]), ("e621",) * 4)
+        self.assertNotIn("mammal", sources)
+        self.assertEqual(self.services.tag_models, [["wd", "pixai", "ram", "e621"]])
+        self.assertEqual(got["models"]["rating"]["general"], 0.9)                        # Hydra has no rating to add
+        # its own strictness, checked like the others
+        for changes in ({"use_e621": "yes"}, {"e621_strictness": 0.19}, {"e621_strictness": 0.96}, {"e621_strictness": "0.5"}):
+            self.refused(lambda: self.post("settings", {"changes": changes}), 400)
+        data = self.post("settings", {"changes": {"e621_strictness": 0.25}})
+        self.assertEqual((data["changed"], data["suggest"]), (["e621_strictness"], "retag"))
+        got = self.post("preview", {"id": self.ids[0]})
+        self.assertTrue({"tail", "fox", "loki"} <= {t["tag"] for t in got["tags"]})       # 0.3, 0.25 and 0.3 pass 0.25
+        # the character switch takes its characters and series away, not its species
+        self.post("settings", {"changes": {"character_tags": False}})
+        got = self.post("preview", {"id": self.ids[0]})
+        names = {t["tag"] for t in got["tags"]}
+        self.assertEqual(names & {"fenrir", "loki", "norse mythology", "miku"}, set())
+        self.assertTrue({"wolf", "canine", "fox", "anthro"} <= names)
+        self.assertEqual(self.services.tag_models[-1], ["wd", "pixai", "ram", "e621"])
+        data = self.post("settings", {"changes": {"use_e621": False}})
+        self.assertEqual((data["changed"], data["suggest"]), (["use_e621"], "full"))
+        got = self.post("preview", {"id": self.ids[0]})
+        self.assertEqual((got["models"]["e621"], self.services.tag_models[-1]), ([], ["wd", "pixai", "ram"]))
+        self.assertNotIn("wolf", {t["tag"] for t in got["tags"]})
 
     def test_tagging_everything_through_the_routes(self):
         self.build()
@@ -1417,8 +1453,9 @@ class TestAiTagger(WebCase):
         self.assertEqual(self.get("/api/aitagger")["settings"]["max_tags"], 12)
         for changes in ({"max_tags": 3}, {"video_frames": "6"}, {"wd_strictness": 2}, {"nope": 1},
                         {"use_ram": "yes"}, {"ram_strictness": 2}, {"ram_strictness": "0.5"}, {"pixai_strictness": 2},
-                        {"use_pixai": "yes"},
-                        {"vram_gb": self.at.VRAM_GB_LIMITS[1] + 1},
+                        {"use_pixai": "yes"}, {"use_e621": 1}, {"e621_strictness": 2},
+                        {"wd_strictness": 0.1}, {"pixai_strictness": 0.05}, {"ram_strictness": 0.19},
+                        {"vram_gb": self.at.VRAM_GB_LIMITS[1] + 1}, {"vram_gb": 4}, {"vram_gb": 3},
                         {"rules": [{"if_all": ["a"]}]}, {"vocabulary": 5}):
             self.refused(lambda: self.post("settings", {"changes": changes}), 400)
         for key, value in (("describe", False), ("describe", "false"), ("instructions", "Be brief."), ("language", "German"),
@@ -1438,6 +1475,11 @@ class TestAiTagger(WebCase):
         self.assertEqual((sorted(data["changed"]), data["suggest"]), (["ram_strictness", "use_ram"], "full"))
         data = self.post("settings", {"changes": {"ram_strictness": 0.6}})
         self.assertEqual((data["changed"], data["suggest"]), (["ram_strictness"], "retag"))
+        data = self.post("settings", {"changes": {"use_e621": False, "e621_strictness": 0.7}})
+        self.assertEqual((data["settings"]["use_e621"], data["settings"]["e621_strictness"]), (False, 0.7))
+        self.assertEqual((sorted(data["changed"]), data["suggest"]), (["e621_strictness", "use_e621"], "full"))
+        data = self.post("settings", {"changes": {"e621_strictness": 0.2, "vram_gb": 5}})        # the new lower limits
+        self.assertEqual((data["settings"]["e621_strictness"], data["settings"]["vram_gb"]), (0.2, 5))
 
     def test_the_vocabulary_takes_combinations_and_refuses_unreadable_lines_with_the_line_number(self):
         text = "# renames and combinations\n1girl -> woman\nfurry + human -> human on anthro\nanthro | furry -> furry art\n" \
@@ -1534,9 +1576,9 @@ class TestAiTagger(WebCase):
                          (self.ids[0], "IMG_0000.jpg", "IMAGE", 1, False))
         self.assertEqual(set(data), {"id", "name", "type", "captures", "frames", "models", "rules", "tags",
                                      "block", "currentDescription", "newDescription", "written"})     # no describer section
-        self.assertEqual(set(data["models"]), {"wd", "pixai", "ram", "rating"})
+        self.assertEqual(set(data["models"]), {"wd", "pixai", "ram", "e621", "rating"})
         self.assertEqual({t["tag"] for t in data["models"]["pixai"]}, {"beach", "sea", "wave"})
-        self.assertEqual(data["models"]["ram"], [])                                          # PHOTO: nothing for RAM++
+        self.assertEqual((data["models"]["ram"], data["models"]["e621"]), ([], []))          # PHOTO: nothing for RAM++ or Hydra
         self.assertEqual(data["block"], "[AI Tagger]\nTags: girl, beach, miku, solo, sea, rating: general\n[/AI Tagger]")
         self.assertEqual(data["tags"][0], {"tag": "girl", "score": 0.9, "source": "wd"})
         self.assertEqual(data["currentDescription"], "")

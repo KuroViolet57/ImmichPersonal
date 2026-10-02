@@ -73,6 +73,18 @@ class Calibration(unittest.TestCase):
     def test_model_registry(self):
         self.assertEqual(self.ts.MODEL_NAMES, ("wd", "pixai", "ram", "e621"))
 
+    def test_the_panels_registry_is_what_the_service_answers(self):
+        # the panel's TAGGERS (immich_organizer/aitagger.py) and this service must agree on the keys, on Hydra's
+        # categories and on the lowest score that is ever sent
+        from immich_organizer import aitagger as at
+        ts = self.ts
+        self.assertEqual(tuple(kind.key for kind in at.TAGGERS), ts.MODEL_NAMES)
+        hydra = next(kind for kind in at.TAGGERS if kind.key == "e621")
+        self.assertEqual(hydra.categories, ts.E621_CATEGORIES)
+        self.assertFalse(hydra.has_rating)                                        # it answers without a "rating"
+        self.assertGreaterEqual(at.FLOOR, ts.E621_MIN_SCORE)                      # the panel never asks for less than Hydra sends
+        self.assertGreaterEqual(at.STRICTNESS[0], at.FLOOR)                       # no threshold below what is sent
+
     def test_oom_detection(self):
         ts = self.ts
         self.assertTrue(ts._is_oom(RuntimeError("CUDA out of memory. Tried to allocate 82.00 MiB")))
