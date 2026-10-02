@@ -2507,6 +2507,24 @@ class TestTaggerClient(unittest.TestCase):
             at.Tagger("http://127.0.0.1:1").tag([b"x"])
         self.assertIsNone(at.Tagger("http://127.0.0.1:1").health())
 
+    def test_a_dead_graphics_card_is_the_taggers_failure_not_the_pictures(self):
+        # 2026-10-02: after "CUDA failure 999" every picture failed instantly and 9,408 assets were marked failed
+        server = self.serve({("POST", "/tag"): lambda b: (200, {"results": [None, None], "errors": ['wd: Fail: [ONNXRuntimeError] : 1 : FAIL : CUDA failure 999: unknown error ; GPU=0 ; file=/onnxruntime_src/onnxruntime/core/providers/cuda/gpu_data_transfer.cc', 'wd: Fail: [ONNXRuntimeError] : 1 : FAIL : CUDA failure 999: unknown error ; GPU=0 ; file=/onnxruntime_src/onnxruntime/core/providers/cuda/gpu_data_transfer.cc']})})
+        with self.assertRaises(at.GpuBroken) as ctx:
+            at.Tagger(server.url).tag([b"x", b"y"])
+        self.assertIsInstance(ctx.exception, sp.ServiceDown)          # handled like a server that went away
+        self.assertIn("CUDA failure 999", str(ctx.exception))
+        for text in ("RuntimeError: CUDA error: an illegal memory access was encountered",
+                     "CUBLAS_STATUS_EXECUTION_FAILED", "device-side assert triggered"):
+            self.assertTrue(at._is_gpu_broken(text), text)
+        for text in ("cannot identify image file", "invalid base64", "CUDA out of memory", None, ""):
+            self.assertFalse(at._is_gpu_broken(text), text)            # a bad file, or what halving handles
+        server = self.serve({("POST", "/tag"): lambda b: (200, {"results": [None], "errors": ["CUDA out of memory"]})})
+        with self.assertRaises(at.GpuOOM):                              # out of memory stays out of memory
+            at.Tagger(server.url).tag([b"x"])
+        server = self.serve({("POST", "/tag"): lambda b: (200, {"results": [None], "errors": ["cannot identify image file"]})})
+        self.assertEqual(at.Tagger(server.url).tag([b"x"])[1], ["cannot identify image file"])   # still the picture's
+
     def test_out_of_memory_is_told_apart(self):
         server = self.serve({("POST", "/tag"): lambda b: (500, {"error": "CUDA out of memory. Tried to allocate 2 GiB"})})
         with self.assertRaises(at.GpuOOM):
@@ -3232,6 +3250,24 @@ class TestIndexer(Base):
         self.assertEqual(self.description(0).split("\n\n")[0], "Holiday in Spain.")
         self.assertIn("[AI Tagger]", self.description(0))
 
+    def test_a_dead_graphics_card_is_not_the_assets_fault(self):
+        real, calls = self.services.tag, []
+
+        def broken_once(images, models=None):
+            calls.append(len(images))
+            if len(calls) == 1:
+                raise at.GpuBroken("the tagger lost the graphics card: CUDA failure 999: unknown error")
+            return real(images, models=models)
+
+        self.services.tag = broken_once
+        with mock.patch.object(at.Indexer, "DROP_WAIT", 0):
+            self.run_indexer()
+        failed = dict(self.store.conn.execute("select id, error from failed").fetchall())
+        self.assertFalse([e for e in failed.values() if "CUDA" in e or "graphics card" in e])   # nobody blamed
+        self.assertEqual(set(failed), {self.ids[3], self.ids[4]})       # only the fixture's two unreadable files
+        self.assertEqual(self.store.counts()["processed"], 3)          # a fresh tagger did the rest
+        self.assertGreater(len(calls), 1)
+
     def test_service_down_is_not_the_assets_fault(self):
         self.services.down = True
         self.run_indexer()
@@ -3905,9 +3941,12 @@ class TestReprocess(Base):
         self.set(blocked=["car"])                                        # so that the queued retag really writes
         self.store.enqueue([self.ids[2]], "retag")
         before = len(self.fake.asset_puts)
+        self.indexer.refresh_catalog()
+        # The order work is handed out in (write threads may finish in any order, which made this test flaky)
+        self.assertEqual([i["id"] for i in self.store.work(1, skip=set())], [self.ids[2]])   # the queued video first
         self.run_indexer(batch_size=1)
-        order = [asset for asset, _body in self.fake.asset_puts[before:] if asset in (self.ids[2], self.ids[10])]
-        self.assertEqual(order, [self.ids[2], self.ids[10]])             # the queued video, then the new photo
+        written = {asset for asset, _body in self.fake.asset_puts[before:]}
+        self.assertTrue({self.ids[2], self.ids[10]} <= written)          # and then the new photo as well
 
     def test_a_strong_request_beats_a_weak_one_in_the_run(self):
         a = self.ids[0]
@@ -4121,6 +4160,18 @@ class TestServices(Base):
         self.tagger = FakeHealth(self.clock, self.runner, "immich_aitagger", tagger_after)
         self.svc = at.Services(self.tagger, runner=self.runner, store=self.store, clock=self.clock,
                                sleep=self.clock.sleep, search_stop=lambda: self.stopped_search.append(len(self.runner.calls)), **kw)
+
+    def test_a_dead_graphics_card_stops_the_tagger_so_the_next_round_starts_a_fresh_one(self):
+        self.svc.load()
+        self.assertEqual(self.runner.state.get("immich_aitagger"), "running")
+
+        def broken(images, models=None):
+            raise at.GpuBroken("the tagger lost the graphics card: CUDA failure 999")
+
+        self.tagger.tag = broken
+        with self.assertRaises(at.GpuBroken):
+            self.svc.tag([b"x"])
+        self.assertIn(["docker", "stop", "-t", "20", "immich_aitagger"], [c for c, _ in self.runner.calls])
 
     def test_vram_gb_is_the_taggers_cap_and_nothing_else_is_derived(self):
         self.assertEqual(self.svc.env(), {"AITAGGER_VRAM_GB": str(at.VRAM_GB_DEFAULT)})

@@ -115,6 +115,12 @@ class GpuOOM(Exception):
     """The tagger ran out of graphics memory for this request: send fewer pictures at once."""
 
 
+class GpuBroken(ServiceDown):
+    """The tagger's connection to the graphics card died (e.g. "CUDA failure 999: unknown error"). Every picture then
+    fails instantly while /health still says ok: on 2026-10-02 that marked 9,408 assets as failed in minutes. It is
+    the tagger's failure, not the pictures': the container is stopped so the next round starts a fresh one."""
+
+
 class ImmichDown(ServiceDown):
     """Immich does not answer (restarting, network). Not the asset's fault."""
 
@@ -832,6 +838,15 @@ def _is_oom(text: str) -> bool:
     return "out of memory" in (text or "").lower()
 
 
+_GPU_BROKEN = re.compile(r"cuda (failure|error)|cudaerror|cudnn_status|cublas_status|illegal memory access|"
+                         r"device-side assert|unspecified launch failure|no cuda-capable device|cuda driver", re.I)
+
+
+def _is_gpu_broken(text: str) -> bool:
+    """A graphics-card runtime failure (not out of memory, which halving handles)."""
+    return bool(text) and not _is_oom(text) and bool(_GPU_BROKEN.search(text))
+
+
 class Tagger:
     """HTTP client of the tagger container (every registered tagger runs in it)."""
 
@@ -875,6 +890,9 @@ class Tagger:
             raise RuntimeError("the tagger answered for a different number of pictures")
         if any(_is_oom(e) for e in errors if e):
             raise GpuOOM(next(e for e in errors if e and _is_oom(e)))
+        broken = next((e for e in errors if _is_gpu_broken(e)), None)
+        if broken:
+            raise GpuBroken(f"the tagger lost the graphics card: {broken[:200]}")
         return results, errors
 
 
@@ -972,7 +990,11 @@ class Services:
 
     # ---- the client
     def tag(self, images: list[bytes], models: list[str] | None = None) -> tuple[list, list]:
-        return self.tagger.tag(images, models=models)
+        try:
+            return self.tagger.tag(images, models=models)
+        except GpuBroken:
+            self.tagger_box.stop()              # its CUDA context is gone for good: the next round starts a fresh one
+            raise
 
     # ---- the graphics card
     def gpu(self) -> dict:
