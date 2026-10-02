@@ -16,7 +16,76 @@ This file is the contract between the parts. Change it when an interface changes
 | `vram_gb` | default **6**, limits **5–8** (four taggers: 5.77 GB at 6, ~11 pictures/s; under ~5 GB they don't load) |
 | Description block | `[AI Tagger]\nTags: …\n[/AI Tagger]` — no describer |
 | Vocabulary box | "Renames and combinations": `a -> b`, `a + b -> c`, `a \| b -> c`, `a + !b -> c`, `-tag` removes (see the section at the end of v3) |
+| Unloading | the panel **stops the container right after the work**: nothing left to tag and `/health` `idleSeconds` ≥ `unload_after` minutes (default **2**, limits **1–60**), never while the indexer works or a request is in flight (`busy`); after a Test-card use the models keep their place for the server's own 20 minutes first. The server's 20-minute exit stays as the backstop. Status `unload` object, countdown in the web tab and the app (see "Unloading the models and picking up new uploads") |
+| New uploads | a cheap change probe every `check_every` minutes (default **1**, limits **1–60**) instead of a full library read every 10 minutes; the full read only when the probe changed, and at least hourly. A new asset waits for Immich's preview file (up to 30 minutes) |
 | Indexer | pipelined across rounds: ≤ 2 tagger requests in flight (`Indexer.TAG_REQUESTS`) while the next round's pictures are prepared, so the GPU is not idle at round boundaries (see "Indexer: pipelined across rounds" in v3, panel side) |
+
+## Unloading the models and picking up new uploads (v3.2, 2026-10-03)
+
+The owner: "I do not want the models to take space even when they are not indexing or being used." One new photo used to
+keep the models in the graphics card for 20 minutes (the model server's own idle exit, `IDLE_EXIT_MINUTES`), and a new
+upload waited up to 10 minutes to be noticed. The AI Tagger and Search+ now work the same way; the shared code is in
+`searchplus.py` (`unload_status`, `IdleLoop`, `CatalogWatch`, `fetch_probe`). `tagger_service.py`, `embed_service.py` and
+the deploy files are unchanged.
+
+**Settings** (both features; whole minutes; not content settings, so no "outdated" bump and no reprocess):
+
+| Key | Default | Limits | Meaning |
+|---|---|---|---|
+| `unload_after` | 2 | 1–60 | the panel stops the model container once nothing is left to do and the server has been idle this long |
+| `check_every` | 1 | 1–60 | how often the panel asks Immich's database whether anything changed |
+
+**Unload rules.** The check runs from the indexer's waiting loop (it wakes at least every minute, `IDLE_POLL`; a loop that
+is working never checks). The panel stops the container when all of these hold: the indexer has nothing left to do (it is
+waiting for new photos, or `keep_updated` is off and it is winding down), `/health` is `ok` and its `idleSeconds` ≥
+`unload_after` × 60, no request is in flight (the tagger's `/health` `busy` is 0 *and* the panel has none out; the Search+
+server has no `busy`, so the panel counts its own requests), and no interactive grace is on.
+- **Interactive grace.** After a person used a model the short rule waits until the server's own idle time (its
+  `idleExitMinutes`, 20) has passed since that use. Interactive use is: the AI Tagger's Test card (`Indexer.test`:
+  preview and apply; `Services.mark_interactive`) and, for Search+, every text embedding (`Service.embed_text`: the Search+
+  search, the search engine paths of `/api/search`, smart albums and themes; a "like this photo" search needs no model).
+  The panel remembers the time (`interactive_age`); the indexer's own requests never count.
+- **Paused indexer.** With no indexer thread there is no waiting loop to run the check; if the models were loaded
+  interactively only the server's 20-minute exit applies.
+- **`keep_updated` off.** The thread still ends when everything is done, but first it waits out the short rule (the status
+  stays "up to date") and stops the container; with an interactive grace on it ends at once and the server's exit does it.
+  Start / Try again wakes it for new work.
+- A failing `docker stop`, or a health look that fails, never ends the indexer; the server's own exit is the net.
+
+**The `unload` object** in `GET /api/aitagger` (and `GET /api/searchplus`), computed from the (remembered, ≤ 5 s) `/health`
+and container state, so the polling stays cheap:
+```json
+"unload": {"loaded": true, "idleSeconds": 40, "unloadInSeconds": 80, "rule": "after-work", "busy": false}
+```
+`loaded`: the container runs (false: `idleSeconds` / `unloadInSeconds` / `rule` are null). `idleSeconds`: the server's, null while
+it loads. `unloadInSeconds`: when the container will be gone if nothing happens, null while busy. `rule` says which rule
+does it: `after-work` (the short rule), `interactive` (the grace, then the short rule) or `server` (the server's own exit:
+the indexer is paused, or `unload_after` is longer than the server waits). `busy`: a request is in flight or the indexer is
+working (no countdown then). The web tab shows "Models loaded · unloads in ~1 min 40 s if nothing new" or "Not loaded · GPU
+memory free" (Search+: "Model"); the app shows the same line, and both have the two settings (the web tab in "Speed and
+memory" and next to "keep it up to date" on the Search+ tab).
+
+**Picking up new uploads.** The 10-minute full read of the library list (`CATALOG_EVERY`) is gone. Every `check_every`
+minutes the indexer runs one small query through the same `docker exec immich_postgres psql` path (`fetch_probe`, about 0.2 s):
+```sql
+select (select count(*) from asset a where <live>),                                  -- live = not deleted, timeline or archive, image or video
+       (select coalesce(max(a."createdAt")::text,'') from asset a where <live>),      -- newest upload
+       (select coalesce(max(a."deletedAt")::text,'') from asset a),                   -- newest trashing
+       (select count(*) from asset_file f where f.type = 'preview'),                  -- previews made
+       (select coalesce(max(f."createdAt")::text,'') from asset_file f where f.type = 'preview')
+```
+The columns were checked against the live schema (`\d asset`, `\d asset_file`). `asset."updatedAt"` / `updateId` are *not*
+used: they move whenever anything is written to an asset, and the AI Tagger writes every description. The full library
+read (`fetch_catalog`) happens only when the probe's answer differs from the one at the last full read (new, deleted,
+trashed, archived or hidden assets, a new preview), when there has not been one yet, and at least every
+`SAFETY_SYNC` = 60 minutes. A failing probe changes nothing (the hourly read is the net); Start / Try again looks at
+once.
+
+**Not before Immich has finished.** The catalogue rows carry `added` (`asset."createdAt"`, epoch seconds; 0 = unknown, kept
+in the `assets` table of both stores, which add the column when they are opened). An asset with no preview file
+(`asset_file` of type `preview`; videos too) that was added less than `PREVIEW_GRACE` = 30 minutes ago is left out of the
+work list (`searchplus.READY`), not failed; the status line says how many wait. The probe notices the preview and the next
+read brings its path. After 30 minutes without one it is processed as before (the fallback to the original).
 
 ## v3 (2026-10-02) — supersedes v2 and v1 where they differ
 
@@ -1070,7 +1139,7 @@ Scopes: `ids` (list), `tag` (has that tag), `outdated` (version older than curre
 
 Same shape as Search+:
 - A daemon thread, `instance()`, and `autostart()` (when `settings.indexing`) called from `serve()`.
-- `CATALOG_EVERY = 600`.
+- ~~`CATALOG_EVERY = 600`~~ (v3.2: a probe every `check_every` minutes decides when the library list is read; see "Unloading the models and picking up new uploads").
 - 6 prep threads; at most 2 tagger requests in flight; `vlm_parallel` VLM requests in flight.
 - Work order: `queue` first, then unprocessed assets (newest first), skipping `excluded`.
 - "Service down" is not the asset's fault.
@@ -1174,6 +1243,7 @@ Status:
  "service": {"tagger": {"container": "running|stopped|missing|unknown", "status": "ok|loading|error|down", "error": null},
              "vlm": {"container": "...", "status": "ok|loading|down", "error": null},
              "gpu": {"totalGb": 24, "usedGb": 7.1}, "searchplusRunning": false},
+ "unload": {"loaded": true, "idleSeconds": 40, "unloadInSeconds": 80, "rule": "after-work|interactive|server", "busy": false},
  "models": {"wd": "wd-eva02-large-tagger-v3", "ram": "RAM++ (swin-large)", "vlm": "Qwen3.5-9B (FP8)"},
  "failures": [{"id", "name", "error", "attempts", "at"}]}
 ```

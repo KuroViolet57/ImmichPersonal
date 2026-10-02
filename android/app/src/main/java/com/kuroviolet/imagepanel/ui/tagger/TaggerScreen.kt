@@ -85,6 +85,7 @@ import com.kuroviolet.imagepanel.ui.components.ScreenTop
 import com.kuroviolet.imagepanel.ui.components.SectionCard
 import com.kuroviolet.imagepanel.ui.components.Segmented
 import com.kuroviolet.imagepanel.ui.components.Selection
+import com.kuroviolet.imagepanel.ui.components.UnloadLine
 import com.kuroviolet.imagepanel.ui.components.assetItems
 import com.kuroviolet.imagepanel.ui.components.fullSpan
 import com.kuroviolet.imagepanel.ui.components.plural
@@ -113,6 +114,7 @@ data class TagDraft(
     val characterTags: Boolean = true, val ratingTag: Boolean = true, val writeTags: Boolean = false,
     val use: Map<String, Boolean> = emptyMap(), val strictness: Map<String, Float> = emptyMap(), val maxTags: Int = 30,
     val videoFrames: Int = 6, val batchSize: Int = 8, val vramGb: Int = 8, val keepUpdated: Boolean = true,
+    val unloadAfter: Int = 2, val checkEvery: Int = 1,
     val rules: List<RuleDraft> = emptyList(),
 ) {
     /** The settings as the panel stores them (the tagger ones under their `use_<key>` / `<key>_strictness` keys). */
@@ -129,6 +131,8 @@ data class TagDraft(
         put("batch_size", JsonPrimitive(batchSize))
         put("vram_gb", JsonPrimitive(vramGb))
         put("keep_updated", JsonPrimitive(keepUpdated))
+        put("unload_after", JsonPrimitive(unloadAfter))
+        put("check_every", JsonPrimitive(checkEvery))
         put("rules", JsonArray(rules.filter { it.isUsable() }.map { r ->
             buildJsonObject {
                 putJsonArray("if_all") { splitTags(r.ifAll).forEach { add(it) } }
@@ -152,7 +156,8 @@ data class TagDraft(
                 strictness = known.associateWith { (s.d("${it}_strictness") ?: 0.5).toFloat() },
                 maxTags = s.i("max_tags") ?: 30, videoFrames = s.i("video_frames") ?: 6, batchSize = s.i("batch_size") ?: 8,
                 vramGb = s.i("vram_gb") ?: 8, keepUpdated = s.b("keep_updated") ?: true,
-                rules = s.a("rules").objects().map { r ->
+                unloadAfter = s.i("unload_after") ?: 2, checkEvery = s.i("check_every") ?: 1,
+                rules =s.a("rules").objects().map { r ->
                     RuleDraft(r.a("if_all").strings().joinToString(", "), r.a("if_any").strings().joinToString(", "),
                         r.a("unless").strings().joinToString(", "), r.a("add").strings().joinToString(", "), r.a("remove").strings().joinToString(", "))
                 },
@@ -440,6 +445,8 @@ private fun StatusCard(vm: TaggerVm) {
         val gpu = sv.o("gpu")
         Hint(serviceText(sv.o("tagger"), "Taggers") +
             (gpu.d("usedGb")?.let { " · GPU %.1f of %.0f GB in use".format(it, gpu.d("totalGb") ?: 24.0) } ?: ""))
+        // "Models loaded · unloads in ~1 min 40 s if nothing new" / "Not loaded · GPU memory free" (the status' `unload`)
+        UnloadLine(st.o("unload"), "Models")
         if (sv.b("exclusive") != false) Hint("Search+ is paused while the AI Tagger uses the GPU.")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Button(onClick = {
@@ -618,6 +625,12 @@ private fun SettingsCards(vm: TaggerVm) {
             Slider(value = d.vramGb.toFloat(), onValueChange = { vm.draft = d.copy(vramGb = it.toInt()) },
                 valueRange = vram.first.toFloat()..vram.last.toFloat())
             Hint("A change to the memory restarts the models the next time they load.")
+            NumberField("Unload the models after (minutes)", d.unloadAfter, { vm.draft = d.copy(unloadAfter = it) }, Modifier.fillMaxWidth(),
+                max = range("unload_after", 1, 60).last)
+            Hint("When everything is tagged and nothing new has come in for this long, the models are stopped and the graphics memory is free. After a Test of yours they stay loaded for 20 minutes instead.")
+            NumberField("Look for new uploads every (minutes)", d.checkEvery, { vm.draft = d.copy(checkEvery = it) }, Modifier.fillMaxWidth(),
+                max = range("check_every", 1, 60).last)
+            Hint("One tiny question to Immich's database. A new photo is tagged once Immich has made its preview.")
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Keep it up to date (tag new uploads)", modifier = Modifier.weight(1f))
                 Switch(checked = d.keepUpdated, onCheckedChange = { vm.draft = d.copy(keepUpdated = it) })

@@ -88,6 +88,7 @@ import com.kuroviolet.imagepanel.ui.components.ScreenTop
 import com.kuroviolet.imagepanel.ui.components.SectionCard
 import com.kuroviolet.imagepanel.ui.components.Segmented
 import com.kuroviolet.imagepanel.ui.components.Selection
+import com.kuroviolet.imagepanel.ui.components.UnloadLine
 import com.kuroviolet.imagepanel.ui.components.assetItems
 import com.kuroviolet.imagepanel.ui.components.fullSpan
 import com.kuroviolet.imagepanel.ui.components.plural
@@ -406,18 +407,12 @@ private fun IndexSheet(vm: SearchPlusVm, onClose: () -> Unit) {
             val cfg = st.o("settings")
             val indexing = cfg.b("indexing") == true
             Text(indexerText(ix, c).replaceFirstChar { it.uppercase() }, style = MaterialTheme.typography.titleMedium)
-            Hint(
-                when {
-                    sv.s("status") == "ok" -> {
-                        val left = (sv.d("idleExitMinutes") ?: 0.0) - (sv.d("idleSeconds") ?: 0.0) / 60
-                        "Model loaded on the GPU" + if ((sv.d("idleSeconds") ?: 0.0) > 60) " · unloads in ~${left.toInt() + 1} min if unused" else ""
-                    }
-                    sv.s("status") == "error" -> "Model failed to load: ${sv.str("error")}"
-                    sv.s("container") == "running" -> "Model loading…"
-                    sv.s("container") == "missing" -> "Model server not installed yet"
-                    else -> "Model not loaded — the GPU memory is free"
-                },
-            )
+            // "Model loaded · unloads in ~1 min 40 s if nothing new" / "Not loaded · GPU memory free" (the status' `unload`)
+            when {
+                sv.s("status") == "error" -> Hint("Model failed to load: ${sv.str("error")}")
+                sv.s("container") == "missing" -> Hint("Model server not installed yet")
+                else -> UnloadLine(st.o("unload"), "Model")
+            }
             val assets = c.i("assets") ?: 0
             val indexed = c.i("indexed") ?: 0
             LinearProgressIndicator(progress = { if (assets > 0) indexed.toFloat() / assets else 0f }, modifier = Modifier.fillMaxWidth())
@@ -452,6 +447,23 @@ private fun IndexSheet(vm: SearchPlusVm, onClose: () -> Unit) {
                     vm.action("settings", buildJsonObject { putJsonObject("changes") { put("keep_updated", on) } })
                 })
             }
+            // whole minutes, 1-60 (the panel's limits); saved with the button so a half-typed number is never sent
+            val savedUnload = cfg.i("unload_after") ?: 2
+            val savedCheck = cfg.i("check_every") ?: 1
+            var unloadAfter by remember { mutableIntStateOf(savedUnload) }
+            var checkEvery by remember { mutableIntStateOf(savedCheck) }
+            NumberField("Unload the model after (minutes)", unloadAfter, { unloadAfter = it }, Modifier.fillMaxWidth(), max = 60)
+            Hint("When everything is indexed and nothing new has come in for this long, the model is stopped and the graphics memory is free. After a search of yours it stays loaded for 20 minutes instead.")
+            NumberField("Look for new uploads every (minutes)", checkEvery, { checkEvery = it }, Modifier.fillMaxWidth(), max = 60)
+            Hint("One tiny question to Immich's database. A new photo is indexed once Immich has made its preview.")
+            FilledTonalButton(
+                enabled = unloadAfter != savedUnload || checkEvery != savedCheck,
+                onClick = {
+                    vm.action("settings", buildJsonObject {
+                        putJsonObject("changes") { put("unload_after", unloadAfter); put("check_every", checkEvery) }
+                    }, "Saved.")
+                },
+            ) { Text("Save") }
             val failures = st.a("failures").objects()
             if ((c.i("failed") ?: 0) > 0) {
                 Text("Could not index ${(c.i("failed") ?: 0).plural("item")}", style = MaterialTheme.typography.titleSmall)
