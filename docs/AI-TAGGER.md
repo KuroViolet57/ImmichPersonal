@@ -6,6 +6,17 @@ asset's Immich description. It runs in the background like Search+ and keeps new
 
 This file is the contract between the parts. Change it when an interface changes.
 
+## As deployed (v3.1, 2026-10-02) — read this first; older numbers further down are history
+
+| | |
+|---|---|
+| Taggers (`TAGGERS`) | `wd` WD EVA02-L v3 · `pixai` PixAI v1.0 · `ram` RAM++ (no rating, noise words) · `e621` Hydra 3.5 (general/species/character/copyright, no rating, noise `mammal`) |
+| Explicit-tag check | on a general/sensitive rating a tag in `EXPLICIT_TAGS` needs ≥ 2 enabled taggers (wd, pixai, e621 can confirm; ram shares only "condom") |
+| `FLOOR` / strictness | the panel asks for scores ≥ **0.2** (at 0.05 RAM++ alone sent ~4,400 tags per picture, all stored); `<key>_strictness` limits **0.2–0.95**, default 0.5 = each model's own threshold |
+| `vram_gb` | default **6**, limits **5–8** (four taggers: 5.77 GB at 6, ~11 pictures/s; under ~5 GB they don't load) |
+| Description block | `[AI Tagger]\nTags: …\n[/AI Tagger]` — no describer |
+| Vocabulary box | "Renames and combinations": `a -> b`, `a + b -> c`, `a \| b -> c`, `a + !b -> c`, `-tag` removes (see the section at the end of v3) |
+
 ## v3 (2026-10-02) — supersedes v2 and v1 where they differ
 
 The owner: the text describer "doesn't enhance or improve anything"; the description should hold **tags only**. Instead,
@@ -437,7 +448,7 @@ has_rating, default_on)`:
 - `categories` are the tag categories it answers with, `general` included; `rating` is separate. `character_categories`
   are those of them that the `character_tags` setting switches off (WD: `character`; PixAI: `character`, `copyright`).
 - `has_rating` says whether it answers with a rating; `default_on` is the default of `use_<key>`.
-- Registered today: `wd` (`general`, `character`; rating) and `pixai` (`general`, `character`, `copyright`; rating).
+- Registered today: `wd`, `pixai`, `ram`, `e621` (see "As deployed" at the top).
 
 `configure_taggers()` generates from the registry, in place: `DEFAULTS` (`use_<key>` = `default_on`, `<key>_strictness` =
 0.5), `LIMITS` (`<key>_strictness` 0.05-0.95), `CONTENT`, and `REPROCESS` (`use_*` in `full`, `*_strictness` in `retag`).
