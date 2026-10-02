@@ -49,13 +49,14 @@ PROJECT = "immich-aitagger"
 TAGGER_SERVICE = "tagger"      # the only compose service this module starts and stops
 
 # ---- graphics memory. PROVISIONAL: the v3 numbers (three taggers) are still being measured; change them here only.
-VRAM_GB_DEFAULT = 5           # setting `vram_gb`, its default: the memory cap of the taggers (AITAGGER_VRAM_GB)
-VRAM_GB_LIMITS = (4, 8)       # what `vram_gb` may be set to (three taggers don't load under ~3.5 GB)
+VRAM_GB_DEFAULT = 6           # setting `vram_gb`, its default: the memory cap of the taggers (AITAGGER_VRAM_GB)
+VRAM_GB_LIMITS = (5, 8)       # what `vram_gb` may be set to (four taggers don't load under ~5 GB; 6 = full speed)
 # ----
 
 DEFAULT_GPU_GB = 24           # when nvidia-smi can't say
 STATE_TTL = 5.0               # seconds a container's state is remembered (the status route is polled)
-FLOOR = 0.05                  # the tagger returns calibrated scores from this up
+FLOOR = 0.2                   # the tagger returns calibrated scores from this up (at 0.05 RAM++ alone sent ~4,400
+                              # tags per picture, all of them stored; nothing below 0.2 is ever kept or shown)
 DISPLAY_FLOOR = 0.2           # the Test card lists scores from this up (the kept ones always)
 CAPTURE_SIDE = 1024           # captures are at most this big
 PREVIEW_SIDE = 256            # pictures in the Test card
@@ -303,6 +304,11 @@ TAGGERS: list[TaggerKind] = [
     # after testing on 53 library pictures: it adds the most correct tags on real photos (docs/AI-TAGGER.md).
     TaggerKind("ram", "RAM++ (swin-large)", ("general",), has_rating=False,
                noise=frozenset({"image", "catch", "peak", "miss", "take", "wear", "label"})),
+    # Hydra 3.5 (RedRocket, e621 vocabulary: anthro, feral, human on anthro, species...). Fourth since v3: the owner's
+    # library has a lot of furry art the Danbooru taggers only call "furry". It votes in the explicit-tag check (on
+    # 190 everyday pictures it raised fewer sexual tags than WD or PixAI). "mammal" lands on every human: noise.
+    TaggerKind("e621", "Hydra 3.5 (e621)", ("general", "species", "character", "copyright"), ("character", "copyright"),
+               has_rating=False, noise=frozenset({"mammal"})),
     # (its key must be the key the tagger service answers /tag with; see docs/AI-TAGGER.md, "Adding a tagger")
 ]
 
@@ -327,7 +333,7 @@ FIXED_DEFAULTS = {
     "write_tags": False,
 }
 FIXED_LIMITS = {"video_frames": (1, 8), "batch_size": (1, 64), "vram_gb": VRAM_GB_LIMITS, "max_tags": (5, 100)}
-STRICTNESS = (0.05, 0.95)           # the limits of every ``<key>_strictness`` (calibrated: 0.5 = the model's own threshold)
+STRICTNESS = (0.2, 0.95)            # the limits of every ``<key>_strictness`` (calibrated: 0.5 = the model's own threshold)
 TEXT_LIMITS = {"vocabulary": 20000}
 MAX_BLOCKED, MAX_RULES, MAX_RULE_TAGS = 500, 100, 50
 RULE_KEYS = ("if_all", "if_any", "unless", "add", "remove")
