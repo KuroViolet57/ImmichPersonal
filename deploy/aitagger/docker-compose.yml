@@ -12,6 +12,9 @@ services:
     image: immich-aitagger:latest
     container_name: immich_aitagger
     restart: "no"
+    # A tiny init process as PID 1 passes Docker's stop signal on, so a stop (the panel unloading the model)
+    # is a clean, immediate exit instead of a 10 s wait and a kill (exit 137).
+    init: true
     mem_limit: 12g
     memswap_limit: 12g
     ports:
