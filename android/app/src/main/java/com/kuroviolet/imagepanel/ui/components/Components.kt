@@ -227,7 +227,8 @@ fun LazyGridScope.fullSpan(key: String? = null, content: @Composable LazyGridIte
 
 /**
  * A text box with a drop-down of suggestions (albums, people, tags) that works on phones: it opens
- * when the box is focused, filters as you type, and picking an entry calls [onPick].
+ * when the box is focused, filters as you type, and picking an entry calls [onPick]. With [filter] off the
+ * options are shown as they are (a list the panel already narrowed down to what is typed).
  */
 @Composable
 fun SuggestField(
@@ -239,14 +240,15 @@ fun SuggestField(
     modifier: Modifier = Modifier,
     placeholder: String = "",
     onDone: (() -> Unit)? = null,
+    filter: Boolean = true,
 ) {
     var focused by remember { mutableStateOf(false) }
     var dismissed by remember { mutableStateOf(false) }
     var widthPx by remember { mutableStateOf(0) }
     val density = LocalDensity.current
     val q = value.trim().lowercase()
-    val matches = remember(q, options) {
-        val base = if (q.isEmpty()) options else options.filter { it.first.lowercase().contains(q) }
+    val matches = remember(q, options, filter) {
+        val base = if (q.isEmpty() || !filter) options else options.filter { it.first.lowercase().contains(q) }
             .sortedByDescending { it.first.lowercase().startsWith(q) }
         base.take(80)
     }

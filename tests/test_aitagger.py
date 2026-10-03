@@ -3050,6 +3050,282 @@ class TestStore(Base):
         self.assertEqual(errors, [])
 
 
+# ---------------------------------------------------------------- every tag findable
+
+def tag_rows(*tags):
+    return [{"tag": t, "score": 1.0, "source": "wd"} for t in tags]
+
+
+STORED = {0: ["girl", "beach", "solo", "long hair"], 1: ["dog", "grass", "solo"], 2: ["dog", "car", "long hair"],
+          3: ["beach", "car"], 4: ["dog", "beach", "rare"]}
+# counts: beach 3, dog 3, car 2, long hair 2, solo 2, girl 1, grass 1, rare 1
+
+
+class TestTagsInTheStore(Base):
+    """The list of all tags (``list_tags``), the counts behind it and the lookups the tag search is built on."""
+
+    def setUp(self):
+        super().setUp()
+        self.store.sync_catalog(self.catalog)          # ids[0] is the newest (2026-01-05) ... ids[4] the oldest
+        for i, tags in STORED.items():
+            self.store.save_result(self.ids[i], tags=tag_rows(*tags), block="", version=1)
+
+    def recount(self):
+        return dict(self.store.conn.execute("select tag, count(*) from asset_tags group by tag").fetchall())
+
+    def counted(self):
+        return dict(self.store.conn.execute("select tag, n from tag_counts").fetchall())
+
+    def test_the_counts_are_kept_by_the_database_whatever_writes_the_tags(self):
+        self.assertEqual(self.counted(), self.recount())
+        self.assertEqual(self.counted()["dog"], 3)
+        self.store.save_result(self.ids[0], tags=tag_rows("girl", "zebra"), block="", version=2)     # a re-tag
+        self.assertEqual(self.counted(), self.recount())
+        self.assertEqual((self.counted()["solo"], self.counted()["zebra"]), (1, 1))
+        self.store.save_result(self.ids[1], tags=tag_rows("dog", "dog", "dog"), block="", version=2)  # repeats are one tag
+        self.assertEqual(self.counted(), self.recount())
+        self.assertNotIn("solo", self.counted())                                # its last asset lost it: the row is gone
+        self.store.forget(self.ids[2])
+        self.assertEqual(self.counted(), self.recount())
+        self.assertEqual(self.counted()["dog"], 2)
+        with self.store.conn:                                                   # any other way of deleting counts too
+            self.store.conn.execute("delete from asset_tags where tag = 'beach'")
+        self.assertEqual(self.counted(), self.recount())
+        self.assertNotIn("beach", self.counted())
+        self.assertTrue(all(n > 0 for n in self.counted().values()))
+
+    def test_a_store_made_before_the_counts_is_filled_once_when_opened(self):
+        folder = Path(self.tmp.name) / "old"
+        old = at.Store(folder)
+        with old.conn:                                                         # what an older version's file looks like
+            old.conn.executescript("drop trigger asset_tags_counted; drop trigger asset_tags_uncounted;"
+                                   "drop table tag_counts; delete from meta where key = 'tag_counts';")
+            old.conn.executemany("insert into asset_tags values (?,?)",
+                                 [("a", "dog"), ("b", "dog"), ("b", "cat"), ("c", "dog")])
+        old.conn.close()
+        store = at.Store(folder)
+        self.addCleanup(store.conn.close)
+        self.assertEqual(dict(store.conn.execute("select tag, n from tag_counts").fetchall()), {"dog": 3, "cat": 1})
+        self.assertEqual(store.meta("tag_counts"), at.TAG_COUNTS)
+        with store.conn:
+            store.conn.execute("insert into asset_tags values ('d', 'dog')")   # the triggers are back
+        self.assertEqual(dict(store.conn.execute("select tag, n from tag_counts").fetchall())["dog"], 4)
+        with store.conn:
+            store.conn.execute("update tag_counts set n = 99 where tag = 'cat'")
+        store.conn.close()
+        again = at.Store(folder)                                               # not counted again on every start
+        self.addCleanup(again.conn.close)
+        self.assertEqual(dict(again.conn.execute("select tag, n from tag_counts").fetchall())["cat"], 99)
+        again.rebuild_tag_counts()                                             # ... but it can be repaired
+        self.assertEqual(dict(again.conn.execute("select tag, n from tag_counts").fetchall())["cat"], 1)
+
+    def test_list_tags_most_used_first_with_counts_and_a_total(self):
+        got = self.store.list_tags()
+        self.assertEqual(got["total"], 8)
+        self.assertEqual([(t["tag"], t["count"]) for t in got["tags"]],
+                         [("beach", 3), ("dog", 3), ("car", 2), ("long hair", 2), ("solo", 2), ("girl", 1), ("grass", 1),
+                          ("rare", 1)])                                         # by count, then by name
+        self.assertEqual(self.store.list_tags("   ")["total"], 8)               # nothing to look for: all of them
+
+    def test_list_tags_finds_a_substring_anywhere_in_the_name(self):
+        pair = lambda q: [(t["tag"], t["count"]) for t in self.store.list_tags(q)["tags"]]  # noqa: E731
+        self.assertEqual(pair("dog"), [("dog", 3)])
+        self.assertEqual(pair("ea"), [("beach", 3)])
+        self.assertEqual(pair("o"), [("dog", 3), ("long hair", 2), ("solo", 2)])
+        self.assertEqual(pair("r"), [("car", 2), ("long hair", 2), ("girl", 1), ("grass", 1), ("rare", 1)])
+        self.assertEqual(pair("g h"), [("long hair", 2)])                       # a space inside is part of it
+        self.assertEqual(pair("zzz"), [])
+        self.assertEqual(self.store.list_tags("zzz"), {"tags": [], "total": 0})
+
+    def test_list_tags_normalises_the_search_like_every_tag(self):
+        for typed in ("LONG_Hair", " long  hair. ", "long hair", "Long/Hair", "long,hair"):
+            self.assertEqual([t["tag"] for t in self.store.list_tags(typed)["tags"]], ["long hair"], typed)
+        self.assertEqual(self.store.list_tags("_")["total"], 8)                 # nothing left of it once normalised
+        self.assertEqual(self.store.list_tags("%")["total"], 0)                 # % and _ are not wildcards
+        self.assertEqual(self.store.list_tags("x" * 200)["total"], 0)
+
+    def test_list_tags_pages_through_all_of_them(self):
+        seen = []
+        for offset in range(0, 9, 3):
+            page = self.store.list_tags(limit=3, offset=offset)
+            self.assertEqual(page["total"], 8)
+            seen += [t["tag"] for t in page["tags"]]
+        self.assertEqual(seen, [t["tag"] for t in self.store.list_tags(limit=100)["tags"]])
+        self.assertEqual(len(seen), 8)
+        self.assertEqual(self.store.list_tags(limit=3, offset=8), {"tags": [], "total": 8})
+        paged = self.store.list_tags("o", limit=2, offset=1)
+        self.assertEqual(([t["tag"] for t in paged["tags"]], paged["total"]), (["long hair", "solo"], 3))
+
+    def test_counts_follow_the_live_assets_and_new_results_show_at_once(self):
+        self.assertEqual(self.store.list_tags("rare")["tags"], [{"tag": "rare", "count": 1}])
+        self.store.sync_catalog(self.catalog[:4])                               # ids[4] is gone from the library
+        self.assertEqual(self.store.list_tags("rare"), {"tags": [], "total": 0})
+        self.assertEqual({t["tag"]: t["count"] for t in self.store.list_tags("")["tags"]}["dog"], 2)
+        self.assertEqual(self.store.list_tags()["total"], 7)
+        self.store.sync_catalog(self.catalog)                                   # and back
+        self.assertEqual(self.store.list_tags("rare")["total"], 1)
+        self.assertEqual({t["tag"]: t["count"] for t in self.store.list_tags("")["tags"]}["dog"], 3)
+        self.store.save_result(self.ids[3], tags=tag_rows("zebra"), block="", version=1)
+        self.assertEqual(self.store.list_tags("zebra")["tags"], [{"tag": "zebra", "count": 1}])
+        self.assertEqual(self.store.list_tags("car")["tags"], [{"tag": "car", "count": 1}])      # ids[3] lost it
+
+    def test_the_top_tags_of_the_assets_list_come_from_the_same_counts(self):
+        data = self.store.list_assets()
+        self.assertEqual(data["tags"][:2], [{"tag": "beach", "count": 3}, {"tag": "dog", "count": 3}])
+        self.assertEqual(data["tagsTotal"], 8)
+        self.assertEqual(self.store.top_tags(3), data["tags"][:3])
+        many = at.Store(Path(self.tmp.name) / "many")
+        self.addCleanup(many.conn.close)
+        many.save_result("x", tags=tag_rows(*[f"t{i:03d}" for i in range(300)]), block="", version=1)
+        self.assertEqual(len(many.top_tags()), 200)                             # the list is capped, the total says so
+        self.assertEqual(many.list_assets()["tagsTotal"], 300)
+
+    def test_ids_with_tags_all_or_any(self):
+        ids = lambda *tags, mode="all": self.store.ids_with_tags(list(tags), mode)  # noqa: E731
+        self.assertEqual(ids("dog"), {self.ids[1], self.ids[2], self.ids[4]})
+        self.assertEqual(ids("dog", "beach"), {self.ids[4]})
+        self.assertEqual(ids("dog", "beach", "solo"), set())
+        self.assertEqual(ids("dog", "beach", mode="any"), {self.ids[0], self.ids[1], self.ids[2], self.ids[3], self.ids[4]})
+        self.assertEqual(ids("long hair", "car", mode="any"), {self.ids[0], self.ids[2], self.ids[3]})
+        self.assertEqual(ids("dog", "dog", "dog"), ids("dog"))                    # a repeat changes nothing
+        self.assertEqual(ids("dog", "nobody has this"), set())                     # "all" of a tag nobody has
+        self.assertEqual(ids("dog", "nobody has this", mode="any"), ids("dog"))    # "any" just ignores it
+        self.assertEqual(ids("nobody has this", mode="any"), set())
+        self.assertEqual(ids(), set())
+        self.assertEqual(ids(mode="any"), set())
+        with self.assertRaises(ValueError):
+            ids("dog", mode="some")
+
+    def test_ids_with_tags_leaves_out_assets_the_library_no_longer_has(self):
+        self.store.sync_catalog(self.catalog[:4])
+        self.assertEqual(self.store.ids_with_tags(["dog"]), {self.ids[1], self.ids[2]})
+        self.assertEqual(self.store.ids_with_tags(["rare"], "any"), set())
+
+    def test_newest_lists_the_wanted_assets_newest_first_with_the_catalogue_names_and_dates(self):
+        everyone = set(self.ids)
+        rows, total = self.store.newest(everyone)
+        self.assertEqual([r["id"] for r in rows], self.ids[:5])                    # 2026-01-05 ... 2025-11-01
+        self.assertEqual(total, 5)
+        self.assertEqual(rows[0], {"id": self.ids[0], "name": "IMG_0000.jpg", "type": "IMAGE", "date": "2026-01-05"})
+        self.assertEqual(rows[2]["type"], "VIDEO")
+        self.assertEqual([r["id"] for r in self.store.newest({self.ids[3], self.ids[1]})[0]], [self.ids[1], self.ids[3]])
+        rows, total = self.store.newest(everyone, limit=2)
+        self.assertEqual(([r["id"] for r in rows], total), (self.ids[:2], 5))     # the total counts past the limit
+        self.assertEqual(self.store.newest(everyone, media="VIDEO")[0][0]["id"], self.ids[2])
+        self.assertEqual([r["id"] for r in self.store.newest(everyone, after="2026-01-04")[0]], self.ids[:2])
+        self.assertEqual([r["id"] for r in self.store.newest(everyone, before="2025-12-01")[0]], self.ids[3:5])
+        self.assertEqual([r["id"] for r in self.store.newest(everyone, after="2026-01-03", before="2026-01-04")[0]],
+                         self.ids[1:3])
+        self.assertEqual([r["id"] for r in self.store.newest(everyone, skip=[self.ids[0], self.ids[4]])[0]], self.ids[1:4])
+        self.assertEqual(self.store.newest(set()), ([], 0))
+        self.store.sync_catalog(self.catalog[:4])                                  # a gone asset is not listed
+        self.assertEqual([r["id"] for r in self.store.newest(everyone)[0]], self.ids[:4])
+
+    def test_newest_gives_the_same_whether_it_looks_assets_up_or_reads_the_whole_list(self):
+        everyone = set(self.ids)
+        for kw in ({}, {"limit": 2}, {"media": "IMAGE"}, {"after": "2025-12-01", "before": "2026-01-04"},
+                   {"skip": [self.ids[1]]}):
+            by_key = self.store.newest(everyone, **kw)
+            with mock.patch.object(at, "NEWEST_LOOKUP_MAX", 0):
+                one_pass = self.store.newest(everyone, **kw)
+            self.assertEqual(by_key, one_pass, kw)
+        self.assertEqual(len(self.store.newest(everyone)[0]), 5)
+
+
+class TestTagSearchIsFast(unittest.TestCase):
+    """Speed-shaped: the live library has 21,000 tags on 73,000 assets (4.2 million rows). Here 21,000 tags on 20,000
+    assets (500,000 rows). The checks are the shape of the queries (which index, which table) plus a very loose clock."""
+
+    TAGS, ASSETS, PER_ASSET = 21000, 20000, 25
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.store = at.Store(Path(cls.tmp.name))
+        rows = []
+        for i in range(cls.ASSETS):
+            rows.append((f"a{i:06d}", "IMAGE", f"2026-01-{i % 28 + 1:02d} 10:00:00", f"IMG_{i}.jpg", 0))
+        with cls.store.conn:
+            cls.store.conn.executemany("insert into assets (id, type, taken, name, gone) values (?,?,?,?,?)", rows)
+            cls.store.conn.executemany(
+                "insert into asset_tags values (?,?)",
+                ((f"a{i:06d}", "solo" if j == 0 else f"tag {(i * 31 + j * 997) % cls.TAGS:05d}")
+                 for i in range(cls.ASSETS) for j in range(cls.PER_ASSET)))
+        cls.store._changes += 1
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.conn.close()
+        cls.tmp.cleanup()
+
+    def timed(self, fn, *args, **kw):
+        started = time.perf_counter()
+        out = fn(*args, **kw)
+        return out, time.perf_counter() - started
+
+    def test_the_summary_is_small_and_the_search_reads_only_it(self):
+        s = self.store
+        self.assertGreater(s.conn.execute("select count(*) from asset_tags").fetchone()[0], 450000)
+        distinct = s.conn.execute("select count(distinct tag) from asset_tags").fetchone()[0]
+        self.assertGreater(distinct, 20000)
+        self.assertEqual(s.conn.execute("select count(*) from tag_counts").fetchone()[0], distinct)
+        first, t_first = self.timed(s.list_tags, "tag 1")                      # builds the in-memory index
+        again, t_again = self.timed(s.list_tags, "tag 1")
+        self.assertEqual(first, again)
+        self.assertGreater(first["total"], 1000)
+        self.assertEqual(len(first["tags"]), 50)
+        self.assertLess(t_first, 0.5, f"first search took {t_first * 1000:.0f} ms")
+        self.assertLess(t_again, 0.1, f"repeated search took {t_again * 1000:.0f} ms")
+        seen = []
+        s.conn.set_trace_callback(seen.append)
+        try:
+            for q in ("solo", "tag 0123", "9", ""):
+                got, took = self.timed(s.list_tags, q, 50, 100)
+                self.assertLess(took, 0.1, f"{q!r}: {took * 1000:.0f} ms")
+            self.assertEqual(got["total"], distinct)                           # (the last one was "": all of them)
+        finally:
+            s.conn.set_trace_callback(None)
+        self.assertEqual(seen, [], "a tag search must not touch the database once the index is built")
+
+    def test_the_index_is_rebuilt_from_the_small_table_not_from_the_rows(self):
+        s = self.store
+        seen = []
+        s.conn.set_trace_callback(seen.append)
+        try:
+            s._changes += 1
+            _, took = self.timed(s.tag_index)
+        finally:
+            s.conn.set_trace_callback(None)
+        self.assertLess(took, 0.5, f"{took * 1000:.0f} ms")
+        reads = [q for q in seen if "asset_tags" in q]
+        self.assertTrue(all("a.gone = 1" in q for q in reads), reads)         # only the gone assets' own tags
+        plan = " ".join(r[3] for r in s.conn.execute("explain query plan " + reads[0]))
+        self.assertNotIn("SCAN t", plan)                                       # the tags of an asset by primary key
+        self.assertIn("PRIMARY KEY", plan)
+
+    def test_looking_up_assets_by_tag_uses_the_index(self):
+        s = self.store
+        seen = []
+        s.conn.set_trace_callback(seen.append)
+        try:
+            all_ids, t_all = self.timed(s.ids_with_tags, ["tag 00031", "solo"], "all")
+            any_ids, t_any = self.timed(s.ids_with_tags, ["tag 00031", "tag 00032"], "any")
+        finally:
+            s.conn.set_trace_callback(None)
+        self.assertTrue(all_ids and any_ids and len(all_ids) < len(any_ids))
+        self.assertLess(t_all, 0.2, f"{t_all * 1000:.0f} ms")
+        self.assertLess(t_any, 0.2, f"{t_any * 1000:.0f} ms")
+        lookups = [q for q in seen if "from asset_tags" in q]
+        self.assertEqual(len(lookups), 2)
+        for q in lookups:
+            plan = " ".join(r[3] for r in s.conn.execute("explain query plan " + q))
+            self.assertNotIn("SCAN asset_tags", plan, plan)                    # never a pass over the 500,000 rows
+            self.assertNotIn("SCAN t0", plan, plan)
+            self.assertIn("asset_tags_tag", plan, plan)                        # the index on the tag
+        # the rarest tag drives the "all" search and the common one ("solo", on every asset) is only looked up per asset
+        self.assertIn("t0.tag = 'tag 00031'", lookups[0])
+
+
 # ---------------------------------------------------------------- writing to Immich
 
 class TestWriteBack(Base):

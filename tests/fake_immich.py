@@ -17,6 +17,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 API_KEY = "test-key"
 
 
+def _plain_text(text: str) -> str:
+    """Lower case with the accents taken off, the way Immich compares a description (``f_unaccent`` + ``ilike``)."""
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(c))
+
+
 def make_assets(count: int = 40) -> list[dict]:
     assets = []
     for i in range(count):
@@ -62,6 +68,8 @@ class FakeImmich:
         self.asset_puts: list[tuple[str, dict]] = []
         self.mangle_description = None      # a callable that changes a description as it is stored (Immich "trimming")
         self.requests: list[tuple[str, str]] = []
+        self.searches: list[tuple[str, dict]] = []      # every smart / metadata search body, in order
+        self.max_page = 1000                            # Immich caps `size` at 1000; a test lowers it to make results span pages
         self.fail_next: dict[str, int] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -400,7 +408,7 @@ class FakeImmich:
         return out
 
     def _page(self, ids: list[str], body: dict) -> dict:
-        size = int(body.get("size") or 100)
+        size = min(int(body.get("size") or 100), self.max_page)
         page = int(body.get("page") or 1)
         start = (page - 1) * size
         window = ids[start : start + size]
@@ -435,20 +443,29 @@ class FakeImmich:
         return True
 
     def _smart(self, body: dict) -> dict:
+        self.searches.append(("smart", dict(body)))
         if body.get("queryAssetId"):
             ids = self.similar_results.get(body["queryAssetId"], [])
         else:
             ids = self.smart_results.get(body.get("query", ""), [])
         ids = [i for i in ids if i in self.by_id and self._matches_filters(self.by_id[i], body)]
-        return self._page(ids, body)
+        return self._page(ids, body)             # (SmartSearchDto has no `description` filter: it is not looked at)
 
     def _metadata(self, body: dict) -> dict:
+        self.searches.append(("metadata", dict(body)))
         album_ids = body.get("albumIds") or []
         if album_ids:
             ids = [i for album_id in album_ids for i in self.album_members.get(album_id, [])]
         else:
             ids = [a["id"] for a in self.assets]
         ids = [i for i in ids if self._matches_filters(self.by_id[i], body)]
+        # MetadataSearchDto.description: "the description contains this text" (Immich: case and accents ignored)
+        text = _plain_text(body.get("description") or "")
+        if text:
+            ids = [i for i in ids
+                   if text in _plain_text((self.by_id[i].get("exifInfo") or {}).get("description") or "")]
+        if body.get("order") in ("asc", "desc"):         # (without `order` the fake keeps the order of its assets)
+            ids.sort(key=lambda i: (self.by_id[i]["fileCreatedAt"], i), reverse=body["order"] == "desc")
         return self._page(ids, body)
 
     def _album_assets(self, album_id: str, method: str, body: dict) -> list[dict]:

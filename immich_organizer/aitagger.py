@@ -1165,6 +1165,7 @@ create table if not exists assets (
   duration_ms integer default 0, gone integer default 0, added integer default 0
 );
 create index if not exists assets_taken on assets(taken desc, id);
+create index if not exists assets_gone on assets(id) where gone = 1;
 create table if not exists raw (
   id text primary key, captures integer, scores_json text, rating_json text, tagged_at text, models text
 );
@@ -1180,9 +1181,23 @@ create table if not exists excluded (id text primary key, at text);
 create table if not exists meta (key text primary key, value text);
 create table if not exists asset_tags (id text, tag text, primary key (id, tag)) without rowid;
 create index if not exists asset_tags_tag on asset_tags(tag);
+create table if not exists tag_counts (tag text primary key, n integer not null) without rowid;
+create trigger if not exists asset_tags_counted after insert on asset_tags begin
+  insert into tag_counts (tag, n) values (new.tag, 1) on conflict(tag) do update set n = n + 1;
+end;
+create trigger if not exists asset_tags_uncounted after delete on asset_tags begin
+  update tag_counts set n = n - 1 where tag = old.tag;
+  delete from tag_counts where tag = old.tag and n <= 0;
+end;
 """
+# ``tag_counts`` is one row per distinct tag with the number of ``asset_tags`` rows (kept by the two triggers, so every
+# way of writing or deleting tags is counted; nothing may replace rows with ``insert or replace``, which does not fire
+# delete triggers). It is what the tag search and the "most common tags" read: the covering index of ``asset_tags`` has
+# 4.2 million entries on the live library, a substring scan of it takes 180 ms, the 21,000-row table a few ms.
 RAW_FORMAT = "2"        # meta.raw_format; 1 (no entry) = stored tagger scores with RAM++, 2 = with PixAI
 BLOCK_FORMAT = "3"      # meta.block_format; before v3 (no entry) a block could hold a "Description:" line
+TAG_COUNTS = "1"        # meta.tag_counts; no entry = ``tag_counts`` was never filled from ``asset_tags``
+NEWEST_LOOKUP_MAX = 20000   # ``Store.newest`` looks up up to this many assets by key; more are found in one pass over the list
 LEGACY_TAGGERS = ("wd", "pixai")        # the registry as it was before it was remembered (meta.taggers)
 _ITEM = "a.id, a.type, a.preview, a.original, a.duration_ms, a.taken, a.name"
 _ITEM_KEYS = ("id", "type", "preview", "original", "duration_ms", "taken", "name")
@@ -1209,7 +1224,7 @@ class Store:
                 self.conn.execute("alter table assets add column added integer default 0")
         self._meta = dict(self.conn.execute("select key, value from meta").fetchall())
         self._changes = 0
-        self._tags_cache: tuple[int, list] | None = None
+        self._tag_index: tuple[tuple, list, dict] | None = None      # (key, [(tag, count)] best first, {tag: count})
         self._migrate()
 
     def _migrate(self) -> None:
@@ -1243,6 +1258,17 @@ class Store:
             self.bump_settings_version()
         with self.lock, self.conn:
             self.conn.execute("update queue set mode='retag' where mode='describe'")
+        if self.meta("tag_counts") != TAG_COUNTS:          # a store made before the tag search: count the tags once
+            self.rebuild_tag_counts()
+            self.set_meta("tag_counts", TAG_COUNTS)
+
+    def rebuild_tag_counts(self) -> None:
+        """Make ``tag_counts`` equal to a count of ``asset_tags`` (the triggers keep it so; this is the one-time fill
+        for an older store, and the repair if it ever were not)."""
+        with self.lock, self.conn:
+            self.conn.execute("delete from tag_counts")
+            self.conn.execute("insert into tag_counts select tag, count(*) from asset_tags group by tag")
+            self._changes += 1
 
     # ---- meta (kept in memory too: read from many threads, written rarely)
     def meta(self, key: str, default: str = "") -> str:
@@ -1275,6 +1301,7 @@ class Store:
                 [(r["id"], r["type"], r["taken"], r.get("name", ""), r.get("preview", ""), r.get("original", ""),
                   int(r.get("duration_ms") or 0), int(r.get("added") or 0)) for r in rows])
             self.set_meta("catalog_at", _now())
+            self._changes += 1                  # assets may have come or gone: the tag counts follow the live ones
         return {"assets": len(rows)}
 
     def asset(self, asset_id: str) -> dict | None:
@@ -1502,21 +1529,91 @@ class Store:
             "catalogAt": self.meta("catalog_at") or None,
         }
 
-    def top_tags(self, limit: int = 200) -> list[dict]:
+    # ---- the tags themselves: all of them, and which assets have which
+    def tag_index(self) -> tuple[list[tuple[str, int]], dict[str, int]]:
+        """Every tag with the number of live assets that have it, as ``[(tag, count)]`` (most used first, then by name)
+        and as a dict. It is read from ``tag_counts`` (21,000 rows: a few ms) minus the tags of assets Immich no longer
+        lists, and kept until a result, a forget or a library read changes something."""
         with self.lock:
-            if self._tags_cache and self._tags_cache[0] == self._changes:
-                return self._tags_cache[1]
-            rows = self.conn.execute(
-                "select t.tag, count(*) c from asset_tags t join assets a on a.id=t.id where a.gone=0"
-                " group by t.tag order by c desc, t.tag limit ?", (limit,)).fetchall()
-            tags = [{"tag": r[0], "count": r[1]} for r in rows]
-            self._tags_cache = (self._changes, tags)
-            return tags
+            key = self._changes
+            if self._tag_index and self._tag_index[0] == key:
+                return self._tag_index[1], self._tag_index[2]
+            counts = dict(self.conn.execute("select tag, n from tag_counts").fetchall())
+            for tag, n in self.conn.execute(          # assets first (the few gone ones), then their tags by primary key
+                    "select t.tag, count(*) from assets a cross join asset_tags t on t.id = a.id where a.gone = 1"
+                    " group by t.tag"):
+                if counts.get(tag, 0) > n:
+                    counts[tag] -= n
+                else:
+                    counts.pop(tag, None)
+            ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            self._tag_index = (key, ordered, counts)
+            return ordered, counts
+
+    def top_tags(self, limit: int = 200) -> list[dict]:
+        return [{"tag": t, "count": n} for t, n in self.tag_index()[0][:limit]]
+
+    def list_tags(self, q: str = "", limit: int = 50, offset: int = 0) -> dict:
+        """Tags that contain ``q`` (normalised like every tag; no ``q``: all of them), most used first, one page of them.
+        ``total`` is how many match."""
+        ordered, _ = self.tag_index()
+        needle = norm_tag(q)
+        hits = [kv for kv in ordered if needle in kv[0]] if needle else ordered
+        return {"tags": [{"tag": t, "count": n} for t, n in hits[offset:offset + limit]], "total": len(hits)}
+
+    def ids_with_tags(self, tags: list[str], mode: str = "all") -> set[str]:
+        """The ids of the live assets that have all (or, ``mode="any"``, at least one) of these tags. The tags are
+        matched exactly as stored, so pass them through ``norm_tag`` first."""
+        if mode not in ("all", "any"):
+            raise ValueError("mode must be all or any")
+        with self.lock:
+            _, counts = self.tag_index()
+            tags = list(dict.fromkeys(tags))
+            known = [t for t in tags if t in counts]
+            if not known or (mode == "all" and len(known) < len(tags)):
+                return set()                              # "all" of a tag nobody has is nothing
+            if mode == "all":
+                known.sort(key=counts.__getitem__)        # the rarest tag drives, the others are looked up per asset
+                ids = {r[0] for r in self.conn.execute(
+                    "select t0.id from asset_tags t0 where t0.tag = ?"
+                    + " and exists (select 1 from asset_tags t where t.id = t0.id and t.tag = ?)" * (len(known) - 1),
+                    known)}
+            else:
+                marks = ",".join("?" * len(known))
+                ids = {r[0] for r in self.conn.execute(f"select distinct id from asset_tags where tag in ({marks})", known)}
+            return ids - {r[0] for r in self.conn.execute("select id from assets where gone = 1")}
+
+    def newest(self, ids, *, media: str | None = None, after: str | None = None, before: str | None = None,
+               skip=(), limit: int = 200) -> tuple[list[dict], int]:
+        """Of these asset ids, the newest ``limit`` that pass the filters, from the library list this store keeps
+        (``taken`` is the picture's own date), and how many pass in all. ``after`` / ``before`` compare dates
+        (``YYYY-MM-DD``, both ends included) like the Search+ index does; ``skip`` are ids to leave out."""
+        after, before, skip = (after or "")[:10], (before or "")[:10], set(skip)
+        if not ids:
+            return [], 0
+        wanted = list(ids)
+        with self.lock:
+            if len(wanted) <= NEWEST_LOOKUP_MAX:           # a few: each one by its key
+                found = []
+                for i in range(0, len(wanted), 500):
+                    chunk = wanted[i:i + 500]
+                    found += self.conn.execute(
+                        "select id, name, type, taken from assets where gone = 0 and id in (%s)" % ",".join("?" * len(chunk)),
+                        chunk).fetchall()
+            else:                                          # many: one pass over the library list
+                found = [r for r in self.conn.execute("select id, name, type, taken from assets where gone = 0")
+                         if r[0] in ids]
+        found = [r for r in found if r[0] not in skip and not (media and r[2] != media)
+                 and not (after and (r[3] or "")[:10] < after) and not (before and (r[3] or "")[:10] > before)]
+        found.sort(key=lambda r: r[0])
+        found.sort(key=lambda r: r[3] or "", reverse=True)    # newest first, then by id (two stable sorts)
+        return [{"id": r[0], "name": r[1] or "", "type": r[2] or "IMAGE", "date": (r[3] or "")[:10]}
+                for r in found[:limit]], len(found)
 
     def list_assets(self, *, tag: str = "", q: str = "", outdated: bool = False, page: int = 1, size: int = 60) -> dict:
         where, args = [f"a.gone=0 and {_WRITTEN}"], []
-        if tag:
-            where.append("exists (select 1 from asset_tags t where t.id=a.id and t.tag=?)")
+        if tag:         # through the tag index: 2-5 ms for a rare tag (a correlated exists took 130 ms for every tag)
+            where.append("a.id in (select id from asset_tags where tag=?)")
             args.append(norm_tag(tag))
         if q:
             like = _like(q.lower())
@@ -1536,7 +1633,8 @@ class Store:
                 (*args, size, (page - 1) * size)).fetchall()
         items = [{"id": r[0], "name": r[1], "type": r[2], "taken": r[3], "tags": [t["tag"] for t in json.loads(r[4])],
                   "settingsVersion": r[5], "processedAt": r[6]} for r in rows]
-        return {"items": items, "total": total, "page": page, "tags": self.top_tags()}
+        return {"items": items, "total": total, "page": page, "tags": self.top_tags(),
+                "tagsTotal": len(self.tag_index()[0])}
 
 
 # ---------------------------------------------------------------- one asset, start to finish

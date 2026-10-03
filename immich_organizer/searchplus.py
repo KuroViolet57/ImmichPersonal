@@ -716,12 +716,15 @@ class View:
         self.names = [a[3] or "" for a in assets]
         self.live = np.array([not a[4] for a in assets], dtype=bool)
         self.owner = np.full(n_rows, -1, dtype=np.int32)
+        self.first = np.zeros(len(self.ids), dtype=np.int64)       # per asset: its first matrix row ...
+        self.n_rows = np.zeros(len(self.ids), dtype=np.int64)      # ... and how many rows it has (0 = not indexed)
         self.rows: dict[str, tuple[int, int]] = {}
         for aid, first, n in conn.execute("select id, first_row, n_rows from indexed"):
             p = self.pos.get(aid)
             if p is None or first + n > n_rows:
                 continue
             self.owner[first:first + n] = p
+            self.first[p], self.n_rows[p] = first, n
             self.rows[aid] = (first, n)
         self.indexed = np.zeros(len(self.ids), dtype=bool)
         for aid in self.rows:
@@ -737,6 +740,30 @@ class View:
         step = 32768
         for s in range(0, len(self.matrix), step):
             out[s:s + step] = np.asarray(self.matrix[s:s + step], dtype=np.float32) @ q
+        return out
+
+    def rows_of(self, positions):
+        """The matrix rows that belong to these asset positions (an asset's rows together, assets in position order; an
+        asset that is not indexed has none)."""
+        import numpy as np
+
+        pos = np.unique(np.asarray(positions, dtype=np.int64))
+        counts = self.n_rows[pos]
+        pos, counts = pos[counts > 0], counts[counts > 0]
+        if not len(pos):
+            return np.zeros(0, dtype=np.int64)
+        starts = np.cumsum(counts) - counts                        # where each asset's rows begin in the answer
+        return np.repeat(self.first[pos] - starts, counts) + np.arange(int(counts.sum()))
+
+    def row_scores_of(self, q, rows):
+        """Like ``row_scores`` for just these matrix rows (in the order given): the other rows are never read."""
+        import numpy as np
+
+        q = np.asarray(q, dtype=np.float32)
+        out = np.empty(len(rows), dtype=np.float32)
+        step = 32768
+        for s in range(0, len(rows), step):
+            out[s:s + step] = np.asarray(self.matrix[rows[s:s + step]], dtype=np.float32) @ q
         return out
 
     def asset_vector(self, asset_id: str):
@@ -930,26 +957,44 @@ class Store:
             return self._view
 
 
-def best_scores(view: View, vector):
-    """Each asset's score for a query vector: its best-matching frame (-inf when not indexed)."""
+def best_scores(view: View, vector, only=None):
+    """Each asset's score for a query vector: its best-matching frame (-inf when not indexed).
+
+    ``only`` (asset positions, or None for every asset) limits the work to those assets: only their matrix rows are
+    read and scored, everything else stays -inf. That is how a search over a few hundred assets (the ones with a
+    tag, say) costs a few hundred rows instead of the whole index."""
     import numpy as np
 
-    scores = view.row_scores(vector)
     best = np.full(len(view.ids), -np.inf, dtype=np.float32)
-    rows = view.owner >= 0
-    np.maximum.at(best, view.owner[rows], scores[rows])
+    if only is None:
+        scores = view.row_scores(vector)
+        rows = view.owner >= 0
+        np.maximum.at(best, view.owner[rows], scores[rows])
+        return best
+    rows = view.rows_of(only)
+    if len(rows):
+        np.maximum.at(best, view.owner[rows], view.row_scores_of(vector, rows))
     return best
 
 
+def positions_of(view: View, ids):
+    """The asset positions in ``view`` of these asset ids (ids the view does not know are left out)."""
+    import numpy as np
+
+    return np.fromiter((view.pos[i] for i in ids if i in view.pos), dtype=np.int64)
+
+
 def search(store: Store, vector, *, media: str | None = None, after: str | None = None, before: str | None = None,
-           limit: int = 200, exclude=(), skip: str | None = None) -> list[dict]:
-    """Best matches first: each asset scores as its best-matching frame."""
+           limit: int = 200, exclude=(), skip: str | None = None, only=None) -> list[dict]:
+    """Best matches first: each asset scores as its best-matching frame.
+
+    ``only`` is a set of asset ids to rank (None: the whole index). Only those assets' vectors are read and scored,
+    and nothing else can be returned; the media, date and exclusion filters narrow them further before scoring."""
     import numpy as np
 
     view = store.view()
     if not len(view.matrix):
         return []
-    best = best_scores(view, vector)
     mask = view.live & view.indexed
     if media in ("IMAGE", "VIDEO"):
         mask &= view.types == media
@@ -961,7 +1006,15 @@ def search(store: Store, vector, *, media: str | None = None, after: str | None 
         p = view.pos.get(aid)
         if p is not None:
             mask[p] = False
-    idx = np.flatnonzero(mask)
+    if only is not None:
+        allowed = np.zeros(len(view.ids), dtype=bool)
+        allowed[positions_of(view, only)] = True
+        mask &= allowed
+        idx = np.flatnonzero(mask)
+        best = best_scores(view, vector, only=idx) if len(idx) else None
+    else:
+        best = best_scores(view, vector)
+        idx = np.flatnonzero(mask)
     if not len(idx):
         return []
     k = min(int(limit), len(idx))

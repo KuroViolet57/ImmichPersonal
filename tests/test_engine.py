@@ -10,10 +10,11 @@ from immich_organizer.engine import (
     build_plan,
     evaluate_rule,
     find_album,
+    looking_at,
     read_journal,
     undo_run,
 )
-from immich_organizer.rules import Rule, parse_ruleset
+from immich_organizer.rules import Refinement, Rule, parse_ruleset
 from tests.fake_immich import API_KEY, FakeImmich
 
 
@@ -105,6 +106,115 @@ class TestEvaluateRule(EngineCase):
         got = evaluate_rule(self.client, rule)
         self.assertTrue(got)
         self.assertTrue(all(a["type"] == "VIDEO" for a in got))
+
+
+class TestEvaluateRuleOnlyTheseAssets(EngineCase):
+    """``only_ids``: the AI tag / description filter. Immich cannot rank just those, so its ranking is read page by
+    page and the wanted assets are picked out, up to ``limit`` of them or ``scan_cap`` results looked at."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.max_page = 5                      # so the ranking spans several pages
+        self.fake.smart_results["mountain"] = self.ids[:30]       # rank 0 .. 29
+
+    def smart_requests(self):
+        return [b for kind, b in self.fake.searches if kind == "smart"]
+
+    def run_rule(self, only, *, limit=10, cap=None, exclude=None, **rule_kw):
+        rule = Rule(name="r", album="A", query="mountain", limit=limit, **rule_kw)
+        stats = {}
+        got = evaluate_rule(self.client, rule, exclude_ids=exclude, only_ids=set(only), scan_cap=cap, stats=stats)
+        return [a["id"] for a in got], stats
+
+    def test_the_wanted_assets_come_out_in_ranking_order_and_the_rest_are_dropped(self):
+        wanted = [self.ids[i] for i in (21, 3, 8, 14)]             # a set: no order of its own
+        got, stats = self.run_rule(wanted, limit=4, cap=100)
+        self.assertEqual(got, [self.ids[3], self.ids[8], self.ids[14], self.ids[21]])
+        self.assertEqual(stats, {"scanned": 22, "capped": False})  # read down to rank 21 (the fourth), no further
+        got, stats = self.run_rule(wanted, limit=10, cap=100)      # fewer than the limit exist: the whole ranking is read
+        self.assertEqual(len(got), 4)
+        self.assertEqual(stats, {"scanned": 30, "capped": False})
+
+    def test_it_stops_reading_pages_once_limit_of_them_are_found(self):
+        got, stats = self.run_rule([self.ids[1], self.ids[2], self.ids[20]], limit=2, cap=100)
+        self.assertEqual(got, [self.ids[1], self.ids[2]])
+        self.assertEqual(len(self.smart_requests()), 1)            # the first page of five had both
+        self.assertEqual(stats["scanned"], 3)
+
+    def test_a_candidate_on_a_later_page_takes_more_pages(self):
+        got, stats = self.run_rule([self.ids[12]], limit=1, cap=100)
+        self.assertEqual(got, [self.ids[12]])
+        self.assertEqual([b["page"] for b in self.smart_requests()], [1, 2, 3])        # five a page: ranks 0-4, 5-9, 10-14
+        self.assertEqual(stats, {"scanned": 13, "capped": False})
+
+    def test_the_scan_cap_stops_it_and_says_so(self):
+        got, stats = self.run_rule([self.ids[12], self.ids[3]], cap=10)
+        self.assertEqual(got, [self.ids[3]])                       # rank 12 is beyond the ten results looked at
+        self.assertEqual(stats, {"scanned": 10, "capped": True})
+        self.assertEqual(len(self.smart_requests()), 3)                                  # pages of 5, 5, then the 11th result
+
+    def test_a_ranking_shorter_than_the_cap_is_not_capped(self):
+        self.fake.smart_results["short"] = self.ids[:10]
+        rule = Rule(name="r", album="A", query="short", limit=10)
+        stats = {}
+        got = evaluate_rule(self.client, rule, only_ids={self.ids[9], self.ids[30]}, scan_cap=10, stats=stats)
+        self.assertEqual([a["id"] for a in got], [self.ids[9]])
+        self.assertEqual(stats, {"scanned": 10, "capped": False})  # exactly ten results exist: nothing more was left
+
+    def test_nothing_in_the_ranking_matches(self):
+        got, stats = self.run_rule([self.ids[35]], cap=100)
+        self.assertEqual((got, stats), ([], {"scanned": 30, "capped": False}))
+
+    def test_excluded_assets_count_as_looked_at_but_not_towards_the_limit(self):
+        wanted = [self.ids[i] for i in (2, 4, 6, 8)]
+        got, stats = self.run_rule(wanted, limit=2, cap=100, exclude={self.ids[2], self.ids[4]})
+        self.assertEqual(got, [self.ids[6], self.ids[8]])
+        self.assertEqual(stats["scanned"], 9)                       # ranks 0 .. 8 all went by
+
+    def test_refine_words_are_applied_to_the_candidates(self):
+        self.fake.smart_results["snow"] = [self.ids[5], self.ids[9], self.ids[11]]
+        got, _ = self.run_rule([self.ids[1], self.ids[9], self.ids[11], self.ids[20]], cap=100,
+                               refine=Refinement(all_of=["snow"]))
+        self.assertEqual(got, [self.ids[9], self.ids[11]])
+
+    def test_without_a_query_the_library_is_read_newest_first_and_the_candidates_picked_out(self):
+        rule = Rule(name="r", album="A", limit=10, filters={"type": "IMAGE"})        # no text, no photo, no people
+        stats = {}
+        wanted = {self.ids[i] for i in (0, 3, 9, 15, 20)}           # ids[9] is a video: the type filter drops it
+        got = evaluate_rule(self.client, rule, only_ids=wanted, scan_cap=None, stats=stats)
+        self.assertEqual({a["id"] for a in got}, wanted - {self.ids[9]})
+        self.assertTrue(all(kind == "metadata" for kind, _ in self.fake.searches))   # smart search was never asked
+        self.assertEqual(stats["capped"], False)
+        self.assertGreaterEqual(stats["scanned"], 21)
+
+    def test_people_any_with_a_ranking_scans_it_to_the_cap(self):
+        anna = self.fake.add_person("Anna", [self.ids[2], self.ids[7]])
+        ben = self.fake.add_person("Ben", [self.ids[12], self.ids[25]])
+        rule = Rule(name="r", album="A", query="mountain", limit=10, filters={"personIds": [anna, ben]},
+                    people_match="any")
+        stats = {}
+        got = evaluate_rule(self.client, rule, only_ids={self.ids[7], self.ids[12], self.ids[25], self.ids[4]},
+                            scan_cap=15, stats=stats)
+        self.assertEqual([a["id"] for a in got], [self.ids[7], self.ids[12]])         # 25 is past the cap; 4 is nobody's
+        self.assertEqual(stats, {"scanned": 15, "capped": True})
+
+    def test_no_only_ids_means_nothing_changes(self):
+        rule = Rule(name="r", album="A", query="mountain", limit=3)
+        stats = {}
+        self.assertEqual([a["id"] for a in evaluate_rule(self.client, rule, stats=stats)], self.ids[:3])
+        self.assertEqual(stats, {"scanned": 0, "capped": False})    # (stats is reset but nothing is counted without a filter)
+        self.assertEqual(self.smart_requests()[0]["size"], 3)       # and the ranking is read only as deep as the limit
+
+
+class TestLookingAt(unittest.TestCase):
+    def test_counts_and_caps(self):
+        stats = {"scanned": 0, "capped": False}
+        self.assertEqual(list(looking_at(iter(range(5)), stats, 3)), [0, 1, 2])
+        self.assertEqual(stats, {"scanned": 3, "capped": True})
+        stats = {"scanned": 0, "capped": False}
+        self.assertEqual(list(looking_at(iter(range(3)), stats, 3)), [0, 1, 2])
+        self.assertEqual(stats, {"scanned": 3, "capped": False})        # exactly the cap, nothing left: not capped
+        self.assertEqual(list(looking_at(iter(range(4)), None, 2)), [0, 1, 2, 3])   # no stats: a plain pass-through
 
 
 class TestPlanAndApply(EngineCase):

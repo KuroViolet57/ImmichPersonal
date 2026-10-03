@@ -88,6 +88,8 @@ import com.kuroviolet.imagepanel.ui.components.ScreenTop
 import com.kuroviolet.imagepanel.ui.components.SectionCard
 import com.kuroviolet.imagepanel.ui.components.Segmented
 import com.kuroviolet.imagepanel.ui.components.Selection
+import com.kuroviolet.imagepanel.ui.components.TagFilterFields
+import com.kuroviolet.imagepanel.ui.components.TagFilterState
 import com.kuroviolet.imagepanel.ui.components.UnloadLine
 import com.kuroviolet.imagepanel.ui.components.assetItems
 import com.kuroviolet.imagepanel.ui.components.fullSpan
@@ -110,6 +112,8 @@ class SearchPlusVm : ViewModel() {
     var before by mutableStateOf("")
     var compare by mutableStateOf(false)
     var showFilters by mutableStateOf(false)
+    /** AI tags and description text: the search ranks only the photos that match them (or lists them, with no text). */
+    val tagFilter = TagFilterState()
 
     var results by mutableStateOf<List<Asset>>(emptyList())
     var immich by mutableStateOf<List<Asset>>(emptyList())
@@ -132,12 +136,15 @@ class SearchPlusVm : ViewModel() {
     }
 
     fun search() {
-        if (mode == "text" && text.isBlank()) return UiBus.error("Type what you are looking for.")
+        if (mode == "text" && text.isBlank() && !tagFilter.active) {
+            return UiBus.error("Type what you are looking for, or filter by AI tags or description text.")
+        }
         if (mode == "like" && !Regex("^[0-9a-fA-F-]{36}$").matches(like.trim())) {
             return UiBus.error("Pick a photo: open any photo and press “Similar”, or paste its ID.")
         }
         val body = buildJsonObject {
             if (mode == "text") put("text", text.trim()) else put("like", like.trim())
+            tagFilter.putInto(this)
             if (type.isNotEmpty()) put("media", type)
             put("limit", limit.coerceAtMost(1000))
             if (after.isNotEmpty()) put("after", after)
@@ -145,7 +152,8 @@ class SearchPlusVm : ViewModel() {
             put("compare", compare)
         }
         val loaded = status?.o("service")?.s("status") == "ok"
-        busy = if (mode == "text" && !loaded) "Loading the Search+ model, then searching… (about half a minute)" else "Searching…"
+        busy = if (mode == "text" && text.isBlank()) "Looking up the photos with those tags or that description…"
+        else if (mode == "text" && !loaded) "Loading the Search+ model, then searching… (about half a minute)" else "Searching…"
         viewModelScope.launch {
             try {
                 val data = Graph.api.post("/api/searchplus/search", body).obj()
@@ -161,7 +169,12 @@ class SearchPlusVm : ViewModel() {
                 val indexed = c.i("indexed") ?: 0
                 val assets = c.i("assets") ?: 0
                 val pending = (c.i("pending") ?: 0) + (c.i("retrying") ?: 0)
+                val filters = data.o("filters")
+                tagFilter.summary = filters.s("text")
+                val listed = filters.s("ranking") == "none"          // tags / description only: listed newest first, nothing ranked
                 note = when {
+                    listed -> "Took %.1f s. Tap a photo to open it; the circle ticks it.".format((data.i("tookMs") ?: 0) / 1000.0) +
+                        (data.i("total")?.takeIf { it > results.size }?.let { " %,d match in all: raise Max results to see more.".format(it) } ?: "")
                     indexed == 0 -> "The index is empty — press the database icon at the top, then “Build index”."
                     pending > 0 -> "Searched the %,d of %,d items indexed so far — the index is still being built.".format(indexed, assets)
                     else -> "Took %.1f s. Videos score by their best-matching frame.".format((data.i("tookMs") ?: 0) / 1000.0)
@@ -192,7 +205,8 @@ class SearchPlusVm : ViewModel() {
             put("media", type)
             put("taken_after", after); put("taken_before", before)
         }
-        UiBus.toast("Filled in from your Search+ search as “the best N”. Preview, adjust, then Save.")
+        UiBus.toast("Filled in from your Search+ search as “the best N”. Preview, adjust, then Save." +
+            if (tagFilter.active) " The AI tag and description filters are not part of a smart album, so they are left out." else "")
         return true
     }
 
@@ -289,6 +303,7 @@ fun SearchPlusScreen(nav: NavController) {
                                     TextButton(onClick = { vm.selection.clear() }) { Text("None") }
                                 }
                             }
+                            vm.tagFilter.summary?.let { Hint(it) }
                             vm.note?.let { Hint(it) }
                         }
                     }
@@ -346,13 +361,20 @@ private fun Form(vm: SearchPlusVm, onSaveAsSmart: () -> Unit) {
             Hint("Easiest: open any photo and press “Similar”.")
         }
         Segmented(MEDIA_OPTIONS, vm.type, { vm.type = it })
-        TextButton(onClick = { vm.showFilters = !vm.showFilters }) { Text(if (vm.showFilters) "Hide filters" else "More filters") }
+        TextButton(onClick = { vm.showFilters = !vm.showFilters }) {
+            Text((if (vm.showFilters) "Hide filters" else "More filters") + if (vm.tagFilter.active) " · tags or description set" else "")
+        }
         if (vm.showFilters) {
             NumberField("Max results (up to 1,000)", vm.limit, { vm.limit = it }, Modifier.fillMaxWidth(), max = 1000)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 DateField("Taken after", vm.after, { vm.after = it }, Modifier.weight(1f))
                 DateField("Taken before", vm.before, { vm.before = it }, Modifier.weight(1f))
             }
+            TagFilterFields(
+                vm.tagFilter,
+                "The tags the AI Tagger found. Only photos with them are ranked (and only their pictures are looked at); " +
+                    "leave the text empty to just list them, newest first.",
+            )
         }
         CheckRow("Compare with Immich's own smart search", vm.compare) { vm.compare = it }
         Button(onClick = { focus.clearFocus(); vm.search() }, modifier = Modifier.fillMaxWidth()) { Text("Search") }

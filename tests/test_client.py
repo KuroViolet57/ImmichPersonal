@@ -79,6 +79,20 @@ class TestClient(unittest.TestCase):
         got = list(self.client.iter_smart_search({"query": "everything"}, limit=25, page_size=10))
         self.assertEqual([a["id"] for a in got], ids[:25])
 
+    def test_iter_smart_search_asks_for_the_same_page_size_every_time(self):
+        # Immich's offset is (page - 1) * size: a smaller last page would start inside the one before it, return
+        # repeats, and for a limit one over a whole page need one request for every result of the first
+        ids = [a["id"] for a in self.fake.assets]
+        self.fake.smart_results["everything"] = ids
+        got = list(self.client.iter_smart_search({"query": "everything"}, limit=23, page_size=10))
+        self.assertEqual([a["id"] for a in got], ids[:23])
+        asked = [(b["page"], b["size"]) for kind, b in self.fake.searches if kind == "smart"]
+        self.assertEqual(asked, [(1, 10), (2, 10), (3, 10)])
+        self.fake.searches.clear()
+        got = list(self.client.iter_smart_search({"query": "everything"}, limit=11, page_size=10))
+        self.assertEqual([a["id"] for a in got], ids[:11])
+        self.assertEqual(len(self.fake.searches), 2)
+
     def test_iter_smart_search_stops_when_results_run_out(self):
         ids = [a["id"] for a in self.fake.assets[:3]]
         self.fake.smart_results["few"] = ids
