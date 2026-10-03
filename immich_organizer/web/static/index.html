@@ -58,7 +58,7 @@
       <small class="hint" id="engine-hint" style="display:block;margin:6px 0 12px"></small>
 
       <label class="field" id="field-query">
-        <span>What are you looking for? (optional if you pick people)</span>
+        <span>What are you looking for? (optional with people, tags or a description)</span>
         <input id="query" type="text" placeholder="person in a mountain" autocomplete="off">
       </label>
 
@@ -110,6 +110,27 @@
         </div>
 
         <div class="field">
+          <span>AI tags</span>
+          <div class="chip-add">
+            <input id="s-tag-input" type="text" placeholder="Start typing a tag" autocomplete="off" spellcheck="false" enterkeyhint="done">
+            <button class="btn btn-quiet" id="s-tag-add" type="button">Add</button>
+          </div>
+          <div class="chips" id="s-tag-chips"></div>
+          <div class="seg seg-small is-hidden" id="s-tag-mode">
+            <button class="seg-btn is-active" data-value="all" type="button">All of them</button>
+            <button class="seg-btn" data-value="any" type="button">Any of them</button>
+          </div>
+          <small>The tags the AI Tagger found (pick from the list, it knows every tag). Only photos with them are searched;
+            with no description above they are simply listed, newest first.</small>
+        </div>
+        <label class="field">
+          <span>Description contains</span>
+          <input id="s-desc" type="text" maxlength="200" placeholder="beach holiday" autocomplete="off" enterkeyhint="search">
+          <small>Text in the photo's Immich description (the AI Tagger's tags are written there too). Capitals and
+            accents don't matter.</small>
+        </label>
+
+        <div class="field">
           <span>Skip photos that are in these albums</span>
           <div class="chip-add">
             <input id="skip-input" type="text" list="album-list" placeholder="Album name, then Enter" autocomplete="off">
@@ -149,6 +170,7 @@
           <button class="btn btn-quiet" id="select-none">None</button>
         </div>
       </div>
+      <p class="hint is-hidden" id="results-filters"></p>
       <p class="hint" id="results-note">Click a photo to include or exclude it; Shift+click
         to change a whole range. Smart search has no confidence score, so the tail of a
         long list is usually noise.</p>
@@ -572,6 +594,25 @@
           <input id="sp-before" type="date">
         </label>
       </div>
+      <div class="field">
+        <span>AI tags</span>
+        <div class="chip-add">
+          <input id="sp-tag-input" type="text" placeholder="Start typing a tag" autocomplete="off" spellcheck="false" enterkeyhint="done">
+          <button class="btn btn-quiet" id="sp-tag-add" type="button">Add</button>
+        </div>
+        <div class="chips" id="sp-tag-chips"></div>
+        <div class="seg seg-small is-hidden" id="sp-tag-mode">
+          <button class="seg-btn is-active" data-value="all" type="button">All of them</button>
+          <button class="seg-btn" data-value="any" type="button">Any of them</button>
+        </div>
+        <small>The tags the AI Tagger found. Only photos with them are ranked (and only their pictures are looked at);
+          leave the text empty to just list them, newest first.</small>
+      </div>
+      <label class="field">
+        <span>Description contains</span>
+        <input id="sp-desc" type="text" maxlength="200" placeholder="beach holiday" autocomplete="off" enterkeyhint="search">
+        <small>Text in the photo's Immich description. Capitals and accents don't matter.</small>
+      </label>
       <label class="check"><input id="sp-compare" type="checkbox"><span>Compare with Immich's own smart search, side by side</span></label>
       <div class="row">
         <button class="btn btn-primary" id="sp-run" type="button">Search</button>
@@ -586,6 +627,7 @@
           <button class="btn btn-quiet" id="sp-none" type="button">None</button>
         </div>
       </div>
+      <p class="hint is-hidden" id="sp-filters"></p>
       <p class="hint" id="sp-note"></p>
       <div class="sp-cols" id="sp-cols">
         <div class="sp-col">
@@ -818,7 +860,17 @@
         <h2>Tagged assets</h2>
         <button class="btn btn-quiet" id="tg-refresh" type="button">Refresh</button>
       </div>
+      <div class="field" style="margin-bottom:6px">
+        <span>Find a tag</span>
+        <input id="tg-tag-find" type="text" placeholder="Start typing a tag, then pick it" autocomplete="off" spellcheck="false">
+        <small id="tg-tag-found">Every tag the taggers have written is in this list, not only the common ones below.</small>
+      </div>
+      <h3 class="tg-h" id="tg-top-label">Most common tags</h3>
       <div class="chips" id="tg-top-tags"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn btn-quiet is-hidden" id="tg-tags-more" type="button">Show more</button>
+        <small class="hint" id="tg-tags-note" style="margin:0"></small>
+      </div>
       <div class="chip-add" style="margin-top:10px">
         <input id="tg-q" type="text" placeholder="Search tags and descriptions" autocomplete="off" enterkeyhint="search">
         <button class="btn btn-quiet" id="tg-q-go" type="button">Search</button>

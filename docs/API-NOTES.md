@@ -130,6 +130,13 @@ POST /api/search/metadata
 | Thumbnails for previews | `GET /api/assets/{id}/thumbnail?size=thumbnail\|preview\|fullsize` |
 | Archive / favorite in bulk | `PUT /api/assets` — `{ "ids": [...], "visibility": "archive" }` |
 | Exact (non-AI) search | `POST /api/search/metadata` |
+| Assets whose description contains a text | `POST /api/search/metadata` with `description` (`MetadataSearchDto` only: `SmartSearchDto` has no such filter; marked deprecated in 3.2.0 but present in 3.2.4). A case- and accent-blind substring match; results newest first with `order: "desc"`, 1,000 a page (see `docs/AI-TAGGER.md`, "Search by tags and description") |
+
+`tagIds` of both search bodies are Immich's *own* tags. The AI Tagger's tags live in the description block and in the
+tagger store, so they are not searchable through Immich.
+
+**Paging.** `page` and `size` give the offset `(page - 1) * size`: every page of one walk must ask for the same `size`
+(`ImmichClient.iter_smart_search` used to shrink the last one to what was missing, which landed inside the page before).
 
 ## Workflows and plugins
 

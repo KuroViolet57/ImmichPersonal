@@ -334,9 +334,10 @@ class SearchPlusEngine:
     def view(self):
         return self._parts()[0].view()
 
-    def best(self, view, vector):
+    def best(self, view, vector, only=None):
+        """Every asset's best score; with ``only`` (asset positions) just those assets are scored, the rest are -inf."""
         from .searchplus import best_scores
-        return best_scores(view, vector)
+        return best_scores(view, vector) if only is None else best_scores(view, vector, only=only)
 
 
 def theme_vector(theme: dict, client: ImmichClient, backend: Backend) -> list[float]:
@@ -513,16 +514,30 @@ def _sp_vector(cache: dict, text: str, model: str, engine) -> list[float]:
 
 
 def searchplus_select(client: ImmichClient, theme: dict, backend, engine, *, cutoff=None, limit=None,
-                      albums=None) -> tuple[list[tuple[str, float | None]], object]:
+                      albums=None, only_ids=None) -> tuple[list[tuple[str, float | None]], object]:
     """The Search+ version of ``Backend.select``: (matches best first, every eligible score).
 
     Same filters as with Immich's model; photos not in the Search+ index (yet) are not scored.
+
+    ``only_ids`` (a set of asset ids, None for no limit) restricts everything to those assets: they alone are
+    ranked, and only their vectors are read and scored (the filters narrow them first); no other asset can come back.
     """
     import numpy as np
 
     theme = normalise(theme)
     view = engine.view()
     mask = np.asarray(view.live, dtype=bool) & np.asarray(view.indexed, dtype=bool)
+    if only_ids is not None:
+        only_mask = np.zeros(len(view.ids), dtype=bool)
+        only_mask[[view.pos[i] for i in only_ids if i in view.pos]] = True
+        mask &= only_mask
+
+    def scored(vector):
+        """Every asset's best score; with ``only_ids`` just the assets still in the mask are read and scored."""
+        if only_ids is None:
+            return engine.best(view, vector)
+        return engine.best(view, vector, only=np.flatnonzero(mask))
+
     if theme["media"] in MEDIA_TYPES:
         mask &= view.types == theme["media"]
     if theme["taken_after"]:
@@ -552,14 +567,14 @@ def searchplus_select(client: ImmichClient, theme: dict, backend, engine, *, cut
 
     term_cutoff = theme["cutoff"] if theme["source"] == "text" else SP_TERM_CUTOFF
     for term in theme["all_of"]:
-        mask &= engine.best(view, _sp_vector(cache, term, model, engine)) >= term_cutoff
+        mask &= scored(_sp_vector(cache, term, model, engine)) >= term_cutoff
     for term in theme["none_of"]:
-        mask &= engine.best(view, _sp_vector(cache, term, model, engine)) < term_cutoff
+        mask &= scored(_sp_vector(cache, term, model, engine)) < term_cutoff
 
     if theme["source"] == "text":
-        best = engine.best(view, _sp_vector(cache, theme["description"], model, engine))
+        best = scored(_sp_vector(cache, theme["description"], model, engine))
     elif theme["source"] == "like":
-        best = engine.best(view, view.asset_vector(theme["like"]))
+        best = scored(view.asset_vector(theme["like"]))
     else:
         best = None
     idx = np.flatnonzero(mask)

@@ -53,6 +53,7 @@ import com.kuroviolet.imagepanel.model.UiBus
 import com.kuroviolet.imagepanel.model.ViewerSession
 import com.kuroviolet.imagepanel.net.a
 import com.kuroviolet.imagepanel.net.i
+import com.kuroviolet.imagepanel.net.o
 import com.kuroviolet.imagepanel.net.obj
 import com.kuroviolet.imagepanel.net.str
 import com.kuroviolet.imagepanel.net.strings
@@ -67,6 +68,8 @@ import com.kuroviolet.imagepanel.ui.components.MEDIA_OPTIONS
 import com.kuroviolet.imagepanel.ui.components.NumberField
 import com.kuroviolet.imagepanel.ui.components.ScreenTop
 import com.kuroviolet.imagepanel.ui.components.SectionCard
+import com.kuroviolet.imagepanel.ui.components.TagFilterFields
+import com.kuroviolet.imagepanel.ui.components.TagFilterState
 import com.kuroviolet.imagepanel.ui.components.Segmented
 import com.kuroviolet.imagepanel.ui.components.Selection
 import com.kuroviolet.imagepanel.ui.components.SuggestField
@@ -108,6 +111,8 @@ class SearchVm : ViewModel() {
     var allOf by mutableStateOf("")
     var noneOf by mutableStateOf("")
     var showFilters by mutableStateOf(false)
+    /** AI tags and description text: filters of their own (the panel searches only the photos that match them). */
+    val tagFilter = TagFilterState()
 
     var results by mutableStateOf<List<Asset>>(emptyList())
     val selection = Selection()
@@ -141,7 +146,9 @@ class SearchVm : ViewModel() {
     private fun terms(s: String) = s.split(',').map { it.trim() }.filter { it.isNotEmpty() }
 
     fun run() {
-        if (mode == "query" && query.isBlank() && people.isEmpty()) return UiBus.error("Describe what you are looking for, or pick people.")
+        if (mode == "query" && query.isBlank() && people.isEmpty() && !tagFilter.active) {
+            return UiBus.error("Describe what you are looking for, pick people, or filter by AI tags or description text.")
+        }
         if (mode == "like" && like.isBlank()) return UiBus.error("Paste an asset ID to match against.")
         val body = buildJsonObject {
             put("limit", limit)
@@ -160,12 +167,15 @@ class SearchVm : ViewModel() {
             putJsonArray("people") { people.forEach { add(it) } }
             put("peopleMatch", peopleMatch)
             putJsonArray("skipIds") { sessionSkip.forEach { add(it) } }
+            tagFilter.putInto(this)
             when (mode) {
                 "query" -> put("query", query.trim())
                 else -> put("like", like.trim())
             }
         }
         busy = if (engine == "searchplus" && mode == "query" && query.isNotBlank()) "Searching with the Search+ model… (the first search loads it: up to ~30 s)"
+        else if (tagFilter.active && (query.isNotBlank() || mode == "like")) "Looking through the ranking for photos with those tags or that description… (up to ~15 s)"
+        else if (tagFilter.active) "Looking up the photos with those tags or that description…"
         else if (people.size > 1 && peopleMatch == "any") "Searching for photos with any of these people… (up to ~15 s)"
         else "Searching your library for up to %,d…".format(limit)
         viewModelScope.launch {
@@ -179,6 +189,7 @@ class SearchVm : ViewModel() {
                 val excluded = data.i("excluded") ?: 0
                 if (excluded > 0) msg += " · skipped %,d from your skip list".format(excluded)
                 summary = data.str("match").ifEmpty { null }
+                tagFilter.summary = data.o("filters").str("text").ifEmpty { null }
                 UiBus.toast("$msg.")
                 val unknown = data.a("unknownAlbums").strings()
                 if (unknown.isNotEmpty()) UiBus.error("No album named ${unknown.joinToString()} — nothing skipped for it.")
@@ -215,7 +226,8 @@ class SearchVm : ViewModel() {
             putJsonArray("all_of") { terms(allOf).forEach { add(it) } }
             putJsonArray("none_of") { terms(noneOf).forEach { add(it) } }
         }
-        UiBus.toast("Filled in from your search as “the best N”. Preview, adjust, then Save.")
+        UiBus.toast("Filled in from your search as “the best N”. Preview, adjust, then Save." +
+            if (tagFilter.active) " The AI tag and description filters are not part of a smart album, so they are left out." else "")
         return true
     }
 
@@ -277,6 +289,7 @@ fun SearchScreen(nav: NavController) {
                             Column(Modifier.weight(1f)) {
                                 Text("${vm.results.size.plural("result")} · ${vm.selection.size} selected", style = MaterialTheme.typography.titleSmall)
                                 vm.summary?.let { Hint(it) }
+                                vm.tagFilter.summary?.let { Hint(it) }
                             }
                             TextButton(onClick = { vm.selection.selectAll(vm.results.map { it.id }) }) { Text("All") }
                             TextButton(onClick = { vm.selection.clear() }) { Text("None") }
@@ -310,7 +323,7 @@ private fun SearchForm(vm: SearchVm, onSaveAsSmart: () -> Unit) {
         when (vm.mode) {
             "query" -> OutlinedTextField(
                 value = vm.query, onValueChange = { vm.query = it },
-                label = { Text("What are you looking for? (optional if you pick people)") },
+                label = { Text("What are you looking for? (optional with people, tags or a description)") },
                 placeholder = { Text("person in a mountain") },
                 singleLine = true, modifier = Modifier.fillMaxWidth(),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
@@ -342,7 +355,7 @@ private fun SearchForm(vm: SearchVm, onSaveAsSmart: () -> Unit) {
         TextButton(onClick = { vm.showFilters = !vm.showFilters }) {
             Icon(if (vm.showFilters) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, contentDescription = null)
             Spacer(Modifier.padding(start = 4.dp))
-            Text("Filters & refinement")
+            Text("Filters & refinement" + if (vm.tagFilter.active) " · tags or description set" else "")
         }
         if (vm.showFilters) Filters(vm)
         Button(onClick = { focus.clearFocus(); vm.run() }, modifier = Modifier.fillMaxWidth()) { Text("Search") }
@@ -362,6 +375,11 @@ private fun Filters(vm: SearchVm) {
             DateField("Taken after", vm.after, { vm.after = it }, Modifier.weight(1f))
             DateField("Taken before", vm.before, { vm.before = it }, Modifier.weight(1f))
         }
+        TagFilterFields(
+            vm.tagFilter,
+            "The tags the AI Tagger found (pick from the list, it knows every tag). Only photos with them are searched; " +
+                "with no description above they are simply listed, newest first.",
+        )
         SuggestField(
             value = vm.skipInput, onValueChange = { vm.skipInput = it },
             label = "Skip photos that are in these albums",

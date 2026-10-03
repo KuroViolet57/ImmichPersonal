@@ -19,6 +19,7 @@ This file is the contract between the parts. Change it when an interface changes
 | Unloading | the panel **stops the container right after the work**: nothing left to tag and `/health` `idleSeconds` ≥ `unload_after` minutes (default **2**, limits **1–60**), never while the indexer works or a request is in flight (`busy`); after a Test-card use the models keep their place for the server's own 20 minutes first. The server's 20-minute exit stays as the backstop. Status `unload` object, countdown in the web tab and the app (see "Unloading the models and picking up new uploads") |
 | New uploads | a cheap change probe every `check_every` minutes (default **1**, limits **1–60**) instead of a full library read every 10 minutes; the full read only when the probe changed, and at least hourly. A new asset waits for Immich's preview file (up to 30 minutes) |
 | Indexer | pipelined across rounds: ≤ 2 tagger requests in flight (`Indexer.TAG_REQUESTS`) while the next round's pictures are prepared, so the GPU is not idle at round boundaries (see "Indexer: pipelined across rounds" in v3, panel side) |
+| Finding tags | `GET /api/aitagger/tags?q=` finds any of the (21,110) tags; the "Tagged assets" card shows the 200 commonest as "Most common tags" with "Show more"; the Search and Search+ tabs filter by `tags` / `tagMode` / `description` (see "Search by tags and description") |
 
 ## Unloading the models and picking up new uploads (v3.2, 2026-10-03)
 
@@ -87,7 +88,99 @@ in the `assets` table of both stores, which add the column when they are opened)
 work list (`searchplus.READY`), not failed; the status line says how many wait. The probe notices the preview and the next
 read brings its path. After 30 minutes without one it is processed as before (the fallback to the original).
 
-## v3 (2026-10-02) — supersedes v2 and v1 where they differ
+## Search by tags and description (v3.3, 2026-10-03)
+
+The owner thought tags were missing: the "Tagged assets" card listed only the 200 commonest of the library's 21,110
+distinct tags (the 200th is on 4,300 assets; 3,812 tags are on exactly one asset), so a tag seen on an asset was
+often not in it. Now every tag can be found, and the Search and Search+ tabs can filter by AI tags and by description
+text. Immich can do neither: `SmartSearchDto` has no `description` filter, and the `tagIds` of both search bodies are
+Immich's *native* tags, not ours (ours live in the description block and in `asset_tags`). `MetadataSearchDto`
+(`POST /search/metadata`) does have `description` ("the description contains this text", a case- and accent-blind
+substring match; marked deprecated in 3.2.0, present in 3.2.4). Code: `tagsearch.py` (the filter, the candidates, the
+`filters` object), `aitagger.Store` (tags), `searchplus.search(only=)` and `engine.evaluate_rule(only_ids=)` (the ranking).
+
+**`GET /api/aitagger/tags?q=&limit=50&offset=0`** → `{"tags": [{"tag", "count"}], "total"}`. Tags that contain `q`
+(normalised with `norm_tag` like everywhere: lowercase, `_` as a space, ...; no `q`: every tag), most used first then by
+name, one page; `total` is how many match. `limit` is 1-200, `offset` ≥ 0 (numbers or 400). The count is the number of live
+assets (Immich still lists them) that have the tag. `GET /api/aitagger/assets` keeps its top-200 `tags` and has `tagsTotal`
+(how many tags there are); the screens label the 200 "Most common tags" and page on through the route ("Show more").
+
+**Store.** `asset_tags(id, tag)` already had the index `asset_tags_tag` and the primary key `(id, tag)`: asset to tags,
+tag to assets, both by index. They are not enough for a *substring* search: on the live library `asset_tags` has 4.2
+million rows, `like '%wolf%'` over the covering index takes 180 ms, and the old top-200 query (a join with `assets`) took 5 s.
+So there is a summary, `tag_counts(tag primary key, n)`, one row per tag (21,110), kept by two SQL triggers on `asset_tags`
+(insert +1, delete -1 and the row goes at 0), so every way of writing or deleting tags is counted (a row must never be
+replaced with `insert or replace`, which does not fire delete triggers). A store made before is filled once when it is
+opened (`meta.tag_counts`, one `group by`: about 0.2 s warm, a few seconds cold on the 5.5 GB live file); `rebuild_tag_counts()`
+repairs it. `Store.tag_index()` reads it into memory (a list best first and a dict), minus the tags of assets that are
+gone (`assets.gone`; a query that starts from the few gone assets), and keeps it until a result, a forget or a library read
+changes something (`_changes`). `list_tags`, `top_tags` and the chip counts all come from it; after the first call a search
+touches no table. Measured on a store of the live shape: see "Measured" below.
+
+**Search requests.** Three optional fields for `POST /api/search` (both engines) and `POST /api/searchplus/search`:
+
+| Field | Meaning |
+|---|---|
+| `tags: [str]` | at most 20 (400 above that; counted as sent). Each is normalised with `norm_tag` and matched **exactly** against `asset_tags` (renames are not applied: the stored tags are the renamed ones, the box suggests them). Blank entries are skipped; one that normalises to nothing is a 400. Repeats count once |
+| `tagMode` | `"all"` (default) or `"any"`; 400 otherwise |
+| `description: str` | at most 200 characters after trimming (400 above); "the description contains this text" through Immich's metadata search, newest first, paged, up to `tagsearch.DESCRIPTION_CAP` = 5,000 assets. The text is also in the `[AI Tagger]` block, so it finds tags too |
+
+With none of them (or empty ones) a request is as before. Tags and description together: the assets in both. The
+candidates are the live assets of the tagger store (tags) and the assets Immich answers (description). What happens next
+depends on the rest of the request:
+
+| Request | What is returned |
+|---|---|
+| no text, no reference photo (only filters) | the candidates, **newest first**, up to `limit` (with `total` when more). Dates and names come from the tagger store's library list, or, with a description, from Immich's answer. Either model; needs neither. With people, "in no album", `must also` words or "any of these people" it reads Immich's list of those newest first and keeps the candidates (the same page-by-page way as below) |
+| Search+ model (Search+ tab or `engine: searchplus`) with text or like | **only the candidates are ranked**: the mask (live, indexed, candidates, then type, dates, people, skipped albums, must-also words) is made first and `view.rows_of(positions)` gives the matrix rows of what is left; only those rows are read from the memory-mapped file and scored (`best_scores(only=)`, `row_scores_of`). Nothing outside the candidates is read, scored or returned; the same order and scores as ranking everything and filtering, which a test checks on random sets. No candidates: no model start either |
+| Immich smart search with text or like | Immich cannot rank just a set, so its ranking is read page by page (1,000 a page) and the candidates picked out until `limit` of them are found or `tagsearch.SCAN_CAP` = 10,000 results have been looked at (skipped assets count as looked at). It stops reading as soon as it has `limit` |
+| `compare` on the Search+ tab | Immich's column is read the same way (its first 10,000 ranked results) and cut to the candidates |
+
+The answer gets `filters` (only when a filter was asked for):
+```json
+"filters": {"tags": ["anthro", "wolf"], "tagMode": "all", "description": "", "candidates": 312, "capped": false,
+            "ranking": "none|searchplus|immich", "ranked": 41, "scanned": 4210, "scanCapped": false,
+            "text": "Filtered to 312 assets with all of: anthro, wolf. Ranked only those with the Search+ model (41 of them are in its index)."}
+```
+`candidates` is the size of the set (tags ∩ description) before anything else; `capped` that Immich had more than 5,000
+assets with that description text (only the newest 5,000 were used); `ranked` (Search+) how many candidates are in the
+index; `scanned` / `scanCapped` (Immich) how many results of its ranking were looked at and whether the cap stopped it
+before `limit` was reached. `text` is the line the screens show over the results.
+
+**Screens.** Web (Search and Search+ forms, in the filters area): an "AI tags" box with a drop-down from the route (the
+commonest when it opens, narrowing as you type; counts beside each), chips, an "All of them / Any of them" switch from
+two chips on, a "Description contains" box and `filters.text` over the results. A typed tag is checked against the route
+before it becomes a chip. The AI Tagger tab: "Find a tag" (same drop-down; picking one filters the list exactly like a
+chip), the chips labelled "Most common tags" and "Show more" (60 a time through the route). Android: the same in
+`SearchScreen`, `SearchPlusScreen` (inside the filters) and `TaggerScreen` (Tagged), with `TagFilter.kt` shared.
+"Save as smart album" leaves the two filters out and says so (a smart album cannot use them yet).
+
+**Fix on the way.** `ImmichClient.iter_smart_search` asked for `limit - seen` on the last page, but Immich's offset is
+`(page - 1) * size`, so a smaller last page landed inside the one before (repeats, skipped by the id check) and a limit one
+over a whole page needed a request per result (10,001 would have been 10,000 requests). Every page now asks for the same
+`size`.
+
+**Measured** (2026-10-03). Read-only against the live `tagger.sqlite` (opened `mode=ro`); the query timings are of the
+shipped code on a scratch store holding a copy of the live `assets` and `asset_tags` rows (4.2 million rows, 73,000
+assets, 21,110 tags), on WSL's own disk like the live file (the same copy on a Windows drive was 20 times slower, which is
+not how the panel runs).
+
+| | |
+|---|---|
+| `tag_counts` kept by the triggers while 4.2 million rows were inserted | equal to a recount (`group by tag`, 150-190 ms warm) |
+| `list_tags(q)` (the route's work), `q` = wolf, anthro, a, e, long hair, `(`, 1girl | 0.5-0.6 ms each (0.00 ms for the first page of everything) |
+| the first one after a change: the in-memory index is built from `tag_counts` | 10 ms (39 ms with 2,000 assets gone) |
+| for comparison: `like '%wolf%'` over `asset_tags`' covering index / the old top-200 query | 148-180 ms / 5 s |
+| `ids_with_tags`: anthro AND wolf (228 assets) / anthro (8,480) / `solo` (38,705) / `solo` OR 1girl (56,919) | 0.7 / 1.7 / 8 / 27 ms |
+| `ids_with_tags`, the 20 commonest tags, all of them / any of them | 37 / 157 ms |
+| `newest` (the listing for a filters-only search), 228 assets | 0.3 ms |
+| `list_assets(tag=...)` for the Tagged card: before (a correlated `exists`) / now (`a.id in (select id from asset_tags where tag=?)`) | 130 ms for any tag / 2-5 ms for a rare tag (534 assets), 46 ms for 8,480, 210 ms for 38,705 |
+
+Plans: the "all" lookup is `SEARCH t0 USING COVERING INDEX asset_tags_tag (tag=?)` and, per row of the rarest tag,
+`SEARCH t USING PRIMARY KEY (id=? AND tag=?)`; "any" is `SEARCH asset_tags USING COVERING INDEX asset_tags_tag`; the gone
+assets come from the partial index `assets_gone` (`create index ... on assets(id) where gone = 1`, empty while nothing is
+gone). Nothing scans the 4.2 million rows. The one-off migration of the live store (the `group by`) is the only
+slow step and runs when the new panel first opens it.
 
 The owner: the text describer "doesn't enhance or improve anything"; the description should hold **tags only**. Instead,
 add a **third tagger** that is good on both real photos and illustration, or is bigger / more accurate.
@@ -1230,7 +1323,8 @@ Every route needs the panel token. Errors are `{"error": "..."}`: 400 for invali
 | `POST /api/aitagger/apply` | `{id}` | preview + `written: true` (process and write now) |
 | `POST /api/aitagger/reprocess` | `{scope, ids?, tag?, mode}` | status + `queued` |
 | `POST /api/aitagger/remove` | `{ids, exclude: bool}` | `{removed, excluded}` (strip the block, forget results) |
-| `GET /api/aitagger/assets` | `?tag=&q=&outdated=1&page=1&size=60` | `{items: [{id, name, type, taken, tags: [str], description, settingsVersion, processedAt}], total, page, tags: [{tag, count}]}` (top 200 tags) |
+| `GET /api/aitagger/assets` | `?tag=&q=&outdated=1&page=1&size=60` | `{items: [{id, name, type, taken, tags: [str], description, settingsVersion, processedAt}], total, page, tags: [{tag, count}], tagsTotal}` (the 200 commonest tags; `tagsTotal` is how many there are) |
+| `GET /api/aitagger/tags` | `?q=&limit=50&offset=0` | `{tags: [{tag, count}], total}`: every tag that contains `q`, most used first, one page (see "Search by tags and description") |
 | `GET /api/aitagger/sample` | `?type=IMAGE\|VIDEO` | `{id, name, type}` (a random catalog asset) |
 
 Status:
@@ -1301,8 +1395,10 @@ Cards:
 5. **Test.** An asset id field plus Random photo / Random video, then Preview. It shows the captures, the tags per model
    with scores, the rating, what the VLM added and removed, which rules fired, the final tags, the description, and the
    description before and after. A "Write this" button (`apply`).
-6. **Tagged assets.** Top-tag chips, search, an "outdated only" filter, and a list with thumbnails, tags and
-   description. Selection actions: Re-tag, Re-describe, Full re-process, Remove AI text (with "and don't tag again").
+6. **Tagged assets.** "Find a tag" (autocomplete from `GET /api/aitagger/tags`; picking a tag filters like its chip),
+   the chips "Most common tags" with "Show more" (pages through all tags), search, an "outdated only" filter, and a
+   list with thumbnails, tags and description. Selection actions: Re-tag, Re-describe, Full re-process, Remove AI text
+   (with "and don't tag again").
 
 Saving "How to tag" or "Rules" opens a choice:
 - **New assets only** (default)

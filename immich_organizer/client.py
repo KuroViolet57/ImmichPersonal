@@ -225,7 +225,10 @@ class ImmichClient:
         while seen < limit:
             body = dict(payload)
             body["page"] = page
-            body["size"] = min(page_size, limit - seen)
+            # The same size for every page: Immich's offset is (page - 1) * size, so a smaller last page (what
+            # ``limit - seen`` made it) lands inside the previous one and returns repeats; for a limit of 10,001 it took
+            # 10,000 one-result requests to get to the last result.
+            body["size"] = page_size
             assets = (self.search_smart(body) or {}).get("assets") or {}
             items = assets.get("items") or []
             if not items:

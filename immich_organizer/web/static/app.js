@@ -96,6 +96,12 @@
   const thumbUrl = (id) => `/thumb/${encodeURIComponent(id)}?t=${encodeURIComponent(token)}`;
   const splitTerms = (value) => value.split(",").map((s) => s.trim()).filter(Boolean);
   const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+  const h = (tag, cls, text) => {
+    const x = document.createElement(tag);
+    if (cls) x.className = cls;
+    if (text != null) x.textContent = text;
+    return x;
+  };
 
   // A segmented control: returns a getter/setter for its value.
   function segmented(id, onChange) {
@@ -284,6 +290,135 @@
     if (window.visualViewport) window.visualViewport.addEventListener("resize", replace);
     document.addEventListener("scroll", (e) => { if (current && e.target !== pop) place(current); }, true);
   })();
+
+  // ------------------------------------------------------------------ AI tags
+  // The tags the AI Tagger wrote (aitagger.py; `GET /api/aitagger/tags?q=` finds them: there are tens of thousands,
+  // far too many for a <datalist>, which phones don't show anyway). Used by the Search tab, the Search+ tab and the
+  // AI Tagger's list of tagged assets.
+
+  // The same normalising as the panel's `norm_tag`, so a typed tag looks like the stored one.
+  const normTag = (text) => String(text).toLowerCase().replace(/_/g, " ").replace(/[,/]/g, " ")
+    .replace(/\[/g, "(").replace(/\]/g, ")").split(/\s+/).filter(Boolean).join(" ").replace(/\.+$/, "").trim().slice(0, 60);
+  const MAX_FILTER_TAGS = 20;
+
+  const tagPop = (() => {
+    const pop = document.createElement("div");
+    pop.className = "suggest is-hidden";
+    pop.setAttribute("role", "listbox");
+    document.body.appendChild(pop);
+    return pop;
+  })();
+  let tagPopInput = null;
+  function placeTagPop() {
+    const input = tagPopInput;
+    if (!input) return;
+    const r = input.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const viewTop = vv ? vv.offsetTop : 0;
+    const viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;     // above the on-screen keyboard
+    const below = viewBottom - r.bottom - 8, above = r.top - viewTop - 8;
+    const up = below < 180 && above > below;
+    tagPop.style.left = `${Math.max(8, r.left)}px`;
+    tagPop.style.width = `${r.width}px`;
+    tagPop.style.maxHeight = `${Math.max(120, Math.min(320, up ? above : below))}px`;
+    if (up) { tagPop.style.top = ""; tagPop.style.bottom = `${window.innerHeight - r.top + 4}px`; }
+    else { tagPop.style.bottom = ""; tagPop.style.top = `${r.bottom + 4}px`; }
+  }
+  function hideTagPop() { tagPop.classList.add("is-hidden"); tagPopInput = null; }
+  window.addEventListener("resize", placeTagPop);
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", placeTagPop);
+  document.addEventListener("scroll", (e) => { if (tagPopInput && e.target !== tagPop) placeTagPop(); }, true);
+
+  // A drop-down under `input` with the tags that contain what is typed, most used first, each with its count.
+  // `pick(tag, count)` gets the one that was tapped. Opens when the box is focused (then it lists the commonest).
+  function tagSuggest(input, pick) {
+    let seq = 0, timer = null;
+    const close = () => { clearTimeout(timer); seq++; hideTagPop(); };          // also drops a question still on its way
+    const ask = () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const mine = ++seq;
+        let data;
+        try { data = await api(`/api/aitagger/tags?${new URLSearchParams({ q: input.value.trim(), limit: "30" })}`); }
+        catch { if (mine === seq) hideTagPop(); return; }
+        if (mine !== seq || document.activeElement !== input) return;           // a newer question, or the box was left
+        tagPop.textContent = "";
+        if (!data.tags.length) return hideTagPop();
+        data.tags.forEach((t) => {
+          const b = h("button", "suggest-item");
+          b.type = "button";
+          b.setAttribute("role", "option");
+          b.append(h("span", "", t.tag), h("small", "", t.count.toLocaleString()));
+          b.addEventListener("mousedown", (e) => e.preventDefault());           // keep the keyboard up while tapping
+          b.addEventListener("click", () => { close(); pick(t.tag, t.count); });
+          tagPop.appendChild(b);
+        });
+        if (data.total > data.tags.length) {
+          tagPop.appendChild(h("p", "suggest-more", `${(data.total - data.tags.length).toLocaleString()} more — keep typing to narrow it down`));
+        }
+        tagPopInput = input;
+        tagPop.scrollTop = 0;
+        placeTagPop();
+        tagPop.classList.remove("is-hidden");
+      }, 150);
+    };
+    input.addEventListener("input", ask);
+    input.addEventListener("focus", ask);
+    input.addEventListener("blur", () => setTimeout(() => { if (tagPopInput === input && document.activeElement !== input) hideTagPop(); }, 200));
+    input.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+    return close;
+  }
+
+  // The chosen tags of a search as chips (`<prefix>-tag-input`, `-tag-add`, `-tag-chips`, `-tag-mode` in the page), with
+  // suggestions as you type and an all / any switch once there are two. `get()` are the tags, `mode()` is all or any.
+  function tagPicker(prefix) {
+    const input = $(`${prefix}-tag-input`), box = $(`${prefix}-tag-chips`), modeBox = $(`${prefix}-tag-mode`);
+    const mode = segmented(`${prefix}-tag-mode`);
+    let tags = [];
+    const render = () => {
+      box.textContent = "";
+      tags.forEach((name) => {
+        const chip = h("span", "chip", name);
+        const x = h("button", "", "×");
+        x.type = "button";
+        x.setAttribute("aria-label", `Remove the tag ${name}`);
+        x.addEventListener("click", () => { tags = tags.filter((t) => t !== name); render(); });
+        chip.appendChild(x);
+        box.appendChild(chip);
+      });
+      modeBox.classList.toggle("is-hidden", tags.length < 2);
+    };
+    const put = (name) => {
+      if (!tags.includes(name)) {
+        if (tags.length >= MAX_FILTER_TAGS) return toast(`At most ${MAX_FILTER_TAGS} tags at a time.`, true);
+        tags.push(name);
+      }
+      input.value = "";
+      closeList();
+      render();
+    };
+    // a typed tag is checked against the panel's list, so a typo is caught here and not as "0 results"
+    const typed = async () => {
+      const name = normTag(input.value);
+      if (!name) return;
+      try {
+        const data = await api(`/api/aitagger/tags?${new URLSearchParams({ q: name, limit: "200" })}`);
+        if (data.tags.some((t) => t.tag === name) || data.total > data.tags.length) return put(name);
+        toast(`The AI Tagger has no tag “${name}”. Pick one from the list that opens as you type.`, true);
+      } catch (err) { toast(err.message, true); }
+    };
+    const closeList = tagSuggest(input, (tag) => put(tag));
+    $(`${prefix}-tag-add`).addEventListener("click", typed);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); closeList(); typed(); } });
+    return { get: () => tags.slice(), mode: () => mode.get() };
+  }
+
+  // What the tag / description filters did, in the panel's own words (`filters.text` of a search answer).
+  function showFilters(id, filters) {
+    const el = $(id);
+    el.textContent = filters ? filters.text || "" : "";
+    el.classList.toggle("is-hidden", !(filters && filters.text));
+  }
 
   // ------------------------------------------------------------------ viewer
 
@@ -686,6 +821,7 @@
   const searchPeopleMatch = segmented("people-match");
   const searchPeople = peoplePicker("people-input", "people-add", "people-chips",
     (ids) => $("people-match").classList.toggle("is-hidden", ids.length < 2));
+  const searchTags = tagPicker("s");
 
   function renderSessionChip() {
     const box = $("skip-chips");
@@ -790,13 +926,18 @@
     if ($("takenAfter").value) body.filters.taken_after = $("takenAfter").value;
     if ($("takenBefore").value) body.filters.taken_before = $("takenBefore").value;
     if ($("unfiled").checked) body.filters.only_unfiled = true;
+    const tags = searchTags.get();
+    if (tags.length) { body.tags = tags; body.tagMode = searchTags.mode(); }
+    const description = $("s-desc").value.trim();
+    if (description) body.description = description;
     return body;
   }
 
   async function runSearch() {
     const body = currentSearch();
-    if (searchMode.get() === "query" && !body.query && !body.people.length) {
-      return toast("Describe what you are looking for, or pick people.", true);
+    const filtered = !!(body.tags || body.description);          // AI tags / description text: they are enough on their own
+    if (searchMode.get() === "query" && !body.query && !body.people.length && !filtered) {
+      return toast("Describe what you are looking for, pick people, or filter by AI tags or description text.", true);
     }
     if (searchMode.get() === "like" && !body.like) return toast("Paste an asset ID to match against.", true);
     if (body.limit > 10000) return toast("Max results can be at most 10,000.", true);
@@ -804,6 +945,10 @@
 
     busy(true, body.engine === "searchplus" && body.query
       ? "Searching with the Search+ model… (the first search loads the model: up to ~30 s)"
+      : filtered && (body.query || body.like)
+      ? "Looking through the ranking for photos with those tags or that description… (can take up to ~15 s)"
+      : filtered
+      ? "Looking up the photos with those tags or that description…"
       : body.people.length > 1 && body.peopleMatch === "any" && (body.query || body.like)
       ? "Searching for photos with any of these people… (can take up to ~15 s)"
       : `Searching your library for up to ${body.limit.toLocaleString()}…`);
@@ -815,6 +960,7 @@
       state.selected = new Set(state.assets.map((a) => a.id));
       state.lastClicked = -1;
       renderResults();
+      showFilters("results-filters", data.filters);
       $("results-card").classList.remove("is-hidden");
       $("file-card").classList.toggle("is-hidden", state.assets.length === 0);
       let msg = state.assets.length ? `Found ${plural(state.assets.length, "photo")}` : "No matches";
@@ -1056,6 +1202,7 @@
   function saveSearchAsRule() {   // "Save as smart album…"
     const s = currentSearch();
     if (!s.query && !s.like && !s.people.length) return toast("Set up a search first.", true);
+    const leftOut = s.tags || s.description;          // a smart album can't filter on AI tags or description text (yet)
     const who = s.people.map((id) => (state.people.find((p) => p.id === id) || {}).name).filter(Boolean);
     const name = $("album").value.trim() || (s.query || who.join(" & ") || "Similar photos").slice(0, 40);
     const prefill = {
@@ -1071,7 +1218,8 @@
     };
     showTab("themes");
     openThemeEditor(null, prefill);
-    toast("Saved as “the best N” like your search. Switch to “Every photo above a score” and preview for stricter results, then press Save.");
+    toast("Saved as “the best N” like your search. Switch to “Every photo above a score” and preview for stricter results, then press Save."
+      + (leftOut ? " The AI tag and description filters are not part of a smart album, so they are left out." : ""), !!leftOut);
   }
 
 
@@ -1495,6 +1643,7 @@
     $("sp-field-text").classList.toggle("is-hidden", v !== "text");
     $("sp-field-like").classList.toggle("is-hidden", v !== "like");
   });
+  const spTags = tagPicker("sp");
   const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
   function spLikeThumb() {
     const id = $("sp-like").value.trim();
@@ -1663,10 +1812,15 @@
     fillSpGrid($("sp-grid"), spState.assets, true, two ? theirs : null);
     if (two) fillSpGrid($("sp-grid-immich"), spState.immich, false, mine);
     const c = data.counts;
-    let note = `Took ${(data.tookMs / 1000).toFixed(1)} s. Tap a photo to (un)select it; ⤢ opens it. Videos score by their best-matching frame.`;
-    if (c && (c.pending || 0) + (c.retrying || 0) > 0) note = `Searched the ${c.indexed.toLocaleString()} of ${c.assets.toLocaleString()} items indexed so far — the index is still being built. ` + note;
-    if (c && !c.indexed) note = "The index is empty — press “Build index” below first.";
+    const listed = !!(data.filters && data.filters.ranking === "none");        // AI tag / description filters only: no ranking
+    let note = listed
+      ? `Took ${(data.tookMs / 1000).toFixed(1)} s. Tap a photo to (un)select it; ⤢ opens it.`
+      : `Took ${(data.tookMs / 1000).toFixed(1)} s. Tap a photo to (un)select it; ⤢ opens it. Videos score by their best-matching frame.`;
+    if (data.total && data.total > spState.assets.length) note += ` ${data.total.toLocaleString()} match in all: raise Max results to see more.`;
+    if (!listed && c && (c.pending || 0) + (c.retrying || 0) > 0) note = `Searched the ${c.indexed.toLocaleString()} of ${c.assets.toLocaleString()} items indexed so far — the index is still being built. ` + note;
+    if (!listed && c && !c.indexed) note = "The index is empty — press “Build index” below first.";
     $("sp-note").textContent = note;
+    showFilters("sp-filters", data.filters);
     updateSpCounts();
   }
 
@@ -1677,15 +1831,21 @@
       media: $("sp-type").value || null, limit: Math.min(Number($("sp-limit").value) || 200, 1000),
       after: $("sp-after").value || null, before: $("sp-before").value || null, compare: $("sp-compare").checked,
     };
+    const tags = spTags.get();
+    if (tags.length) { body.tags = tags; body.tagMode = spTags.mode(); }
+    const description = $("sp-desc").value.trim();
+    if (description) body.description = description;
+    const filtered = tags.length > 0 || !!description;                // enough on their own: the matching photos are listed
     if (mode === "text") {
       body.text = $("sp-text").value.trim();
-      if (!body.text) return toast("Type what you are looking for.", true);
+      if (!body.text && !filtered) return toast("Type what you are looking for, or filter by AI tags or description text.", true);
     } else {
       body.like = $("sp-like").value.trim();
       if (!isUuid(body.like)) return toast("Pick a photo: open any photo in the panel and press “Similar”, or paste its ID.", true);
     }
     const loaded = spState.data && spState.data.service.status === "ok";
-    busy(true, mode === "text" && !loaded ? "Loading the Search+ model, then searching… (about half a minute)" : "Searching…");
+    busy(true, mode === "text" && !body.text ? "Looking up the photos with those tags or that description…"
+      : mode === "text" && !loaded ? "Loading the Search+ model, then searching… (about half a minute)" : "Searching…");
     try {
       const data = await api("/api/searchplus/search", { method: "POST", body: JSON.stringify(body) });
       spState.assets = data.assets || [];
@@ -1742,6 +1902,7 @@
   });
   $("sp-run").addEventListener("click", () => runSearchPlus());
   $("sp-text").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearchPlus(); });
+  $("sp-desc").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearchPlus(); });
   $("sp-like").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearchPlus(); });
   $("v-similar").addEventListener("click", () => {
     const item = viewer.list[viewer.index];
@@ -1820,7 +1981,10 @@
     base: {},              // form values as last loaded or saved: tells which keys the person changed
     seen: {},              // the server value each form field was last filled from
     rules: [],             // the rule rows being edited
-    list: { items: [], total: 0, page: 1, size: 60, tags: [], tag: "", q: "", outdated: false, allTags: false, seq: 0, loaded: false, version: null },
+    // `chips` are the tag chips shown (the commonest first, then the pages "Show more" fetched), `tagsTotal` how many tags
+    // there are in all, `picked` the tag chosen in "Find a tag" (it may not be among the chips)
+    list: { items: [], total: 0, page: 1, size: 60, tags: [], chips: [], tagsTotal: 0, picked: null, tag: "", q: "",
+            outdated: false, seq: 0, loaded: false, version: null },
     selected: new Set(),   // asset ids ticked in the list (kept across pages)
     qTimer: null,
   };
@@ -2497,6 +2661,8 @@
 
   // ---------------------------------------------------------- tagged assets
 
+  const TG_CHIPS = 18;      // tag chips shown first (the list from the assets route holds the 200 commonest)
+  const TG_MORE = 60;       // chips "Show more" adds each time
   const tgViewerHooks = {
     isSelected: (item) => tagState.selected.has(item.id),
     toggle: (item, index) => {
@@ -2529,6 +2695,8 @@
       L.total = data.total || 0;
       L.page = data.page || L.page;
       L.tags = data.tags || [];
+      L.tagsTotal = data.tagsTotal != null ? data.tagsTotal : L.tags.length;
+      if (!L.chips.length) L.chips = L.tags.slice(0, TG_CHIPS);
       L.loaded = true;
       tgRenderAssets();
     } catch (err) {
@@ -2541,9 +2709,10 @@
     const current = tagState.data ? tagState.data.settingsVersion : null;
     L.version = current;
 
+    // "Most common tags": a chip each (tap to filter, tap again to clear), then as many more as "Show more" brought in
     const top = $("tg-top-tags");
     top.textContent = "";
-    const shown = L.allTags ? L.tags : L.tags.slice(0, 18);
+    const shown = L.chips;
     const tagChip = (name, count) => {
       const b = tgEl("button", `tg-tag${L.tag === name ? " is-on" : ""}`, name);
       b.type = "button";
@@ -2551,14 +2720,18 @@
       b.addEventListener("click", () => { L.tag = L.tag === name ? "" : name; tgLoadAssets(1); });
       return b;
     };
-    if (L.tag && !shown.some((t) => t.tag === L.tag)) top.appendChild(tagChip(L.tag, null));
+    if (L.tag && !shown.some((t) => t.tag === L.tag)) top.appendChild(tagChip(L.tag, L.picked && L.picked.tag === L.tag ? L.picked.count : null));
     shown.forEach((t) => top.appendChild(tagChip(t.tag, t.count)));
-    if (L.tags.length > 18) {
-      const more = tgEl("button", "tg-tag", L.allTags ? "Fewer tags" : `All ${L.tags.length} tags`);
-      more.type = "button";
-      more.addEventListener("click", () => { L.allTags = !L.allTags; tgRenderAssets(); });
-      top.appendChild(more);
-    }
+    const rest = Math.max(0, L.tagsTotal - shown.length);
+    $("tg-tags-more").classList.toggle("is-hidden", rest === 0);
+    $("tg-tags-more").textContent = rest > TG_MORE ? "Show more" : `Show the last ${rest.toLocaleString()}`;
+    $("tg-tags-note").textContent = L.tagsTotal
+      ? (rest ? `${shown.length.toLocaleString()} of ${L.tagsTotal.toLocaleString()} tags shown, the commonest first. Find any other one above.`
+        : `All ${L.tagsTotal.toLocaleString()} tags are shown.`)
+      : "";
+    $("tg-tag-found").textContent = L.tag
+      ? `Showing the assets that have “${L.tag}”. Tap its chip again to clear it.`
+      : "Every tag the taggers have written can be found here, not only the common ones below.";
 
     $("tg-count").textContent = plural(L.total, "asset");
     const list = $("tg-list");
@@ -2617,7 +2790,34 @@
   const tgGoPage = (page) => { tgLoadAssets(page); $("tg-assets").scrollIntoView({ block: "start" }); };
   $("tg-prev").addEventListener("click", () => tgGoPage(tagState.list.page - 1));
   $("tg-next").addEventListener("click", () => tgGoPage(tagState.list.page + 1));
-  $("tg-refresh").addEventListener("click", () => { loadTagger(); tgLoadAssets(); });
+  $("tg-refresh").addEventListener("click", () => { tagState.list.chips = []; loadTagger(); tgLoadAssets(); });
+
+  // "Show more" under the most common tags: the next page of the full list (`GET /api/aitagger/tags`, same order)
+  async function tgMoreTags() {
+    const L = tagState.list;
+    const button = $("tg-tags-more");
+    button.disabled = true;
+    try {
+      const data = await api(`/api/aitagger/tags?${new URLSearchParams({ limit: String(TG_MORE), offset: String(L.chips.length) })}`);
+      const have = new Set(L.chips.map((t) => t.tag));
+      L.chips = L.chips.concat(data.tags.filter((t) => !have.has(t.tag)));
+      L.tagsTotal = data.total;
+      tgRenderAssets();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  }
+  $("tg-tags-more").addEventListener("click", tgMoreTags);
+  // "Find a tag": picking one filters the list exactly like tapping its chip
+  tagSuggest($("tg-tag-find"), (tag, count) => {
+    const L = tagState.list;
+    L.tag = tag;
+    L.picked = { tag, count };
+    $("tg-tag-find").value = "";
+    tgLoadAssets(1);
+  });
   const tgSearch = () => { clearTimeout(tagState.qTimer); tagState.list.q = $("tg-q").value.trim(); tgLoadAssets(1); };
   $("tg-q-go").addEventListener("click", tgSearch);
   $("tg-q").addEventListener("keydown", (e) => { if (e.key === "Enter") tgSearch(); });
@@ -3161,6 +3361,7 @@
   $("run").addEventListener("click", runSearch);
   $("query").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
   $("like").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+  $("s-desc").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
   $("file").addEventListener("click", fileSelected);
   $("save-as-rule").addEventListener("click", saveSearchAsRule);
   $("select-all").addEventListener("click", () => {

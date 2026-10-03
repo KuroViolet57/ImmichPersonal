@@ -114,6 +114,37 @@ class TestStatic(WebCase):
             self.assertIn(ctx.exception.code, (403, 404), attempt)
 
 
+class TestTheScripts(unittest.TestCase):
+    """The page's scripts: they parse (``node --check``), and every element they look up is in the page."""
+
+    STATIC = Path(__file__).resolve().parent.parent / "immich_organizer" / "web" / "static"
+
+    def test_the_scripts_parse(self):
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        for name in ("app.js", "sw.js"):
+            done = subprocess.run([node, "--check", str(self.STATIC / name)], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, f"{name}: {done.stderr}")
+
+    def test_every_element_the_app_looks_up_exists_in_the_page(self):
+        import re
+        js = (self.STATIC / "app.js").read_text("utf-8")
+        html = (self.STATIC / "index.html").read_text("utf-8")
+        have = set(re.findall(r'\bid="([^"]+)"', html))
+        used = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)', js))
+        self.assertEqual(sorted(used - have), [])
+        # the tag pickers find their parts by prefix (`tagPicker("s")`, `tagPicker("sp")`)
+        for prefix in re.findall(r'tagPicker\("([a-z]+)"\)', js):
+            for part in ("tag-input", "tag-add", "tag-chips", "tag-mode"):
+                self.assertIn(f"{prefix}-{part}", have)
+        self.assertEqual(sorted(re.findall(r'tagPicker\("([a-z]+)"\)', js)), ["s", "sp"])
+        for needed in ("s-desc", "sp-desc", "results-filters", "sp-filters", "tg-tag-find", "tg-tags-more", "tg-top-label"):
+            self.assertIn(needed, have)
+
+
 class TestApi(WebCase):
     def test_status_reports_the_connection(self):
         _, payload = request(self.base + "/api/status")
@@ -1056,6 +1087,7 @@ class FakeSPEngine:
 
     def __init__(self, view, scores):
         self._view, self.scores, self.text_calls = view, scores, 0
+        self.best_calls = []            # the ``only`` of every scoring call (asset positions, or None: everything)
 
     def model_name(self):
         return "PE-test"
@@ -1067,10 +1099,16 @@ class FakeSPEngine:
     def view(self):
         return self._view
 
-    def best(self, view, vector):
+    def best(self, view, vector, only=None):
         import numpy as np
+        self.best_calls.append(None if only is None else [int(p) for p in only])
         sc = self.scores.get(vector[0], {})
-        return np.array([sc.get(a, -1.0) for a in view.ids], dtype=np.float32)
+        out = np.array([sc.get(a, -1.0) for a in view.ids], dtype=np.float32)
+        if only is not None:                                   # like the real one: whatever was not asked for is -inf
+            kept = np.zeros(len(out), dtype=bool)
+            kept[np.asarray(only, dtype=np.int64)] = True
+            out[~kept] = -np.inf
+        return out
 
 
 class TestSmartAlbumsOnSearchPlus(WebCase):
@@ -1970,3 +2008,547 @@ class TestAiTaggerUnload(WebCase):
                 self.refused(lambda: self.post("settings", {"changes": changes}))
         self.assertEqual(self.get()["settings"]["unload_after"], 5)
         self.assertEqual(self.get()["limits"]["unload_after"], [1, 60])
+
+
+# ------------------------------------------------------------------ search by AI tags and by description
+
+class TagSearchCase(WebCase):
+    """The fake library of 40 assets with AI tags and descriptions made up for the tag search.
+
+    AI tags (the tagger store): ``solo`` on all, ``anthro`` on even i, ``wolf`` on i % 3 == 0, ``beach`` on i % 5 == 0,
+    ``furry art`` on i < 4. Immich descriptions: "Holiday in Spain" for i % 4 == 0, "Grandma's Café" for i % 4 == 1.
+    Videos are i % 10 == 9. The Search+ index has assets 0..11 only; asset i is a picture of WORDS[i % 4]."""
+
+    def setUp(self):
+        super().setUp()
+        from immich_organizer import aitagger as at
+        from immich_organizer import searchplus as sp
+        from immich_organizer import tagsearch
+        from tests import test_aitagger as ta
+        from tests import test_searchplus as ts
+        self.at, self.sp, self.tagsearch, self.ts = at, sp, tagsearch, ts
+        self.n = len(self.ids)
+        self.taken = []
+        rows = []
+        for i, a in enumerate(self.fake.assets):
+            self.taken.append(a["localDateTime"][:10] + " 12:00:00")
+            rows.append({"id": a["id"], "type": a["type"], "taken": self.taken[i], "name": a["originalFileName"],
+                         "preview": "", "original": "", "duration_ms": 0})
+        self.store = at.Store(Path(self.tmp.name) / "at")
+        self.addCleanup(self.store.conn.close)
+        self.store.sync_catalog(rows)
+        for i in range(self.n):
+            tags = ["solo"] + (["anthro"] if i % 2 == 0 else []) + (["wolf"] if i % 3 == 0 else []) \
+                + (["beach"] if i % 5 == 0 else []) + (["furry art"] if i < 4 else [])
+            self.store.save_result(self.ids[i], tags=ta.tag_rows(*tags), block="", version=1, written=True)
+            text = "Holiday in Spain" if i % 4 == 0 else "Grandma's Café" if i % 4 == 1 else ""
+            if text:
+                self.fake.by_id[self.ids[i]]["exifInfo"] = {"description": text}
+        self.services = ta.FakeServices()
+        self.indexer = at.Indexer(self.store, self.services, client=self.client, catalog=lambda: rows, frames=ta.fake_frames)
+        self.addCleanup(self.indexer.stop, 5)
+        self.httpd.RequestHandlerClass.aitagger_parts = (self.store, self.services, self.indexer)
+        self.addCleanup(setattr, self.httpd.RequestHandlerClass, "aitagger_parts", None)
+        # Search+: assets 0..11 indexed, newest first
+        self.sp_catalog = [{"id": self.ids[i], "type": "IMAGE", "taken": f"2026-01-{20 - i:02d} 10:00", "name": f"p{i}.jpg",
+                            "preview": ts.WORDS[i % 4], "original": "", "duration_ms": 0} for i in range(12)]
+        self.spstore = sp.Store(Path(self.tmp.name) / "sp")
+        self.addCleanup(self.spstore.conn.close)
+        self.spservice = ts.FakeService()
+        self.spindexer = sp.Indexer(self.spstore, self.spservice, catalog=lambda: self.sp_catalog, frames=ts.fake_frames)
+        sp.save_settings({"keep_updated": False})
+        self.spindexer.start()
+        self.spindexer.thread.join(10)
+        self.assertEqual(self.spstore.counts()["indexed"], 12)
+        self.httpd.RequestHandlerClass.searchplus_parts = (self.spstore, self.spservice, self.spindexer)
+        self.addCleanup(setattr, self.httpd.RequestHandlerClass, "searchplus_parts", None)
+        self.backend = FakeThemeBackend({"dog": {self.ids[1]: 0.2, self.ids[3]: 0.15, self.ids[9]: 0.1}})
+        self.httpd.RequestHandlerClass.theme_backend = self.backend
+        self.addCleanup(setattr, self.httpd.RequestHandlerClass, "theme_backend", None)
+
+    # ---- helpers
+    def get(self, path):
+        return request(self.base + path)[1]
+
+    def search(self, body, path="/api/search"):
+        return request(self.base + path, method="POST", body=body)[1]
+
+    def plus(self, body):
+        return self.search(body, "/api/searchplus/search")
+
+    def refused(self, call, text=None, code=400):
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            call()
+        self.assertEqual(err.exception.code, code)
+        message = json.loads(err.exception.read())["error"]
+        if text:
+            self.assertIn(text, message)
+        return message
+
+    def at_i(self, *idx):
+        return [self.ids[i] for i in idx]
+
+    def ids_of(self, data):
+        return [a["id"] for a in data["assets"]]
+
+    def newest(self, idx):
+        return [self.ids[i] for i in sorted(idx, key=lambda i: self.taken[i], reverse=True)]
+
+    def wolf(self):
+        return [i for i in range(self.n) if i % 3 == 0]
+
+    def searches(self, kind):
+        return [b for k, b in self.fake.searches if k == kind]
+
+
+class TestTheTagListRoute(TagSearchCase):
+    def test_every_tag_with_its_count_most_used_first(self):
+        data = self.get("/api/aitagger/tags")
+        self.assertEqual(data["total"], 5)
+        self.assertEqual([(t["tag"], t["count"]) for t in data["tags"]],
+                         [("solo", 40), ("anthro", 20), ("wolf", 14), ("beach", 8), ("furry art", 4)])
+        self.assertEqual(set(data), {"tags", "total"})
+        self.assertEqual(set(data["tags"][0]), {"tag", "count"})
+
+    def test_it_finds_a_substring_and_normalises_what_is_typed(self):
+        pair = lambda q: [(t["tag"], t["count"]) for t in self.get("/api/aitagger/tags?q=" + q)["tags"]]  # noqa: E731
+        self.assertEqual(pair("AN"), [("anthro", 20)])
+        self.assertEqual(pair("r"), [("anthro", 20), ("furry art", 4)])
+        self.assertEqual(pair("Furry_Art"), [("furry art", 4)])
+        self.assertEqual(pair("furry%20art"), [("furry art", 4)])
+        self.assertEqual(pair("zzz"), [])
+        self.assertEqual(self.get("/api/aitagger/tags?q=zzz"), {"tags": [], "total": 0})
+        self.assertEqual(self.get("/api/aitagger/tags?q=r")["total"], 2)
+
+    def test_paging(self):
+        pages = [self.get(f"/api/aitagger/tags?limit=2&offset={o}") for o in (0, 2, 4, 6)]
+        self.assertEqual([[t["tag"] for t in p["tags"]] for p in pages],
+                         [["solo", "anthro"], ["wolf", "beach"], ["furry art"], []])
+        self.assertEqual({p["total"] for p in pages}, {5})
+        self.assertEqual(len(self.get("/api/aitagger/tags?limit=0")["tags"]), 1)         # at least one
+        self.assertEqual(len(self.get("/api/aitagger/tags?limit=9999")["tags"]), 5)       # at most 200
+        self.assertEqual(len(self.get("/api/aitagger/tags?offset=-3")["tags"]), 5)        # not before the first
+        for bad in ("limit=x", "offset=1.5"):
+            self.refused(lambda: self.get("/api/aitagger/tags?" + bad), "numbers")
+
+    def test_it_needs_the_token_and_the_assets_list_says_how_many_tags_there_are(self):
+        self.refused(lambda: request(self.base + "/api/aitagger/tags", token=None), code=401)
+        data = self.get("/api/aitagger/assets")
+        self.assertEqual(data["tagsTotal"], 5)
+        self.assertEqual(data["tags"][0], {"tag": "solo", "count": 40})
+
+
+class TestSearchTabWithOnlyFilters(TagSearchCase):
+    """No text and no reference photo: the assets that match, newest first (either model; the model makes no difference)."""
+
+    def test_tags_newest_first_with_the_filters_summary(self):
+        data = self.search({"tags": ["wolf"], "limit": 100})
+        self.assertEqual(self.ids_of(data), self.newest(self.wolf()))
+        self.assertEqual(data["count"], 14)
+        first = self.ids.index(data["assets"][0]["id"])
+        self.assertEqual(data["assets"][0], {"id": self.ids[first], "name": f"IMG_{first:04d}.jpg", "type": "IMAGE",
+                                             "date": self.taken[first][:10]})
+        self.assertEqual(data["filters"], {
+            "tags": ["wolf"], "tagMode": "all", "description": "", "candidates": 14, "capped": False, "ranking": "none",
+            "text": "Filtered to 14 assets with the tag wolf. Newest first."})
+        self.assertEqual(self.searches("smart"), [])                       # Immich's smart search was not asked
+        self.assertEqual(self.searches("metadata"), [])                    # nor anything else: it is all in the store
+
+    def test_limit_and_the_total_past_it(self):
+        data = self.search({"tags": ["wolf"], "limit": 5})
+        self.assertEqual(self.ids_of(data), self.newest(self.wolf())[:5])
+        self.assertEqual((data["count"], data["total"]), (5, 14))
+        self.assertNotIn("total", self.search({"tags": ["wolf"], "limit": 14}))     # nothing hidden: no "of N"
+
+    def test_all_or_any_of_several_tags(self):
+        both = self.search({"tags": ["anthro", "wolf"], "limit": 100})              # i % 6 == 0
+        self.assertEqual(set(self.ids_of(both)), set(self.at_i(*range(0, 40, 6))))
+        self.assertEqual(both["filters"]["tagMode"], "all")
+        self.assertEqual(both["filters"]["text"], "Filtered to 7 assets with all of: anthro, wolf. Newest first.")
+        either = self.search({"tags": ["anthro", "wolf"], "tagMode": "any", "limit": 100})
+        want = {i for i in range(self.n) if i % 2 == 0 or i % 3 == 0}
+        self.assertEqual(self.ids_of(either), self.newest(want))
+        self.assertEqual(either["filters"]["text"], f"Filtered to {len(want)} assets with any of: anthro, wolf. Newest first.")
+        self.assertEqual(self.search({"tags": ["wolf", "furry art", "beach"], "limit": 9})["count"], 1)      # only asset 0
+
+    def test_tags_are_normalised_and_unknown_ones_match_nothing(self):
+        data = self.search({"tags": ["Furry_Art", "furry art", " SOLO "], "limit": 100})
+        self.assertEqual(data["filters"]["tags"], ["furry art", "solo"])                  # normalised, no repeat
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(0, 1, 2, 3)))
+        none = self.search({"tags": ["wolf", "unicorn"]})
+        self.assertEqual((none["assets"], none["filters"]["candidates"]), ([], 0))
+        self.assertEqual(none["filters"]["text"], "Filtered to 0 assets with all of: wolf, unicorn. Newest first.")
+        self.assertEqual(self.search({"tags": ["wolf", "unicorn"], "tagMode": "any", "limit": 100})["count"], 14)
+
+    def test_type_dates_skip_ids_and_skipped_albums(self):
+        videos = self.search({"tags": ["wolf"], "filters": {"type": "VIDEO"}, "limit": 100})
+        self.assertEqual(set(self.ids_of(videos)), set(self.at_i(9, 39)))
+        late = self.search({"tags": ["wolf"], "filters": {"taken_after": "2023-01-01", "taken_before": "2023-12-31"},
+                            "limit": 100})
+        want = [i for i in self.wolf() if self.taken[i][:4] == "2023"]
+        self.assertTrue(want)
+        self.assertEqual(self.ids_of(late), self.newest(want))
+        self.fake.add_album("Done", members=self.at_i(0, 3))
+        skipped = self.search({"tags": ["wolf"], "excludeAlbums": ["Done"], "skipIds": self.at_i(6), "limit": 100})
+        self.assertEqual(set(self.ids_of(skipped)), set(self.at_i(*self.wolf())) - set(self.at_i(0, 3, 6)))
+        self.assertEqual(skipped["excluded"], 3)
+        self.assertEqual(self.search({"tags": ["wolf"], "excludeAlbums": ["Nope"]})["unknownAlbums"], ["Nope"])
+
+    def test_the_search_plus_model_makes_no_difference_without_a_text(self):
+        data = self.search({"tags": ["wolf"], "engine": "searchplus", "limit": 100})
+        self.assertEqual(self.ids_of(data), self.newest(self.wolf()))
+        self.assertEqual(data["engine"], "searchplus")
+        self.refused(lambda: self.search({"tags": ["wolf"], "engine": "searchplus", "filters": {"city": "Paris"}}),
+                     "can't be used with the Search+ model")
+
+    def test_people_and_other_immich_only_filters_read_immichs_list_and_keep_the_candidates(self):
+        anna = self.fake.add_person("Anna", self.at_i(0, 3, 4, 6))
+        data = self.search({"tags": ["wolf"], "people": [anna], "limit": 100})
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(0, 3, 6)))               # 4 is Anna's but has no wolf
+        self.assertEqual(data["filters"]["ranking"], "none")
+        self.assertEqual(data["filters"]["candidates"], 14)
+        self.assertEqual(self.searches("smart"), [])
+        self.assertEqual(self.searches("metadata")[0]["personIds"], [anna])
+        self.fake.add_album("Filed", members=self.at_i(0))
+        data = self.search({"tags": ["wolf"], "filters": {"only_unfiled": True}, "limit": 100})
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(*self.wolf())) - set(self.at_i(0)))
+        self.fake.smart_results["snow"] = self.at_i(3, 6, 1)
+        data = self.search({"tags": ["wolf"], "refine": {"all_of": ["snow"]}, "limit": 100})        # refine words still work
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(3, 6)))
+
+    def test_people_any_with_tags(self):
+        anna = self.fake.add_person("Anna", self.at_i(0, 4))
+        ben = self.fake.add_person("Ben", self.at_i(3, 5))
+        data = self.search({"tags": ["wolf"], "people": [anna, ben], "peopleMatch": "any", "limit": 100})
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(0, 3)))             # 4 and 5 are somebody's, but not wolves
+
+    def test_description_only_asks_immich_and_lists_newest_first(self):
+        data = self.search({"description": "holiday", "limit": 100})
+        spain = [i for i in range(self.n) if i % 4 == 0]
+        self.assertEqual(self.ids_of(data), self.newest(spain))
+        body = self.searches("metadata")[0]
+        self.assertEqual((body["description"], body["order"]), ("holiday", "desc"))
+        self.assertNotIn("query", body)
+        self.assertEqual(data["filters"]["candidates"], 10)
+        self.assertEqual(data["filters"]["text"], "Filtered to 10 assets whose description contains “holiday”. Newest first.")
+        self.assertEqual(data["filters"]["tags"], [])
+        self.assertEqual(self.searches("smart"), [])
+        self.assertEqual(data["assets"][0]["name"], f"IMG_{self.ids.index(data['assets'][0]['id']):04d}.jpg")
+
+    def test_the_description_match_is_case_and_accent_blind_and_is_a_substring(self):
+        grandma = [i for i in range(self.n) if i % 4 == 1]
+        for text in ("cafe", "CAFÉ", "grandma", "ndma's c"):
+            self.assertEqual(set(self.ids_of(self.search({"description": text, "limit": 100}))),
+                             set(self.at_i(*grandma)), text)
+        self.assertEqual(self.search({"description": "no such words"})["assets"], [])
+
+    def described(self):
+        """The description searches Immich was asked, in order (the people search for "any of them" has none)."""
+        return [b for b in self.searches("metadata") if "description" in b]
+
+    def test_the_description_search_gets_the_filters_immich_can_apply(self):
+        self.search({"description": "holiday", "filters": {"type": "VIDEO"}})
+        self.assertEqual(self.described()[-1]["type"], "VIDEO")
+        anna = self.fake.add_person("Anna", self.at_i(0, 4, 8))
+        data = self.search({"description": "holiday", "people": [anna], "limit": 100})
+        self.assertEqual(self.described()[-1]["personIds"], [anna])
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(0, 4, 8)))
+        data = self.search({"description": "holiday", "people": [anna, self.fake.add_person("Ben", self.at_i(0, 12))],
+                            "peopleMatch": "any", "limit": 100})
+        self.assertNotIn("personIds", self.described()[-1])                              # "any of them": applied afterwards
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(0, 4, 8, 12)))
+        self.search({"description": "holiday", "filters": {"language": "de"}, "limit": 3})   # a smart-search-only filter
+        self.assertNotIn("language", self.described()[-1])
+
+    def test_description_and_tags_together_are_the_assets_in_both(self):
+        data = self.search({"description": "holiday", "tags": ["wolf"], "limit": 100})
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(0, 12, 24, 36)))          # i % 4 == 0 and i % 3 == 0
+        self.assertEqual(data["filters"]["candidates"], 4)
+        self.assertEqual(data["filters"]["text"], "Filtered to 4 assets with the tag wolf and whose description "
+                                                  "contains “holiday”. Newest first.")
+        calls = len(self.searches("metadata"))
+        none = self.search({"description": "holiday", "tags": ["unicorn"]})
+        self.assertEqual((none["assets"], none["filters"]["candidates"]), ([], 0))
+        self.assertEqual(len(self.searches("metadata")), calls)                          # nothing has the tag: Immich not asked
+
+    def test_the_description_cap_is_reported(self):
+        with mock.patch.object(self.tagsearch, "DESCRIPTION_CAP", 4):
+            data = self.search({"description": "holiday", "limit": 100})
+        spain = [i for i in range(self.n) if i % 4 == 0]
+        newest_four = self.newest(spain)[:4]                                           # Immich answers newest first
+        self.assertEqual(self.ids_of(data), newest_four)
+        self.assertTrue(data["filters"]["capped"])
+        self.assertEqual(data["filters"]["candidates"], 4)
+        self.assertIn("only the newest 4 were used", data["filters"]["text"])
+        with mock.patch.object(self.tagsearch, "DESCRIPTION_CAP", 10):                 # exactly as many as there are: not capped
+            data = self.search({"description": "holiday", "limit": 100})
+        self.assertFalse(data["filters"]["capped"])
+        self.assertEqual(len(data["assets"]), 10)
+
+    def test_the_description_search_pages_through_immichs_answer(self):
+        self.fake.max_page = 3
+        with mock.patch.object(self.tagsearch, "DESCRIPTION_CAP", 5):
+            data = self.search({"description": "holiday", "limit": 100})
+        self.assertEqual(len(self.searches("metadata")), 2)                            # 5 + 1 asked for: two pages of three
+        self.assertEqual(len(data["assets"]), 5)
+        self.assertTrue(data["filters"]["capped"])
+        self.fake.searches.clear()
+        self.search({"description": "holiday", "limit": 100})                           # the real cap: everything, three pages
+        self.assertEqual([b["page"] for b in self.searches("metadata")], [1, 2, 3, 4])
+
+    def test_immich_refusing_the_description_search_says_so(self):
+        from immich_organizer.client import ImmichError
+        with mock.patch.object(self.client, "iter_metadata_search", side_effect=ImmichError("x", 400, "bad description")):
+            self.refused(lambda: self.search({"description": "x"}), "did not accept the description search")
+        with mock.patch.object(self.client, "iter_metadata_search", side_effect=ImmichError("down", 503, "")):
+            self.refused(lambda: self.search({"description": "x"}), code=502)
+
+
+class TestSearchTabWithAQueryAndFilters(TagSearchCase):
+    def setUp(self):
+        super().setUp()
+        self.fake.smart_results["mountain"] = list(self.ids)                           # rank i is asset i
+        self.fake.similar_results[self.ids[1]] = [i for i in self.ids if i != self.ids[1]]
+
+    def test_immichs_ranking_is_read_and_the_candidates_picked_out_in_order(self):
+        data = self.search({"query": "mountain", "tags": ["wolf"], "limit": 3})
+        self.assertEqual(self.ids_of(data), self.at_i(0, 3, 6))
+        self.assertEqual(data["filters"]["ranking"], "immich")
+        self.assertEqual((data["filters"]["scanned"], data["filters"]["scanCapped"]), (7, False))   # ranks 0 .. 6 were looked at
+        self.assertEqual(data["filters"]["candidates"], 14)
+        self.assertIn("Filtered to 14 assets with the tag wolf. Looked through the top 7 of Immich's ranking", data["filters"]["text"])
+        self.assertIn("the tags come from the AI Tagger", data["filters"]["text"])
+        self.assertEqual(data["match"], 'text "mountain"')
+
+    def test_it_stops_as_soon_as_the_limit_is_reached_and_pages_through_immichs_ranking(self):
+        self.fake.max_page = 4
+        data = self.search({"query": "mountain", "tags": ["wolf"], "limit": 4})
+        self.assertEqual(self.ids_of(data), self.at_i(0, 3, 6, 9))
+        self.assertEqual([b["page"] for b in self.searches("smart")], [1, 2, 3])        # ranks 0-3, 4-7, 8-11: then it had four
+        self.assertEqual(data["filters"]["scanned"], 10)
+
+    def test_the_scan_cap_is_reported_when_it_stops_before_the_limit(self):
+        with mock.patch.object(self.tagsearch, "SCAN_CAP", 5):
+            data = self.search({"query": "mountain", "tags": ["beach"], "limit": 10})   # beach: 0, 5, 10 ...
+        self.assertEqual(self.ids_of(data), self.at_i(0))                               # rank 5 is the sixth: beyond the cap
+        self.assertEqual((data["filters"]["scanned"], data["filters"]["scanCapped"]), (5, True))
+        self.assertIn("It stopped at 5, so matches further down are missing", data["filters"]["text"])
+        self.assertIn("Search+ model ranks exactly the matching assets", data["filters"]["text"])
+        with mock.patch.object(self.tagsearch, "SCAN_CAP", 5):
+            data = self.search({"query": "mountain", "tags": ["beach"], "limit": 1})
+        self.assertFalse(data["filters"]["scanCapped"])                                 # it had what it was asked for
+
+    def test_skipped_assets_count_as_looked_at_and_do_not_use_up_the_limit(self):
+        data = self.search({"query": "mountain", "tags": ["wolf"], "limit": 3, "skipIds": self.at_i(0, 3)})
+        self.assertEqual(self.ids_of(data), self.at_i(6, 9, 12))
+        self.assertEqual(data["filters"]["scanned"], 13)
+
+    def test_like_this_photo_with_tags(self):
+        data = self.search({"like": self.ids[1], "tags": ["anthro"], "limit": 3})
+        self.assertEqual(self.ids_of(data), self.at_i(0, 2, 4))
+        self.assertEqual(self.searches("smart")[0]["queryAssetId"], self.ids[1])
+
+    def test_description_and_tags_filter_the_ranking_together(self):
+        data = self.search({"query": "mountain", "description": "holiday", "tags": ["anthro"], "limit": 100})
+        self.assertEqual(self.ids_of(data), self.at_i(*range(0, 40, 4)))                # even and i % 4 == 0 -> i % 4 == 0
+        data = self.search({"query": "mountain", "description": "holiday", "tags": ["beach"], "limit": 100})
+        self.assertEqual(self.ids_of(data), self.at_i(0, 20))                           # i % 4 == 0 and i % 5 == 0
+        self.assertEqual(data["filters"]["candidates"], 2)
+
+    def test_nothing_with_the_tags_means_no_ranking_is_read(self):
+        data = self.search({"query": "mountain", "tags": ["unicorn"]})
+        self.assertEqual((data["assets"], data["filters"]["scanned"], data["filters"]["candidates"]), ([], 0, 0))
+        self.assertEqual(self.searches("smart"), [])
+
+    def test_a_search_without_filters_has_no_filters_object_and_is_as_before(self):
+        data = self.search({"query": "mountain", "limit": 3})
+        self.assertNotIn("filters", data)
+        self.assertEqual(self.ids_of(data), self.at_i(0, 1, 2))
+        self.assertEqual(self.searches("smart")[0]["size"], 3)                           # read only as deep as asked
+        self.assertNotIn("filters", self.search({"query": "mountain", "tags": [], "description": "  ", "limit": 3}))
+
+    def test_the_filter_is_used_with_people_and_refine_words_too(self):
+        anna = self.fake.add_person("Anna", self.at_i(0, 1, 3, 4))
+        data = self.search({"query": "mountain", "tags": ["wolf"], "people": [anna], "limit": 10})
+        self.assertEqual(self.ids_of(data), self.at_i(0, 3))
+        self.fake.smart_results["snow"] = self.at_i(6, 9)
+        data = self.search({"query": "mountain", "tags": ["wolf"], "refine": {"all_of": ["snow"]}, "limit": 10})
+        self.assertEqual(self.ids_of(data), self.at_i(6, 9))
+
+
+class TestSearchTabWithTheSearchPlusModelAndFilters(TagSearchCase):
+    def setUp(self):
+        super().setUp()
+        view = FakeSPView(self.ids[:10], types={self.ids[9]: "VIDEO"}, indexed=self.ids[:9])
+        self.engine = FakeSPEngine(view, {"fnaf": {self.ids[i]: round(0.24 - i * 0.01, 2) for i in range(10)},
+                                          "plush": {self.ids[i]: 0.2 for i in (0, 3, 4)}})
+        self.httpd.RequestHandlerClass.theme_sp_engine = self.engine
+        self.addCleanup(setattr, self.httpd.RequestHandlerClass, "theme_sp_engine", None)
+
+    def positions(self, *idx):
+        return set(idx)
+
+    def test_only_the_candidates_are_ranked_and_only_their_scores_are_asked_for(self):
+        data = self.search({"engine": "searchplus", "query": "fnaf", "tags": ["wolf"], "limit": 10})
+        self.assertEqual(self.ids_of(data), self.at_i(0, 3, 6))                         # wolf: 0, 3, 6, 9; 9 is not indexed
+        self.assertEqual(data["assets"][0]["score"], 0.24)
+        self.assertEqual(data["filters"]["ranking"], "searchplus")
+        self.assertEqual((data["filters"]["candidates"], data["filters"]["ranked"]), (14, 3))
+        self.assertIn("Ranked only those with the Search+ model (3 of them are in its index).", data["filters"]["text"])
+        self.assertTrue(self.engine.best_calls)
+        for only in self.engine.best_calls:
+            self.assertIsNotNone(only, "something ranked every asset")
+            self.assertLessEqual(set(only), {0, 3, 6})                                  # never an asset outside the candidates
+        self.assertEqual(self.engine.text_calls, 1)
+
+    def test_filters_and_must_also_words_narrow_it_before_anything_is_scored(self):
+        data = self.search({"engine": "searchplus", "query": "fnaf", "tags": ["wolf"], "limit": 10,
+                            "refine": {"all_of": ["plush"], "none_of": []}, "filters": {"taken_after": "2000-01-01"}})
+        self.assertEqual(self.ids_of(data), self.at_i(0, 3))                            # plush: 0, 3, 4; 4 has no wolf
+        for only in self.engine.best_calls:
+            self.assertLessEqual(set(only), {0, 3, 6})
+        self.assertEqual(len(self.engine.best_calls), 2)                               # the plush words, then fnaf
+        self.assertEqual(set(self.engine.best_calls[1]), {0, 3})                       # ... for what was left
+
+    def test_description_and_tags_and_no_candidates_not_waking_the_model(self):
+        data = self.search({"engine": "searchplus", "query": "fnaf", "description": "holiday", "tags": ["wolf"], "limit": 10})
+        self.assertEqual(self.ids_of(data), self.at_i(0))                               # i % 12 == 0 and indexed
+        none = self.search({"engine": "searchplus", "query": "fnaf", "tags": ["unicorn"]})
+        self.assertEqual(none["assets"], [])
+        self.assertEqual(none["filters"]["candidates"], 0)
+        calls = self.engine.text_calls
+        self.search({"engine": "searchplus", "query": "fnaf", "tags": ["unicorn"]})
+        self.assertEqual(self.engine.text_calls, calls)                                 # nothing to rank: no text vector either
+
+    def test_like_this_photo_with_tags(self):
+        self.engine.scores[f"like:{self.ids[0]}"] = {self.ids[i]: round(1.0 - i * 0.05, 2) for i in range(10)}
+        data = self.search({"engine": "searchplus", "like": self.ids[0], "tags": ["wolf"], "limit": 10})
+        self.assertEqual(self.ids_of(data), self.at_i(3, 6))                            # the photo itself is not a result
+
+
+class TestSearchPlusTabWithFilters(TagSearchCase):
+    def test_a_text_search_ranks_only_the_candidates_and_reads_only_their_vectors(self):
+        everyone = self.plus({"text": "dog", "limit": 100})
+        self.assertEqual({a["id"] for a in everyone["assets"][:3]}, set(self.at_i(1, 5, 9)))      # the dogs win
+        self.assertNotIn("filters", everyone)
+        view = self.spstore.view()
+        spy = self.ts.SpyMatrix(view.matrix)
+        view.matrix = spy
+        with mock.patch.object(self.sp.View, "row_scores", side_effect=AssertionError("ranked the whole index")):
+            data = self.plus({"text": "dog", "tags": ["wolf"], "limit": 100})
+        self.assertEqual(self.ids_of(data)[0], self.ids[9])                              # the one dog among them (9 is wolf)
+        self.assertEqual(set(self.ids_of(data)), set(self.at_i(0, 3, 6, 9)))             # wolf and indexed: 0, 3, 6, 9
+        self.assertFalse({self.ids[1], self.ids[5]} & set(self.ids_of(data)))            # the other dogs are not candidates
+        wanted_rows = {view.rows[self.ids[i]][0] for i in (0, 3, 6, 9)}
+        self.assertEqual(spy.read, wanted_rows)                                          # four rows read, of twelve
+        self.assertEqual(data["filters"], {
+            "tags": ["wolf"], "tagMode": "all", "description": "", "candidates": 14, "capped": False,
+            "ranking": "searchplus", "ranked": 4,
+            "text": "Filtered to 14 assets with the tag wolf. Ranked only those with the Search+ model (4 of them are in its index)."})
+        self.assertEqual(data["query"], {"text": "dog", "like": None})
+        self.assertIn("counts", data)
+
+    def test_more_like_a_photo_with_tags_and_the_media_and_date_filters(self):
+        data = self.plus({"like": self.ids[1], "tags": ["wolf"], "limit": 100})
+        self.assertEqual(self.ids_of(data)[0], self.ids[9])                              # the other dog; 1 itself is left out
+        self.assertEqual(self.plus({"text": "dog", "tags": ["wolf"], "media": "IMAGE", "limit": 100})["count"], 4)
+        self.assertEqual(self.plus({"text": "dog", "tags": ["wolf"], "media": "VIDEO", "limit": 100})["count"], 0)
+        late = self.plus({"text": "dog", "tags": ["wolf"], "before": "2026-01-14", "limit": 100})
+        self.assertEqual(set(self.ids_of(late)), set(self.at_i(6, 9)))                   # 2026-01-20-i: 6 -> 14, 9 -> 11
+
+    def test_all_or_any(self):
+        both = self.plus({"text": "dog", "tags": ["anthro", "wolf"], "limit": 100})      # i % 6 == 0: 0 and 6 are indexed
+        self.assertEqual(set(self.ids_of(both)), set(self.at_i(0, 6)))
+        self.assertEqual((both["filters"]["candidates"], both["filters"]["ranked"]), (7, 2))
+        either = self.plus({"text": "dog", "tags": ["anthro", "wolf"], "tagMode": "any", "limit": 100})
+        self.assertEqual(set(self.ids_of(either)), {self.ids[i] for i in range(12) if i % 2 == 0 or i % 3 == 0})
+
+    def test_nothing_with_the_tags_means_the_model_is_not_woken(self):
+        with mock.patch.object(self.spservice, "ready", side_effect=AssertionError("woke the model")):
+            data = self.plus({"text": "dog", "tags": ["unicorn"]})
+            self.assertEqual((data["assets"], data["filters"]["candidates"]), ([], 0))
+            self.assertEqual(self.plus({"text": "dog", "tags": ["wolf", "unicorn"]})["assets"], [])
+
+    def test_only_filters_lists_the_assets_newest_first(self):
+        data = self.plus({"tags": ["wolf"], "limit": 5})
+        self.assertEqual(self.ids_of(data), self.newest(self.wolf())[:5])                # all 40, not only the 12 indexed
+        self.assertEqual((data["count"], data["total"]), (5, 14))
+        self.assertEqual(data["filters"]["ranking"], "none")
+        self.assertEqual(data["filters"]["text"], "Filtered to 14 assets with the tag wolf. Newest first.")
+        self.assertEqual(data["query"], {"text": "", "like": None})
+        self.assertIn("counts", data)
+        self.assertEqual(self.plus({"tags": ["wolf"], "media": "VIDEO"})["count"], 2)
+        self.assertEqual(self.searches("smart") + self.searches("metadata"), [])
+
+    def test_only_a_description_asks_immich_with_the_type_and_applies_the_dates_itself(self):
+        data = self.plus({"description": "holiday", "media": "IMAGE", "after": "2022-06-01", "before": "2023-12-31",
+                          "limit": 100})
+        body = self.searches("metadata")[-1]
+        self.assertEqual((body["description"], body["type"]), ("holiday", "IMAGE"))
+        self.assertNotIn("takenAfter", body)                                             # the dates are compared as Search+ does
+        want = [i for i in range(self.n) if i % 4 == 0 and "2022-06-01" <= self.taken[i][:10] <= "2023-12-31"]
+        self.assertTrue(want)
+        self.assertEqual(self.ids_of(data), self.newest(want))
+        self.assertTrue(all("2022-06-01" <= a["date"] <= "2023-12-31" for a in data["assets"]))
+
+    def test_the_compare_column_keeps_only_the_candidates_of_immichs_own_ranking(self):
+        data = self.plus({"text": "dog", "tags": ["wolf"], "compare": True, "limit": 100})
+        self.assertEqual([a["id"] for a in data["immich"]["assets"]], self.at_i(3, 9))   # Immich ranks 1, 3, 9; 1 has no wolf
+        self.assertEqual(data["immich"]["model"], "model-a")
+        self.assertEqual(data["immich"]["overlap"], 2)
+        none = self.plus({"text": "dog", "tags": ["unicorn"], "compare": True})
+        self.assertEqual(none["immich"]["assets"], [])
+
+    def test_the_description_and_the_tags_are_checked_like_the_search_tab(self):
+        self.refused(lambda: self.plus({}), "filter by AI tags or description")
+        self.refused(lambda: self.plus({"tags": [], "description": " "}), "filter by AI tags")
+        self.refused(lambda: self.plus({"like": "not an id", "tags": ["wolf"]}), "Not an asset id")
+
+
+class TestTagAndDescriptionRequestsAreChecked(TagSearchCase):
+    BOTH = ("/api/search", "/api/searchplus/search")
+
+    def body(self, path, **extra):
+        return {("query" if path == "/api/search" else "text"): "dog", **extra}
+
+    def test_at_most_twenty_tags(self):
+        for path in self.BOTH:
+            twenty = [f"tag{i}" for i in range(20)]
+            self.assertEqual(self.search(self.body(path, tags=twenty, limit=3), path)["filters"]["candidates"], 0)
+            self.refused(lambda: self.search(self.body(path, tags=twenty + ["one more"]), path), "At most 20 tags")
+            self.refused(lambda: self.search(self.body(path, tags=["wolf"] * 21), path), "At most 20 tags")   # as sent
+
+    def test_tags_are_a_list_of_text(self):
+        for path in self.BOTH:
+            for bad in ("wolf", {"wolf": 1}, [1, 2], ["wolf", None], 5):
+                self.refused(lambda: self.search(self.body(path, tags=bad), path), "tags must be a list of tag names")
+
+    def test_the_tag_mode_is_all_or_any(self):
+        for path in self.BOTH:
+            for bad in ("some", "ALL", 1, True, ""):
+                self.refused(lambda: self.search(self.body(path, tags=["wolf"], tagMode=bad), path), "tagMode must be all or any")
+            for good in ("all", "any", None):
+                self.search(self.body(path, tags=["wolf"], tagMode=good, limit=2), path)
+            self.assertEqual(self.search(self.body(path, tags=["wolf"], limit=2), path)["filters"]["tagMode"], "all")  # the default
+
+    def test_the_description_is_text_of_at_most_200_characters(self):
+        for path in self.BOTH:
+            self.search(self.body(path, description="x" * 200, limit=2), path)
+            self.refused(lambda: self.search(self.body(path, description="x" * 201), path), "at most 200 characters")
+            self.refused(lambda: self.search(self.body(path, description=5), path), "description must be text")
+            self.refused(lambda: self.search(self.body(path, description=["a"]), path), "description must be text")
+            self.assertEqual(self.search(self.body(path, description="  " + "y" * 200 + "  ", limit=2), path)["filters"]["description"],
+                             "y" * 200)                                                  # it is trimmed first
+
+    def test_a_tag_must_have_something_in_it(self):
+        for path in self.BOTH:
+            self.refused(lambda: self.search(self.body(path, tags=["_"]), path), "not a usable tag")
+            data = self.search(self.body(path, tags=["", "  ", "wolf"], limit=2), path)         # blank entries are skipped
+            self.assertEqual(data["filters"]["tags"], ["wolf"])
+            self.assertNotIn("filters", self.search(self.body(path, tags=["", " "], limit=2), path))
+
+    def test_filters_alone_are_enough_but_nothing_at_all_is_not(self):
+        self.refused(lambda: self.search({}), "filter by AI tags or description")
+        self.refused(lambda: self.search({"tags": [], "tagMode": "any"}), "filter by AI tags or description")
+        self.assertEqual(self.search({"tags": ["wolf"], "limit": 2})["count"], 2)
+        self.assertEqual(self.search({"description": "holiday", "limit": 2})["count"], 2)

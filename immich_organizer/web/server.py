@@ -33,6 +33,7 @@ from ..client import ImmichClient, ImmichError
 from .. import aitagger as aitagger_mod
 from .. import albums as albums_mod
 from .. import searchplus as searchplus_mod
+from .. import tagsearch as tagsearch_mod
 from .. import themes as themes_mod
 from ..config import state_dir
 from ..engine import (
@@ -366,38 +367,65 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             limit = max(1, min(int(body.get("limit") or 200), 1000))
         except (TypeError, ValueError):
             raise ValueError("limit must be a number") from None
+        flt = tagsearch_mod.parse(body)             # AI tags and description text
         started = _time.monotonic()
         if like:
             like = self._uuid(like)
-            vector = store.view().asset_vector(like)
-        elif text:
-            health = service.ready(wait=150)
-            if store.model and health.get("model") != store.model:
-                raise ValueError(f"The index was built with {store.model}, but the model server runs {health.get('model')}.")
-            vector = service.embed_text([text])[0]
+        elif not text and flt is None:
+            raise ValueError("Type what you are looking for, pick a photo to find more like it, "
+                             "or filter by AI tags or description text.")
+        found = None
+        if flt is not None:
+            found = tagsearch_mod.find(self._at()[0], self.client, flt, {"type": media} if media else None)
+        if not like and not text:
+            # nothing to rank by: the assets that match the filters, newest first
+            hits, total = tagsearch_mod.newest_first(self._at()[0], found, media=media, after=after, before=before,
+                                                     limit=limit)
+            out = {"assets": hits, "count": len(hits), "tookMs": round((_time.monotonic() - started) * 1000),
+                   "counts": store.counts(), "query": {"text": "", "like": None},
+                   "filters": tagsearch_mod.summary(flt, found, "none")}
+            if total > len(hits):
+                out["total"] = total
+            return out
+        if found is not None and not found.ids:
+            hits = []                               # nothing has these tags: no ranking, and the model is not woken
         else:
-            raise ValueError("Type what you are looking for, or pick a photo to find more like it.")
-        found = searchplus_mod.search(store, vector, media=media, after=after, before=before, limit=limit,
-                                      skip=like or None)
-        out = {"assets": found, "count": len(found), "tookMs": round((_time.monotonic() - started) * 1000),
+            if like:
+                vector = store.view().asset_vector(like)
+            else:
+                health = service.ready(wait=150)
+                if store.model and health.get("model") != store.model:
+                    raise ValueError(f"The index was built with {store.model}, but the model server runs {health.get('model')}.")
+                vector = service.embed_text([text])[0]
+            # with a filter only the candidates are ranked: only their vectors are read and scored
+            hits = searchplus_mod.search(store, vector, media=media, after=after, before=before, limit=limit,
+                                         skip=like or None, only=found.ids if found is not None else None)
+        out = {"assets": hits, "count": len(hits), "tookMs": round((_time.monotonic() - started) * 1000),
                "counts": store.counts(), "query": {"text": text, "like": like or None}}
+        if found is not None:
+            out["filters"] = tagsearch_mod.summary(flt, found, "searchplus", ranked=self._ranked(store.view(), found.ids))
         if body.get("compare"):
-            out["immich"] = self._searchplus_immich(text, like, media, after, before, limit)
-            mine = {a["id"] for a in found}
+            out["immich"] = self._searchplus_immich(text, like, media, after, before, limit,
+                                                    only_ids=found.ids if found is not None else None)
+            mine = {a["id"] for a in hits}
             out["immich"]["overlap"] = sum(1 for a in out["immich"]["assets"] if a["id"] in mine)
         return out
 
-    def _searchplus_immich(self, text, like, media, after, before, limit) -> dict:
-        """The same question asked to Immich's own smart search, for comparison."""
+    def _searchplus_immich(self, text, like, media, after, before, limit, only_ids=None) -> dict:
+        """The same question asked to Immich's own smart search, for comparison. With ``only_ids`` (an AI tag /
+        description filter) its ranking is read as far as ``SCAN_CAP`` and the assets in the set are kept."""
         store = self._sp()[0]
         backend = self._backend()
         model = backend.model_name(self.client)
-        kw = {"media": media, "taken_after": after, "taken_before": before, "limit": limit + (1 if like else 0)}
+        if only_ids is not None and not only_ids:
+            return {"model": model, "assets": []}
+        depth = tagsearch_mod.SCAN_CAP if only_ids is not None else limit
+        kw = {"media": media, "taken_after": after, "taken_before": before, "limit": depth + (1 if like else 0)}
         rows = backend.select(like=like, **kw) if like else backend.select(vec=backend.text_vector(text, model), **kw)
         view = store.view()
         assets = []
         for aid, score in rows:
-            if aid == like:
+            if aid == like or (only_ids is not None and aid not in only_ids):
                 continue
             p = view.pos.get(aid)
             assets.append({"id": aid, "score": round(score, 4) if score is not None else None,
@@ -442,6 +470,12 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 raise ValueError("page and size must be numbers") from None
             return store.list_assets(tag=arg("tag").strip(), q=arg("q").strip(),
                                      outdated=arg("outdated") in ("1", "true"), page=page, size=size)
+        if what == "tags":
+            try:
+                limit, offset = max(1, min(int(arg("limit", "50")), 200)), max(int(arg("offset", "0")), 0)
+            except ValueError:
+                raise ValueError("limit and offset must be numbers") from None
+            return store.list_tags(arg("q"), limit, offset)
         if what == "sample":
             kind = arg("type")
             if kind not in ("", "IMAGE", "VIDEO"):
@@ -1113,7 +1147,7 @@ class OrganizerHandler(BaseHTTPRequestHandler):
         path.write_text(json.dumps(sorted(undone)), "utf-8")
         return {"runId": run_id, "removed": removed, "restored": restored, "failures": failures[:20]}
 
-    def _build_ad_hoc_rule(self, body: dict) -> Rule:
+    def _build_ad_hoc_rule(self, body: dict, has_tag_filter: bool = False) -> Rule:
         query = (body.get("query") or "").strip() or None
         like = (body.get("like") or "").strip() or None
         people = body.get("people") or []
@@ -1121,8 +1155,9 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             raise ValueError("people must be a list of person ids")
         if query and like:
             raise ValueError("Provide either a text query or a reference asset, not both.")
-        if not query and not like and not people:
-            raise ValueError("Describe what you want, paste a reference photo, or pick people.")
+        if not query and not like and not people and not has_tag_filter:
+            raise ValueError("Describe what you want, paste a reference photo, pick people, "
+                             "or filter by AI tags or description text.")
 
         limit = body.get("limit", 60)
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
@@ -1156,71 +1191,134 @@ class OrganizerHandler(BaseHTTPRequestHandler):
         rule.people_match = match
         return rule
 
+    def _exclusions(self, body: dict) -> tuple[set[str], list[str]]:
+        """The assets a search leaves out (``skipIds`` and the photos of the ``excludeAlbums``) and the albums not found."""
+        exclude_albums = body.get("excludeAlbums") or []
+        skip_ids = body.get("skipIds") or []
+        if not isinstance(exclude_albums, list) or not all(isinstance(a, str) for a in exclude_albums):
+            raise ValueError("excludeAlbums must be a list of album names or ids")
+        if not isinstance(skip_ids, list) or not all(isinstance(a, str) for a in skip_ids):
+            raise ValueError("skipIds must be a list of asset ids")
+        exclude, unknown = excluded_asset_ids(self.client, exclude_albums)
+        exclude |= set(skip_ids)
+        return exclude, unknown
+
+    @staticmethod
+    def _pushdown(rule: Rule) -> dict:
+        """The rule's filters as Immich names them, for the description search: with "any of these people" Immich's own
+        ``personIds`` (all of them) would be wrong, so that one is left out (the people are applied afterwards)."""
+        return {k: v for k, v in rule.filters.items() if not (k == "personIds" and rule.people_any)}
+
+    @staticmethod
+    def _brief(a: dict) -> dict:
+        """An Immich asset as the search lists show it."""
+        return {"id": a.get("id"), "name": a.get("originalFileName"), "type": a.get("type"),
+                "date": (a.get("localDateTime") or a.get("fileCreatedAt") or "")[:10]}
+
     def _search(self, body: dict) -> dict:
         if body.get("mode") == "tags":
             raise ValueError("Search by tags has been removed.")
         engine = body.get("engine") or "immich"
         if engine not in themes_mod.ENGINES:
             raise ValueError("engine must be immich or searchplus")
-        rule = self._build_ad_hoc_rule(body)
+        flt = tagsearch_mod.parse(body)            # AI tags and description text (neither is something Immich can filter on)
+        rule = self._build_ad_hoc_rule(body, has_tag_filter=flt is not None)
         if engine == "searchplus":
-            return self._search_searchplus(body, rule)
+            self._check_sp_filters(body)
+        if flt is not None and not rule.query and not rule.like_asset:
+            return self._search_filtered(body, rule, flt, engine)
+        if engine == "searchplus":
+            return self._search_searchplus(body, rule, flt)
 
-        exclude_albums = body.get("excludeAlbums") or []
-        skip_ids = body.get("skipIds") or []
-        if not isinstance(exclude_albums, list) or not all(isinstance(a, str) for a in exclude_albums):
-            raise ValueError("excludeAlbums must be a list of album names or ids")
-        if not isinstance(skip_ids, list) or not all(isinstance(a, str) for a in skip_ids):
-            raise ValueError("skipIds must be a list of asset ids")
-
-        exclude, unknown = excluded_asset_ids(self.client, exclude_albums)
-        exclude |= set(skip_ids)
-        matches = evaluate_rule(self.client, rule, exclude_ids=exclude)
-        return {
+        exclude, unknown = self._exclusions(body)
+        found, stats = None, {"scanned": 0, "capped": False}
+        if flt is not None:
+            found = tagsearch_mod.find(self._at()[0], self.client, flt, self._pushdown(rule))
+        if found is not None and not found.ids:
+            matches = []                               # nothing has these tags: nothing to look for in Immich's ranking
+        elif found is not None:
+            # Immich cannot rank only these assets: read its ranking and keep the ones in the set, up to the scan cap
+            matches = evaluate_rule(self.client, rule, exclude_ids=exclude, only_ids=found.ids,
+                                    scan_cap=tagsearch_mod.SCAN_CAP, stats=stats)
+        else:
+            matches = evaluate_rule(self.client, rule, exclude_ids=exclude)
+        out = {
             "match": rule.describe_match(),
             "count": len(matches),
             "excluded": len(exclude),
             "unknownAlbums": unknown,
-            "assets": [
-                {
-                    "id": a.get("id"),
-                    "name": a.get("originalFileName"),
-                    "type": a.get("type"),
-                    "date": (a.get("localDateTime") or a.get("fileCreatedAt") or "")[:10],
-                }
-                for a in matches
-            ],
+            "assets": [self._brief(a) for a in matches],
         }
+        if found is not None:
+            out["filters"] = tagsearch_mod.summary(flt, found, "immich", scanned=stats["scanned"],
+                                                   scanCapped=stats["capped"])
+        return out
+
+    def _search_filtered(self, body: dict, rule: Rule, flt, engine: str) -> dict:
+        """AI tag / description filters and no text or reference photo: nothing to rank by, so the assets that match,
+        newest first. Which model is chosen makes no difference here."""
+        store = self._at()[0]
+        exclude, unknown = self._exclusions(body)
+        found = tagsearch_mod.find(store, self.client, flt, self._pushdown(rule))
+        filters = rule.filters
+        other = [k for k, v in filters.items() if v is not None and k not in tagsearch_mod.LOCAL_FILTERS]
+        simple = not rule.people_any and not (rule.refine.all_of or rule.refine.none_of)
+        total, rows = None, []
+        if not found.ids:
+            pass
+        elif simple and (flt.description or not other):
+            # Immich already applied every filter to the description search; without one the library list the tagger
+            # keeps has the dates and names (and the type and date filters are all there is)
+            rows, total = tagsearch_mod.newest_first(
+                store, found, media=filters.get("type"), after=(filters.get("takenAfter") or "")[:10] or None,
+                before=(filters.get("takenBefore") or "")[:10] or None, skip=exclude, limit=rule.limit)
+        else:
+            # people, "only in no album", refine words: read Immich's list of those (newest first), keep the matching
+            rows = [self._brief(a) for a in evaluate_rule(self.client, rule, exclude_ids=exclude, only_ids=found.ids)]
+        out = {"match": "AI tags and description", "count": len(rows), "excluded": len(exclude),
+               "unknownAlbums": unknown, "engine": engine, "assets": rows,
+               "filters": tagsearch_mod.summary(flt, found, "none")}
+        if total is not None and total > len(rows):
+            out["total"] = total
+        return out
 
     SP_SEARCH_FILTERS = ("type", "taken_after", "taken_before", "only_unfiled")
 
-    def _search_searchplus(self, body: dict, rule) -> dict:
-        """The Search tab with the Search+ model: same filters, scores from the Search+ index."""
+    def _check_sp_filters(self, body: dict) -> None:
         filters = body.get("filters") or {}
         extra = sorted(k for k, v in filters.items() if v not in (None, "", False) and k not in self.SP_SEARCH_FILTERS)
         if extra:
             raise ValueError(f"{', '.join(extra)} can't be used with the Search+ model.")
-        exclude_albums = body.get("excludeAlbums") or []
-        skip_ids = body.get("skipIds") or []
-        if not isinstance(exclude_albums, list) or not all(isinstance(a, str) for a in exclude_albums):
-            raise ValueError("excludeAlbums must be a list of album names or ids")
-        if not isinstance(skip_ids, list) or not all(isinstance(a, str) for a in skip_ids):
-            raise ValueError("skipIds must be a list of asset ids")
-        exclude, unknown = excluded_asset_ids(self.client, exclude_albums)
-        exclude |= set(skip_ids)
+
+    @staticmethod
+    def _ranked(view, ids) -> int:
+        """How many of these asset ids the Search+ index can rank (live and indexed)."""
+        return sum(1 for i in ids if (p := view.pos.get(i)) is not None and bool(view.live[p]) and bool(view.indexed[p]))
+
+    def _search_searchplus(self, body: dict, rule, flt=None) -> dict:
+        """The Search tab with the Search+ model: same filters, scores from the Search+ index. With an AI tag /
+        description filter only those assets are ranked, with only their vectors read."""
+        filters = body.get("filters") or {}
+        self._check_sp_filters(body)
+        exclude, unknown = self._exclusions(body)
         if rule.like_asset:
             exclude.add(rule.like_asset)               # the reference photo itself isn't a result
-        theme = themes_mod.build_theme({
-            "source": "text" if rule.query else "like" if rule.like_asset else "none",
-            "description": rule.query or "", "like": rule.like_asset, "engine": "searchplus",
-            "mode": "top", "limit": min(rule.limit, 10000), "cutoff": themes_mod.SP_TERM_CUTOFF,
-            "media": filters.get("type") or None, "people": body.get("people") or [],
-            "people_match": rule.people_match, "taken_after": filters.get("taken_after"),
-            "taken_before": filters.get("taken_before"), "only_unfiled": bool(filters.get("only_unfiled")),
-            "all_of": rule.refine.all_of, "none_of": rule.refine.none_of,
-        })
+        found = tagsearch_mod.find(self._at()[0], self.client, flt, self._pushdown(rule)) if flt is not None else None
         engine = self._sp_engine()
-        rows, _ = themes_mod.searchplus_select(self.client, theme, self._backend(), engine)
+        if found is not None and not found.ids:
+            rows = []                                  # nothing has these tags: no need to wake the model either
+        else:
+            theme = themes_mod.build_theme({
+                "source": "text" if rule.query else "like" if rule.like_asset else "none",
+                "description": rule.query or "", "like": rule.like_asset, "engine": "searchplus",
+                "mode": "top", "limit": min(rule.limit, 10000), "cutoff": themes_mod.SP_TERM_CUTOFF,
+                "media": filters.get("type") or None, "people": body.get("people") or [],
+                "people_match": rule.people_match, "taken_after": filters.get("taken_after"),
+                "taken_before": filters.get("taken_before"), "only_unfiled": bool(filters.get("only_unfiled")),
+                "all_of": rule.refine.all_of, "none_of": rule.refine.none_of,
+            })
+            rows, _ = themes_mod.searchplus_select(self.client, theme, self._backend(), engine,
+                                                   only_ids=found.ids if found is not None else None)
         kept = [(i, sc) for i, sc in rows if i not in exclude]
         view = engine.view()
 
@@ -1231,12 +1329,15 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                     "date": str(view.taken[p]) if p is not None else ""}
 
         what = f'"{rule.query}"' if rule.query else f"like {rule.like_asset}" if rule.like_asset else "people"
-        return {
+        out = {
             # no "total": every indexed photo gets a score, so "of 72,000" would only confuse
             "match": f"Search+ model · {what}", "count": min(len(kept), rule.limit),
             "excluded": len(rows) - len(kept), "unknownAlbums": unknown, "engine": "searchplus",
             "assets": [info(i, sc) for i, sc in kept[:rule.limit]],
         }
+        if found is not None:
+            out["filters"] = tagsearch_mod.summary(flt, found, "searchplus", ranked=self._ranked(view, found.ids))
+        return out
 
     def _file_assets(self, body: dict) -> dict:
         asset_ids = body.get("assetIds") or []

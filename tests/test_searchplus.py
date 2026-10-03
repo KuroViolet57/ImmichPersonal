@@ -263,6 +263,143 @@ class TestIndexAndSearch(Base):
         self.assertEqual(self.indexer.state, "stopped")
 
 
+WORDS = ["beach", "dog", "cat", "car"]
+# 16 assets, newest first (x00 is the newest): xNN shows WORDS[NN % 4]; x06 and x13 are videos with three frames
+# (x06: cat | car+cat | beach, x13: dog | cat+dog | car). 14 photos + 2 videos x 3 frames = 20 matrix rows.
+BIG = [{"id": f"x{i:02d}", "type": "VIDEO" if i % 7 == 6 else "IMAGE", "taken": f"2026-01-{20 - i:02d} 10:00",
+        "name": f"x{i:02d}.jpg",
+        "preview": "|".join([WORDS[i % 4], WORDS[(i + 1) % 4] + "+" + WORDS[i % 4], WORDS[(i + 2) % 4]]) if i % 7 == 6
+        else WORDS[i % 4],
+        "original": "", "duration_ms": 9000 if i % 7 == 6 else 0} for i in range(16)]
+DOGS = {"x01", "x05", "x09", "x13"}          # what scores 1.0 for "dog" (x13 on its first frame)
+
+
+class SpyMatrix:
+    """The vector matrix, recording which rows anybody reads from it."""
+
+    def __init__(self, inner):
+        self.inner, self.read = inner, set()
+
+    def __len__(self):
+        return len(self.inner)
+
+    @property
+    def shape(self):
+        return self.inner.shape
+
+    def __getitem__(self, key):
+        self.read.update(int(r) for r in np.atleast_1d(np.arange(len(self.inner))[key]))
+        return self.inner[key]
+
+
+class TestSearchRestrictedToCandidates(Base):
+    """``search(only=ids)`` and ``best_scores(only=positions)``: rank a given set of assets and read nothing else."""
+
+    def setUp(self):
+        super().setUp()
+        self.catalog = list(BIG)
+        self.build()
+        self.q = self.service.embed_text(["dog"])[0]
+        self.view = self.store.view()
+        self.spy = SpyMatrix(self.view.matrix)
+        self.view.matrix = self.spy                    # the cached view: every search below reads through the spy
+        self.everyone = sp.search(self.store, self.q, limit=100)
+        self.all_rows = set(self.spy.read)
+        self.spy.read.clear()
+
+    def rows_of(self, ids):
+        return {r for i in ids for r in range(self.view.rows[i][0], self.view.rows[i][0] + self.view.rows[i][1])}
+
+    def test_ranking_everything_reads_every_row_so_the_spy_works(self):
+        self.assertEqual({r["id"] for r in self.everyone}, {a["id"] for a in BIG})
+        self.assertEqual(self.all_rows, set(range(20)))
+        self.assertEqual({r["id"] for r in self.everyone[:4]}, DOGS)
+
+    def test_only_the_candidates_are_scored_and_returned(self):
+        candidates = {a["id"] for a in BIG if int(a["id"][1:]) % 4 in (2, 3)}        # cats and cars: not one dog
+        self.assertFalse(candidates & DOGS)
+        with mock.patch.object(sp.View, "row_scores", side_effect=AssertionError("ranked everything")):
+            got = sp.search(self.store, self.q, only=candidates, limit=100)
+        self.assertEqual({r["id"] for r in got}, candidates)                          # only candidates come back
+        self.assertEqual(self.spy.read, self.rows_of(candidates))                      # only their rows were read
+        self.assertLess(len(self.spy.read), len(self.all_rows))
+
+    def test_an_asset_outside_the_candidates_never_wins_or_is_read_even_when_it_would(self):
+        candidates = {a["id"] for a in BIG} - {"x01", "x05"}                           # two perfect dog matches left out
+        got = sp.search(self.store, self.q, only=candidates, limit=3)
+        self.assertEqual(len(got), 3)
+        self.assertEqual({r["id"] for r in got}, {"x09", "x13"} | {got[2]["id"]})      # the other two dogs, then the next best
+        self.assertFalse({r["id"] for r in got} & {"x01", "x05"})
+        self.assertFalse(self.spy.read & self.rows_of({"x01", "x05"}))
+        self.assertEqual(self.spy.read, self.rows_of(candidates))
+
+    def test_same_order_and_scores_as_ranking_everything_and_filtering(self):
+        import random
+
+        want_all = {r["id"]: r for r in self.everyone}
+        rng, ids = random.Random(7), [a["id"] for a in BIG]
+        for n in range(1, len(ids) + 1):
+            for _ in range(4):
+                cand = set(rng.sample(ids, n))
+                got = sp.search(self.store, self.q, only=cand, limit=100)
+                want = [r for r in self.everyone if r["id"] in cand]
+                self.assertEqual({r["id"] for r in got}, cand)
+                self.assertEqual([r["score"] for r in got], [r["score"] for r in want], cand)    # same order of scores
+                for r in got:
+                    self.assertEqual(r, want_all[r["id"]])                                       # same score, date, name, type
+
+    def test_a_video_scores_as_its_best_frame_and_limits_and_filters_apply(self):
+        car = self.service.embed_text(["car"])[0]
+        cand = {"x00", "x03", "x06", "x13"}                    # beach, car, video (cat | car+cat | beach), video (dog ...)
+        got = {r["id"]: r["score"] for r in sp.search(self.store, car, only=cand, limit=100)}
+        self.assertAlmostEqual(got["x03"], 1.0, places=3)
+        self.assertAlmostEqual(got["x06"], 0.7071, places=3)   # its best frame, "car+cat"
+        self.assertEqual(len(sp.search(self.store, car, only=cand, limit=2)), 2)
+        self.assertEqual({r["id"] for r in sp.search(self.store, car, only=cand, media="VIDEO")}, {"x06", "x13"})
+        self.assertEqual({r["id"] for r in sp.search(self.store, car, only=cand, after="2026-01-14")}, {"x00", "x03", "x06"})
+        self.assertEqual({r["id"] for r in sp.search(self.store, car, only=cand, before="2026-01-14")}, {"x06", "x13"})
+        self.assertNotIn("x03", {r["id"] for r in sp.search(self.store, car, only=cand, exclude=["x03"])})
+        self.assertNotIn("x03", {r["id"] for r in sp.search(self.store, car, only=cand, skip="x03")})
+        self.spy.read.clear()
+        sp.search(self.store, car, only=cand, media="VIDEO")                              # the filters narrow it first
+        self.assertEqual(self.spy.read, self.rows_of({"x06", "x13"}))
+
+    def test_candidates_the_index_does_not_know_are_ignored_and_an_empty_set_is_nothing(self):
+        self.assertEqual(sp.search(self.store, self.q, only=set()), [])
+        self.assertEqual(sp.search(self.store, self.q, only={"nope", "also nope"}), [])
+        self.assertEqual(self.spy.read, set())                                             # nothing at all was read
+        late = {"id": "late", "type": "IMAGE", "taken": "2026-02-01 10:00", "name": "late.jpg",
+                "preview": "MISSING", "original": "", "duration_ms": 0}
+        self.store.sync_catalog(BIG + [late])                  # in the catalogue (so the view knows it), never indexed
+        self.assertEqual([r["id"] for r in sp.search(self.store, self.q, only={"late", "x01"})], ["x01"])
+
+    def test_best_scores_with_only_leaves_every_other_asset_at_minus_infinity(self):
+        positions = np.array([self.view.pos["x01"], self.view.pos["x06"]])
+        best = sp.best_scores(self.view, self.q, only=positions)
+        self.assertEqual(self.spy.read, self.rows_of(["x01", "x06"]))
+        self.spy.read.clear()
+        everyone = sp.best_scores(self.view, self.q)
+        chosen = np.zeros(len(best), dtype=bool)
+        chosen[positions] = True
+        self.assertTrue(np.all(np.isneginf(best[~chosen])))
+        np.testing.assert_allclose(best[chosen], everyone[chosen], rtol=1e-5)
+
+    def test_rows_of(self):
+        v = self.view
+        pos = lambda *ids: [v.pos[i] for i in ids]  # noqa: E731
+        self.assertEqual(list(v.rows_of(pos("x01"))), [v.rows["x01"][0]])
+        first, n = v.rows["x06"]
+        self.assertEqual(n, 3)                                                     # a video: three frames, three rows
+        # an asset asked for twice counts once; an asset's rows stay together, the assets in position order whatever the
+        # order they are asked in (the rows are numbered in the order the assets were indexed, which varies)
+        got = list(v.rows_of(pos("x06", "x01", "x01")))
+        self.assertEqual(sorted(got), sorted([v.rows["x01"][0], first, first + 1, first + 2]))
+        self.assertEqual(got, list(v.rows_of(pos("x01", "x06"))))
+        in_order = sorted(["x01", "x06"], key=lambda a: v.pos[a])
+        self.assertEqual(got, [r for a in in_order for r in range(v.rows[a][0], v.rows[a][0] + v.rows[a][1])])
+        self.assertEqual(list(v.rows_of([])), [])
+
+
 class TestProgress(Base):
     def test_time_left_counts_video_frames(self):
         self.store.sync_catalog(CATALOG)                     # 5 photos + 1 video still to do

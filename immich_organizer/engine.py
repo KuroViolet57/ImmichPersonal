@@ -190,7 +190,22 @@ def _refine_ids(client: ImmichClient, rule: Rule, phrase: str) -> set[str]:
 MAX_RANKING_SCAN = 500_000
 
 
-def _people_any_stream(client: ImmichClient, rule: Rule, progress: Progress):
+def looking_at(stream, stats: dict | None, cap: int | None = None):
+    """Pass ``stream`` through, counting what is looked at in ``stats["scanned"]``. With ``cap`` it stops after that
+    many and says so in ``stats["capped"]`` (true only if the stream still had more)."""
+    if stats is None:
+        yield from stream
+        return
+    for item in stream:
+        if cap is not None and stats["scanned"] >= cap:
+            stats["capped"] = True
+            return
+        stats["scanned"] += 1
+        yield item
+
+
+def _people_any_stream(client: ImmichClient, rule: Rule, progress: Progress, scan_cap: int | None = None,
+                       stats: dict | None = None):
     """Assets showing *at least one* of the rule's people, without a 1000 cap.
 
     Immich's own ``personIds`` means "all of them". For "any", fetch each
@@ -199,6 +214,7 @@ def _people_any_stream(client: ImmichClient, rule: Rule, progress: Progress):
     * with no description -- return their union, newest first;
     * with a description or reference photo -- walk the normal smart-search
       ranking and keep only photos in that union, so the order stays exact.
+      (``scan_cap`` / ``stats``: how much of that ranking may be looked at, see ``evaluate_rule``.)
     """
     person_ids = list(rule.filters.get("personIds") or [])
     base = {k: v for k, v in rule.filters.items() if k != "personIds"}
@@ -216,7 +232,8 @@ def _people_any_stream(client: ImmichClient, rule: Rule, progress: Progress):
         return
 
     payload = {k: v for k, v in rule.search_payload().items() if k != "personIds"}
-    for asset in client.iter_smart_search(payload, limit=MAX_RANKING_SCAN, page_size=1000):
+    ranking = client.iter_smart_search(payload, limit=(scan_cap + 1) if scan_cap else MAX_RANKING_SCAN, page_size=1000)
+    for asset in looking_at(ranking, stats, scan_cap):
         if asset.get("id") in union:
             yield asset
 
@@ -227,6 +244,9 @@ def evaluate_rule(
     *,
     exclude_ids: set[str] | None = None,
     progress: Progress = _noop,
+    only_ids: set[str] | None = None,
+    scan_cap: int | None = None,
+    stats: dict | None = None,
 ) -> list[dict]:
     """Return the assets a rule matches, best match first.
 
@@ -237,6 +257,12 @@ def evaluate_rule(
     ``exclude_ids`` are skipped *without* using up the limit: the search reads
     further down the ranking instead, so asking for 1000 after filing 1000
     returns the next 1000 rather than an empty page.
+
+    ``only_ids`` keeps just those assets (the AI tag / description filter: the set Immich knows nothing about, so
+    it cannot rank only them). They are picked out of Immich's ranking as it is read, page by page, until ``limit`` of
+    them are found or ``scan_cap`` results have been looked at (the ones skipped by ``exclude_ids`` count as looked at).
+    With no text or reference photo and no people it reads the library newest first, the same way. ``stats`` is
+    filled in with ``scanned`` (how many results were looked at) and ``capped`` (the cap stopped the reading).
     """
     exclude_ids = exclude_ids or set()
     refining = bool(rule.refine.all_of or rule.refine.none_of)
@@ -244,20 +270,28 @@ def evaluate_rule(
     # will discard some of the candidates before the cap is applied.
     base_depth = max(rule.limit, rule.refine.pool) if refining else rule.limit
     search_depth = base_depth + len(exclude_ids)
+    if stats is not None:
+        stats.update(scanned=0, capped=False)
+    if only_ids is not None:
+        # the ranking has to be read until enough of the wanted assets turn up: that is bounded by the cap, not by `limit`
+        search_depth = (scan_cap + 1) if scan_cap else MAX_RANKING_SCAN
 
     progress(f"  searching {rule.describe_match()} (top {base_depth}"
              + (f", skipping {len(exclude_ids)} excluded)" if exclude_ids else ")"))
     if rule.people_any:
-        stream = _people_any_stream(client, rule, progress)
-    elif rule.people_only:
-        # Nothing to rank by: every photo with these people, newest first.
-        stream = client.iter_metadata_search(rule.search_payload(), limit=search_depth)
+        stream = _people_any_stream(client, rule, progress, scan_cap if only_ids is not None else None,
+                                    stats if only_ids is not None else None)
+    elif rule.people_only or (only_ids is not None and not rule.query and not rule.like_asset):
+        # Nothing to rank by: every photo with these people (or every photo), newest first.
+        stream = looking_at(client.iter_metadata_search(rule.search_payload(), limit=search_depth),
+                            stats if only_ids is not None else None, scan_cap if only_ids is not None else None)
     else:
-        stream = client.iter_smart_search(rule.search_payload(), limit=search_depth, page_size=1000)
+        stream = looking_at(client.iter_smart_search(rule.search_payload(), limit=search_depth, page_size=1000),
+                            stats if only_ids is not None else None, scan_cap if only_ids is not None else None)
     if not refining:
         out: list[dict] = []
         for asset in stream:
-            if asset.get("id") in exclude_ids:
+            if asset.get("id") in exclude_ids or (only_ids is not None and asset.get("id") not in only_ids):
                 continue
             out.append(asset)
             if len(out) >= rule.limit:
@@ -266,7 +300,7 @@ def evaluate_rule(
 
     candidates = []
     for asset in stream:
-        if asset.get("id") in exclude_ids:
+        if asset.get("id") in exclude_ids or (only_ids is not None and asset.get("id") not in only_ids):
             continue
         candidates.append(asset)
         if len(candidates) >= base_depth:

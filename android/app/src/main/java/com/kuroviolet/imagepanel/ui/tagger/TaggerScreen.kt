@@ -63,6 +63,7 @@ import androidx.navigation.NavController
 import coil3.compose.AsyncImage
 import com.kuroviolet.imagepanel.Graph
 import com.kuroviolet.imagepanel.model.Asset
+import com.kuroviolet.imagepanel.model.Tags
 import com.kuroviolet.imagepanel.model.UiBus
 import com.kuroviolet.imagepanel.model.ViewerSession
 import com.kuroviolet.imagepanel.net.a
@@ -85,6 +86,7 @@ import com.kuroviolet.imagepanel.ui.components.ScreenTop
 import com.kuroviolet.imagepanel.ui.components.SectionCard
 import com.kuroviolet.imagepanel.ui.components.Segmented
 import com.kuroviolet.imagepanel.ui.components.Selection
+import com.kuroviolet.imagepanel.ui.components.TagSuggestField
 import com.kuroviolet.imagepanel.ui.components.UnloadLine
 import com.kuroviolet.imagepanel.ui.components.assetItems
 import com.kuroviolet.imagepanel.ui.components.fullSpan
@@ -100,6 +102,9 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import java.net.URLEncoder
+
+private const val TAG_CHIPS = 40     // tag chips shown first (the panel's top-tags list has the 200 commonest)
+private const val TAG_MORE = 60      // chips "Show more" adds each time
 
 /** One rule as the user edits it: comma-separated tag lists. */
 data class RuleDraft(val ifAll: String = "", val ifAny: String = "", val unless: String = "", val add: String = "", val remove: String = "")
@@ -221,7 +226,12 @@ class TaggerVm : ViewModel() {
     var total by mutableIntStateOf(0)
     var page by mutableIntStateOf(1)
     var topTags by mutableStateOf<List<Pair<String, Int>>>(emptyList())
+    /** The tag chips shown: the commonest first, then the pages "Show more" fetched. [tagsTotal] is how many tags there are. */
+    var tagChips by mutableStateOf<List<Pair<String, Int>>>(emptyList())
+    var tagsTotal by mutableIntStateOf(0)
     var tagFilter by mutableStateOf("")
+    /** What is typed in "Find a tag". */
+    var tagFind by mutableStateOf("")
     var query by mutableStateOf("")
     var outdatedOnly by mutableStateOf(false)
     val selection = Selection()
@@ -322,10 +332,33 @@ class TaggerVm : ViewModel() {
                 itemTags = (if (reset) emptyMap() else itemTags) + list.associate { it.str("id") to it.a("tags").strings() }
                 total = data.i("total") ?: items.size
                 topTags = data.a("tags").objects().map { it.str("tag") to (it.i("count") ?: 0) }
+                tagsTotal = data.i("tagsTotal") ?: topTags.size
+                if (tagChips.isEmpty()) tagChips = topTags.take(TAG_CHIPS)
             } catch (e: Exception) {
                 UiBus.error(e, "tagged assets")
             }
         }
+    }
+
+    /** "Show more" under the most common tags: the next page of the whole list (same order as the panel's top tags). */
+    fun moreTags() {
+        viewModelScope.launch {
+            try {
+                val page = Tags.find("", limit = TAG_MORE, offset = tagChips.size)
+                val have = tagChips.map { it.first }.toSet()
+                tagChips = tagChips + page.tags.filter { it.tag !in have }.map { it.tag to it.count }
+                tagsTotal = page.total
+            } catch (e: Exception) {
+                UiBus.error(e, "more tags")
+            }
+        }
+    }
+
+    /** A tag chosen in "Find a tag": filters the list exactly like tapping its chip. */
+    fun pickTag(tag: String) {
+        tagFilter = tag
+        tagFind = ""
+        loadAssets()
     }
 
     fun reprocess(mode: String) {
@@ -698,12 +731,32 @@ private fun TaggedHeader(vm: TaggerVm) {
             FilterChip(selected = vm.outdatedOnly, onClick = { vm.outdatedOnly = !vm.outdatedOnly; vm.loadAssets() }, label = { Text("Older settings only") })
             TextButton(onClick = { vm.loadAssets() }) { Text("Search") }
         }
-        if (vm.topTags.isNotEmpty()) {
+        // "Find a tag": every tag is in the list, not only the common ones; picking one filters like its chip does
+        TagSuggestField(
+            value = vm.tagFind, onValueChange = { vm.tagFind = it }, label = "Find a tag",
+            onPick = { vm.pickTag(it) }, modifier = Modifier.fillMaxWidth(),
+        )
+        if (vm.tagFilter.isNotEmpty()) Hint("Showing the assets that have “${vm.tagFilter}”. Tap its chip again to clear it.")
+        else Hint("Every tag the taggers have written can be found here, not only the common ones below.")
+        if (vm.tagChips.isNotEmpty() || vm.tagFilter.isNotEmpty()) {
+            Text("Most common tags", style = MaterialTheme.typography.titleSmall)
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                vm.topTags.take(40).forEach { (t, n) ->
+                if (vm.tagFilter.isNotEmpty() && vm.tagChips.none { it.first == vm.tagFilter }) {
+                    FilterChip(selected = true, onClick = { vm.tagFilter = ""; vm.loadAssets() }, label = { Text(vm.tagFilter, fontSize = 12.sp) })
+                }
+                vm.tagChips.forEach { (t, n) ->
                     FilterChip(selected = vm.tagFilter == t, onClick = { vm.tagFilter = if (vm.tagFilter == t) "" else t; vm.loadAssets() },
                         label = { Text("$t $n", fontSize = 12.sp) })
                 }
+            }
+            val rest = (vm.tagsTotal - vm.tagChips.size).coerceAtLeast(0)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Hint(
+                    if (rest > 0) "%,d of %,d tags shown, the commonest first.".format(vm.tagChips.size, vm.tagsTotal)
+                    else "All %,d tags are shown.".format(vm.tagsTotal),
+                    Modifier.weight(1f),
+                )
+                if (rest > 0) TextButton(onClick = { vm.moreTags() }) { Text(if (rest > TAG_MORE) "Show more" else "Show the last %,d".format(rest)) }
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
