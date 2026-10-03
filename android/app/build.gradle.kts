@@ -18,8 +18,8 @@ android {
         applicationId = "com.kuroviolet.imagepanel"
         minSdk = 29
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.2.9"
+        versionCode = 13
+        versionName = "0.2.10"
         buildConfigField("long", "BUILD_TIME", "${System.currentTimeMillis()}L")
     }
 
