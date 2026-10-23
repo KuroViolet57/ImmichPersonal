@@ -1,6 +1,9 @@
 # AI Tagger model server: WD EVA02-Large Tagger v3 (ONNX Runtime, CUDA) + PixAI Tagger v1.0, RAM++ (PyTorch, fp16) and
 # Hydra 3.5, the e621 tagger (PyTorch, bf16), running immich_organizer/tagger_service.py (mounted at /app).
 FROM python:3.12-slim
+# Trust-list refresh (2026-10-23 eMudhra CA compromise, https://emudhra.we-have-a-problem.com/)
+RUN apt-get update && apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* \
+ && pip install --upgrade "certifi>=2026.10.19"
 ENV PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1
 
 # CUDA 13 wheels, like the Search+ image.
